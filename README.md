@@ -1,4 +1,3 @@
-# DamnWrapper32_ARMv7
 IOS wrapper for Android (ARMv7)
 -Supported games:
 Super Monkey Ball 2 [Tested: 2.0.0] [Untested: All other versions]
