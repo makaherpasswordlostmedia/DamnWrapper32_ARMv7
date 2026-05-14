@@ -2,16 +2,22 @@ IOS wrapper for Android (ARMv7)
 
 -Supported games:
 
-Super Monkey Ball 2 [Tested: 2.0.0] [Untested: All other versions]
+Super Monkey Ball 2 [Untested: All other versions]
 
 Compatability:
 
-Sound: Working sounds and music.
+2.0.0 version:
 
-Other: Accelerometer working.
+Sound: Fully working.
+
+Other: Fully working.
+
 ---
-Graphics: Works with issues (some triangles glithing)
-
+Graphics: Fully working.
 System: Saves not working
 
 Stability: No crashes because of actions but crashes because of memory leaks.
+
+3.1.0 (IOS 4.1) and Lite 1.2.0 (IOS 4.3) versions:
+
+Testing... black screen at this moment but sound working
