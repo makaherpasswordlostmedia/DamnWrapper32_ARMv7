@@ -10,8 +10,8 @@ Sound: Working sounds and music.
 
 Other: Accelerometer working.
 ---
-Graphics: Works with issues
+Graphics: Works with issues (some triangles glithing)
 
 System: Saves not working
 
-Stability: No crashes because of actions but crashes vecause of memory leaks.
+Stability: No crashes because of actions but crashes because of memory leaks.
