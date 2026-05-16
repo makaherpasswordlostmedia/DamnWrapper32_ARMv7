@@ -1,23 +1,13 @@
-IOS wrapper for Android (ARMv7)
+DamnWrapper32 (ARMv7) [by XaView]
 
--Supported games:
+-IOS emulator (wrapper) that currently support these games:
 
-Super Monkey Ball 2 [Untested: All other versions]
-
-Compatability:
-
-2.0.0 version:
-
-Sound: Fully working.
-
-Other: Fully working.
-
+Traps N Gems (All versions)
+Compatability: Fully working but saves not tested, idk.
+Perfomance: Actually... Idk, it runs very slow but showing 25-32 fps, my timers broken or this game slow down instead to frame skip, idk
 ---
-Graphics: Fully working.
-System: Saves not working
+-Super Monkey Ball 2 (All versions but not earlier then 2.0.0)
+Compatability: Fully working but saves not works (Tested only on 2.0.0, other versions may have working saves, dm me if you test it and want to help by showing working saves or not)
+Perfomance: ~12 FPS on Snapdragon 7 Gen 2+
 
-Stability: No crashes because of actions but crashes because of memory leaks.
-
-3.1.0 (IOS 4.1) and Lite 1.2.0 (IOS 4.3) versions:
-
-Testing... black screen at this moment but sound working
+*Theoretically support is IOS 3.0-4.3, if you will find some games except in list upper that works then dm me :)
