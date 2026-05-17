@@ -689,7 +689,7 @@ void _LogToJava(const std::string& msg) {
     else if (isHiddenClass && g_logHiddenClasses) keep = true;
     else if (g_logOther) keep = true;
     
-    if (msg.find("FATAL") != std::string::npos || msg.find("CRITICAL") != std::string::npos || msg.find("ERROR") != std::string::npos || msg.find("ОШИБКА") != std::string::npos || msg.find("ASSERT") != std::string::npos) {
+    if (msg.find("FATAL") != std::string::npos || (msg.find("CRITICAL") != std::string::npos && msg.find("[SIZE-CRITICAL]") == std::string::npos) || msg.find("ERROR") != std::string::npos || msg.find("ОШИБКА") != std::string::npos || msg.find("ASSERT") != std::string::npos) {
         keep = true; // Always log fatals/errors if logging is enabled at all
     }
     
