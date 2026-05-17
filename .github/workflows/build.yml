@@ -10,7 +10,7 @@ on:
 jobs:
   build-apk:
     name: Build and Package APK
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
     - name: Checkout Code
@@ -28,7 +28,13 @@ jobs:
         
         echo "=== 0. Install legacy system libraries for NDK r17c ==="
         sudo apt-get update
-        sudo apt-get install -y libncurses5
+        # Пытаемся поставить пакет легально (в 22.04 он еще бывает в universe)
+        sudo apt-get install -y libncurses5 libtinfo5 || true
+        
+        # Хак: Если старых библиотек нет, привязываем современные libtinfo6/libncurses6 к именам 5-й версии.
+        # Для старого Android NDK это работает безотказно.
+        sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
+        sudo ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5 || true
         
         echo "=== 1. Setup Build Environment ==="
         export SDK=$ANDROID_SDK_ROOT
