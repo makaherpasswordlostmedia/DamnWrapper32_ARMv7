@@ -10689,7 +10689,7 @@ void LoadMachO(const std::string& bundlePath) {
                             bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub");
                             bool isString = (sectname == "__cstring" || sectname == "__objc_methname" || sectname == "__objc_classname" || sectname == "__objc_methtype");
                             
-                            if (isCode && sect.size > 0) {
+                                if (isCode && sect.size > 0) {
                                 LogToJava("REBASE-TRACE: Кастомный парсер сканирует секцию: " + sectname + " (размер: " + std::to_string(sect.size) + ")");
                                 uint32_t current_addr = sect.addr;
                                 const uint8_t* code = (const uint8_t*)(sect.addr + g_appSlide);
@@ -10709,6 +10709,7 @@ void LoadMachO(const std::string& bundlePath) {
                                     
                                     uint32_t literal_addr = 0;
                                     bool is_ldr_pc = false;
+                                    uint32_t target_rd = 0;
                                     
                                     // 16-bit LDR Rx, [PC, #imm8] (0x4800)
                                     if (insn_size == 2 && (hw1 & 0xF800) == 0x4800) {
@@ -10716,37 +10717,58 @@ void LoadMachO(const std::string& bundlePath) {
                                         uint32_t offset = imm8 * 4;
                                         uint32_t pc = current_addr + 4; 
                                         literal_addr = (pc & ~3) + offset;
+                                        target_rd = (hw1 >> 8) & 7;
                                         is_ldr_pc = true;
                                     }
-                                    // 32-bit LDR.W Rx, [PC, #imm12] (0xF85F)
+                                    // 32-bit LDR.W Rx, [PC, +/-imm12] (0xF85F or 0xF8DF)
                                     else if (insn_size == 4) {
                                         uint16_t hw2 = *(ptr + 1);
                                         if ((hw1 & 0xFF7F) == 0xF85F) {
                                             uint32_t offset = hw2 & 0x0FFF;
                                             uint32_t pc = current_addr + 4;
-                                            literal_addr = (pc & ~3) + offset;
+                                            // Проверяем U-бит (направление смещения)
+                                            if ((hw1 & 0x0080) == 0) literal_addr = (pc & ~3) - offset;
+                                            else literal_addr = (pc & ~3) + offset;
+                                            
+                                            target_rd = (hw2 >> 12) & 15;
                                             is_ldr_pc = true;
                                         }
                                     }
                                     
                                     if (is_ldr_pc && literal_addr >= min_vmaddr && literal_addr < max_vmaddr) {
-                                        bool is_valid_memory = false;
-                                        uint32_t shifted_literal = literal_addr + g_appSlide;
-                                        for (const auto& sInfo : g_machoSections) {
-                                            if (shifted_literal >= sInfo.start && shifted_literal < sInfo.end) {
-                                                is_valid_memory = true;
-                                                break;
+                                        // Интеллектуальный Lookahead: Ищем ADD Rd, PC (паттерн позиционно-независимого кода)
+                                        bool is_pic_offset = false;
+                                        const uint16_t* scan_ptr = ptr + (insn_size / 2);
+                                        for (int i = 0; i < 12 && (const uint8_t*)scan_ptr < code + code_size; i++) {
+                                            uint16_t scan_hw = *scan_ptr;
+                                            if (target_rd < 8 && scan_hw == (0x4478 | target_rd)) {
+                                                is_pic_offset = true; break;
+                                            } else if (target_rd >= 8 && scan_hw == (0x44F8 | (target_rd & 7))) {
+                                                is_pic_offset = true; break;
                                             }
+                                            scan_ptr += GetThumbInstructionSize(scan_hw) / 2;
                                         }
-                                        
-                                        if (is_valid_memory) {
-                                            uint32_t val = 0;
-                                            memcpy(&val, (void*)shifted_literal, 4);
+
+                                        // Если это НЕ относительное PIC смещение, значит это абсолютный указатель - делаем ребейз
+                                        if (!is_pic_offset) {
+                                            bool is_valid_memory = false;
+                                            uint32_t shifted_literal = literal_addr + g_appSlide;
+                                            for (const auto& sInfo : g_machoSections) {
+                                                if (shifted_literal >= sInfo.start && shifted_literal < sInfo.end) {
+                                                    is_valid_memory = true;
+                                                    break;
+                                                }
+                                            }
                                             
-                                            if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
-                                                val += g_appSlide;
-                                                memcpy((void*)shifted_literal, &val, 4);
-                                                modified_literals++;
+                                            if (is_valid_memory) {
+                                                uint32_t val = 0;
+                                                memcpy(&val, (void*)shifted_literal, 4);
+                                                
+                                                if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
+                                                    val += g_appSlide;
+                                                    memcpy((void*)shifted_literal, &val, 4);
+                                                    modified_literals++;
+                                                }
                                             }
                                         }
                                     }
@@ -10757,9 +10779,8 @@ void LoadMachO(const std::string& bundlePath) {
                                     parsed_count++;
                                 }
                                 LogToJava("CUSTOM-PARSER: Успешно разобрано " + std::to_string(parsed_count) + " инструкций.");
-                                LogToJava("CUSTOM-PARSER: Изменено указателей в пулах: " + std::to_string(modified_literals));
+                                LogToJava("CUSTOM-PARSER: Изменено абсолютных указателей в пулах: " + std::to_string(modified_literals));
                             } else if (!isString && sect.size > 0) {
-
                                 LogToJava("REBASE-TRACE: Эвристический ребейз секции данных: " + sectname);
                                 uint32_t* ptr = (uint32_t*)(sect.addr + g_appSlide);
                                 uint32_t count = sect.size / 4;
