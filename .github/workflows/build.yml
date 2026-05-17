@@ -1,1 +1,117 @@
-test
+name: DamnWrapper32 CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Позволяет запускать сборку кнопкой из интерфейса GitHub
+
+jobs:
+  build-apk:
+    name: Build and Package APK
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Raw Console Build (No Gradle)
+      run: |
+        set -e
+        echo "=== 1. Setup Build Environment ==="
+        export SDK=$ANDROID_SDK_ROOT
+        export BUILD_TOOLS=$(ls -d $SDK/build-tools/* | sort -V | tail -1)
+        
+        # Важно: Компилируем под API 33, так как в Java коде есть вызовы 
+        # Build.VERSION_CODES.R и Environment.isExternalStorageManager() (появились в API 30+)
+        export PLATFORM_VERSION=33 
+        export PLATFORM=$SDK/platforms/android-$PLATFORM_VERSION
+        export NDK=$(ls -d $SDK/ndk/* | sort -V | tail -1)
+
+        # Устанавливаем нужную платформу Android, если её нет на раннере
+        if [ ! -d "$PLATFORM" ]; then
+          echo "Installing android-$PLATFORM_VERSION platform..."
+          $SDK/cmdline-tools/latest/bin/sdkmanager "platforms;android-$PLATFORM_VERSION" > /dev/null
+        fi
+
+        echo "Using Build Tools: $BUILD_TOOLS"
+        echo "Using NDK: $NDK"
+
+        # Создаем временные директории для сборки
+        mkdir -p build/gen build/obj build/apk build/apk_libs/lib/armeabi-v7a build/res
+
+        echo "=== 2. NDK Build ==="
+        # Сборка C/C++ части. NDK сам найдет main.cpp и sqlite3.c через Android.mk
+        $NDK/ndk-build NDK_PROJECT_PATH=. \
+          APP_BUILD_SCRIPT=src/jni/Android.mk \
+          NDK_APPLICATION_MK=src/jni/Application.mk \
+          NDK_OUT=./build/ndk-obj \
+          NDK_LIBS_OUT=./build/apk_libs/lib
+
+        echo "=== 3. Compile Resources (AAPT2) ==="
+        $BUILD_TOOLS/aapt2 compile --dir res -o build/res.zip
+        $BUILD_TOOLS/aapt2 link -I $PLATFORM/android.jar \
+          --manifest AndroidManifest.xml \
+          -A assets \
+          build/res.zip \
+          --java build/gen \
+          -o build/app-unaligned.apk
+
+        echo "=== 4. Compile Java ==="
+        # Собираем список всех Java файлов (твой исходник + сгенерированный R.java)
+        find src/java -name "*.java" > build/java_sources.txt
+        find build/gen -name "*.java" >> build/java_sources.txt
+        
+        javac -source 1.8 -target 1.8 \
+          -bootclasspath $PLATFORM/android.jar \
+          -cp build/gen \
+          -d build/obj \
+          @build/java_sources.txt
+
+        echo "=== 5. Dexing (D8) ==="
+        # Переводим .class файлы в байткод Dalvik (classes.dex)
+        cd build/obj
+        $BUILD_TOOLS/d8 --release --lib $PLATFORM/android.jar --output ../apk/ $(find . -name "*.class")
+        cd ../..
+
+        echo "=== 6. Package Final APK ==="
+        cp build/app-unaligned.apk build/app-with-code.apk
+        
+        # Добавляем classes.dex
+        cd build/apk
+        zip -qj ../app-with-code.apk classes.dex
+        cd ../..
+        
+        # Добавляем скомпилированные .so библиотеки (с сохранением структуры папок lib/armeabi-v7a/)
+        cd build/apk_libs
+        zip -qr ../app-with-code.apk lib/
+        cd ../..
+
+        echo "=== 7. Zipalign ==="
+        $BUILD_TOOLS/zipalign -p -f 4 build/app-with-code.apk build/app-aligned.apk
+
+        echo "=== 8. Sign APK ==="
+        # Генерируем временный дебаг-ключ и подписываем APK
+        keytool -genkeypair -v -keystore build/debug.keystore \
+          -alias androiddebugkey -keypass android -storepass android \
+          -keyalg RSA -keysize 2048 -validity 10000 \
+          -dname "CN=DamnWrapper,O=XaView,C=RU"
+
+        $BUILD_TOOLS/apksigner sign \
+          --ks build/debug.keystore \
+          --ks-pass pass:android \
+          --out DamnWrapper32_ARMv7.apk \
+          build/app-aligned.apk
+
+    - name: Upload Output APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: DamnWrapper32-APK
+        path: DamnWrapper32_ARMv7.apk
