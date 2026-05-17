@@ -1936,6 +1936,7 @@ extern "C" void Stub_glBindTexture(GLenum target, GLuint texture) {
 
 extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
     LogToJava("[GL-TEX] glTexImage2D: tex=" + std::to_string(g_cpuActiveTexture) + " w=" + std::to_string(width) + " h=" + std::to_string(height) + " intFmt=0x" + std::to_string(internalformat) + " fmt=0x" + std::to_string(format) + " type=0x" + std::to_string(type) + " pixels=" + std::to_string(pixels != nullptr));
+    
     if (target == GL_TEXTURE_2D && level == 0) {
         g_cpuTexW[g_cpuActiveTexture] = width;
         g_cpuTexH[g_cpuActiveTexture] = height;
@@ -1949,104 +1950,116 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
             glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
 
             if (format == GL_RGBA && type == GL_UNSIGNED_BYTE) {
-            int rowLength = width * 4;
-            int stride = rowLength + ((align - (rowLength % align)) % align);
-            const uint8_t* src = (const uint8_t*)pixels;
-            for (int y=0; y<height; y++) memcpy(&texBuf[y*width], src + y*stride, width * 4);
-        } else if (format == GL_RGB && type == GL_UNSIGNED_BYTE) {
-            int rowLength = width * 3;
-            int stride = rowLength + ((align - (rowLength % align)) % align);
-            const uint8_t* src = (const uint8_t*)pixels;
-            for (int y=0; y<height; y++) {
-                const uint8_t* row = src + y * stride;
-                for (int x=0; x<width; x++) texBuf[y*width + x] = 0xFF000000 | (row[x*3+2]<<16) | (row[x*3+1]<<8) | row[x*3];
-            }
-        } else if (format == GL_RGB && type == 0x8363) { // GL_UNSIGNED_SHORT_5_6_5
-            int rowLength = width * 2;
-            int stride = rowLength + ((align - (rowLength % align)) % align);
-            const uint8_t* src = (const uint8_t*)pixels;
-            for (int y=0; y<height; y++) {
-                const uint16_t* row = (const uint16_t*)(src + y * stride);
-                for (int x=0; x<width; x++) {
-                    uint16_t px = row[x];
-                    uint8_t r = (px >> 11) & 0x1F; r = (r << 3) | (r >> 2);
-                    uint8_t g = (px >> 5) & 0x3F;  g = (g << 2) | (g >> 4);
-                    uint8_t b = px & 0x1F;         b = (b << 3) | (b >> 2);
-                    texBuf[y*width + x] = 0xFF000000 | (b<<16) | (g<<8) | r;
+                int rowLength = width * 4;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y=0; y<height; y++) memcpy(&texBuf[y*width], src + y*stride, width * 4);
+            } else if (format == GL_RGB && type == GL_UNSIGNED_BYTE) {
+                int rowLength = width * 3;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y=0; y<height; y++) {
+                    const uint8_t* row = src + y * stride;
+                    for (int x=0; x<width; x++) texBuf[y*width + x] = 0xFF000000 | (row[x*3+2]<<16) | (row[x*3+1]<<8) | row[x*3];
                 }
-            }
-        } else if (format == GL_RGBA && type == 0x8033) { // GL_UNSIGNED_SHORT_4_4_4_4
-            int rowLength = width * 2;
-            int stride = rowLength + ((align - (rowLength % align)) % align);
-            const uint8_t* src = (const uint8_t*)pixels;
-            for (int y=0; y<height; y++) {
-                const uint16_t* row = (const uint16_t*)(src + y * stride);
-                for (int x=0; x<width; x++) {
-                    uint16_t px = row[x];
-                    uint8_t r = (px >> 12) & 0xF; r = (r << 4) | r;
-                    uint8_t g = (px >> 8) & 0xF;  g = (g << 4) | g;
-                    uint8_t b = (px >> 4) & 0xF;  b = (b << 4) | b;
-                    uint8_t a = px & 0xF;         a = (a << 4) | a;
-                    texBuf[y*width + x] = (a<<24) | (b<<16) | (g<<8) | r;
+            } else if (format == GL_RGB && type == 0x8363) { // GL_UNSIGNED_SHORT_5_6_5
+                int rowLength = width * 2;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y=0; y<height; y++) {
+                    const uint16_t* row = (const uint16_t*)(src + y * stride);
+                    for (int x=0; x<width; x++) {
+                        uint16_t px = row[x];
+                        uint8_t r = (px >> 11) & 0x1F; r = (r << 3) | (r >> 2);
+                        uint8_t g = (px >> 5) & 0x3F;  g = (g << 2) | (g >> 4);
+                        uint8_t b = px & 0x1F;         b = (b << 3) | (b >> 2);
+                        texBuf[y*width + x] = 0xFF000000 | (b<<16) | (g<<8) | r;
+                    }
                 }
-            }
-        } else if (format == GL_RGBA && type == 0x8034) { // GL_UNSIGNED_SHORT_5_5_5_1
-            int rowLength = width * 2;
-            int stride = rowLength + ((align - (rowLength % align)) % align);
-            const uint8_t* src = (const uint8_t*)pixels;
-            for (int y=0; y<height; y++) {
-                const uint16_t* row = (const uint16_t*)(src + y * stride);
-                for (int x=0; x<width; x++) {
-                    uint16_t px = row[x];
-                    uint8_t r = (px >> 11) & 0x1F; r = (r << 3) | (r >> 2);
-                    uint8_t g = (px >> 6) & 0x1F;  g = (g << 3) | (g >> 2);
-                    uint8_t b = (px >> 1) & 0x1F;  b = (b << 3) | (b >> 2);
-                    uint8_t a = (px & 0x1) ? 255 : 0;
-                    texBuf[y*width + x] = (a<<24) | (b<<16) | (g<<8) | r;
+            } else if (format == GL_RGBA && type == 0x8033) { // GL_UNSIGNED_SHORT_4_4_4_4
+                int rowLength = width * 2;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y=0; y<height; y++) {
+                    const uint16_t* row = (const uint16_t*)(src + y * stride);
+                    for (int x=0; x<width; x++) {
+                        uint16_t px = row[x];
+                        uint8_t r = (px >> 12) & 0xF; r = (r << 4) | r;
+                        uint8_t g = (px >> 8) & 0xF;  g = (g << 4) | g;
+                        uint8_t b = (px >> 4) & 0xF;  b = (b << 4) | b;
+                        uint8_t a = px & 0xF;         a = (a << 4) | a;
+                        texBuf[y*width + x] = (a<<24) | (b<<16) | (g<<8) | r;
+                    }
                 }
-            }
-        } else if (format == 0x80E1 && type == GL_UNSIGNED_BYTE) { // GL_BGRA_EXT
-            int rowLength = width * 4;
-            int stride = rowLength + ((align - (rowLength % align)) % align);
-            const uint8_t* src = (const uint8_t*)pixels;
-            for (int y=0; y<height; y++) {
-                const uint32_t* row = (const uint32_t*)(src + y * stride);
-                for (int x=0; x<width; x++) {
-                    uint32_t px = row[x];
-                    uint8_t b = px & 0xFF; uint8_t g = (px >> 8) & 0xFF;
-                    uint8_t r = (px >> 16) & 0xFF; uint8_t a = (px >> 24) & 0xFF;
-                    texBuf[y*width + x] = (a<<24) | (b<<16) | (g<<8) | r;
+            } else if (format == GL_RGBA && type == 0x8034) { // GL_UNSIGNED_SHORT_5_5_5_1
+                int rowLength = width * 2;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y=0; y<height; y++) {
+                    const uint16_t* row = (const uint16_t*)(src + y * stride);
+                    for (int x=0; x<width; x++) {
+                        uint16_t px = row[x];
+                        uint8_t r = (px >> 11) & 0x1F; r = (r << 3) | (r >> 2);
+                        uint8_t g = (px >> 6) & 0x1F;  g = (g << 3) | (g >> 2);
+                        uint8_t b = (px >> 1) & 0x1F;  b = (b << 3) | (b >> 2);
+                        uint8_t a = (px & 0x1) ? 255 : 0;
+                        texBuf[y*width + x] = (a<<24) | (b<<16) | (g<<8) | r;
+                    }
                 }
+            } else if (format == 0x80E1 && type == GL_UNSIGNED_BYTE) { // GL_BGRA_EXT
+                int rowLength = width * 4;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y=0; y<height; y++) {
+                    const uint32_t* row = (const uint32_t*)(src + y * stride);
+                    for (int x=0; x<width; x++) {
+                        uint32_t px = row[x];
+                        uint8_t b = px & 0xFF; uint8_t g = (px >> 8) & 0xFF;
+                        uint8_t r = (px >> 16) & 0xFF; uint8_t a = (px >> 24) & 0xFF;
+                        texBuf[y*width + x] = (a<<24) | (b<<16) | (g<<8) | r;
+                    }
+                }
+            } else if (format == 0x1909 && type == GL_UNSIGNED_BYTE) { // GL_LUMINANCE
+                int rowLength = width * 1;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y=0; y<height; y++) {
+                    const uint8_t* row = src + y * stride;
+                    for (int x=0; x<width; x++) { uint8_t l = row[x]; texBuf[y*width + x] = 0xFF000000 | (l<<16) | (l<<8) | l; }
+                }
+            } else if (format == 0x190A && type == GL_UNSIGNED_BYTE) { // GL_LUMINANCE_ALPHA
+                int rowLength = width * 2;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y=0; y<height; y++) {
+                    const uint8_t* row = src + y * stride;
+                    for (int x=0; x<width; x++) { uint8_t l = row[x*2]; uint8_t a = row[x*2+1]; texBuf[y*width + x] = (a<<24) | (l<<16) | (l<<8) | l; }
+                }
+            } else if (format == GL_ALPHA && type == GL_UNSIGNED_BYTE) {
+                int rowLength = width * 1;
+                int stride = rowLength + ((align - (rowLength % align)) % align);
+                const uint8_t* src = (const uint8_t*)pixels;
+                for (int y=0; y<height; y++) {
+                    const uint8_t* row = src + y * stride;
+                    for (int x=0; x<width; x++) texBuf[y*width + x] = (row[x]<<24) | 0x00FFFFFF;
+                }
+            } else {
+                std::fill(texBuf.begin(), texBuf.end(), 0xFFFF00FF);
             }
-        } else if (format == 0x1909 && type == GL_UNSIGNED_BYTE) { // GL_LUMINANCE
-            int rowLength = width * 1;
-            int stride = rowLength + ((align - (rowLength % align)) % align);
-            const uint8_t* src = (const uint8_t*)pixels;
-            for (int y=0; y<height; y++) {
-                const uint8_t* row = src + y * stride;
-                for (int x=0; x<width; x++) { uint8_t l = row[x]; texBuf[y*width + x] = 0xFF000000 | (l<<16) | (l<<8) | l; }
-            }
-        } else if (format == 0x190A && type == GL_UNSIGNED_BYTE) { // GL_LUMINANCE_ALPHA
-            int rowLength = width * 2;
-            int stride = rowLength + ((align - (rowLength % align)) % align);
-            const uint8_t* src = (const uint8_t*)pixels;
-            for (int y=0; y<height; y++) {
-                const uint8_t* row = src + y * stride;
-                for (int x=0; x<width; x++) { uint8_t l = row[x*2]; uint8_t a = row[x*2+1]; texBuf[y*width + x] = (a<<24) | (l<<16) | (l<<8) | l; }
-            }
-        } else if (format == GL_ALPHA && type == GL_UNSIGNED_BYTE) {
-            int rowLength = width * 1;
-            int stride = rowLength + ((align - (rowLength % align)) % align);
-            const uint8_t* src = (const uint8_t*)pixels;
-            for (int y=0; y<height; y++) {
-                const uint8_t* row = src + y * stride;
-                for (int x=0; x<width; x++) texBuf[y*width + x] = (row[x]<<24) | 0x00FFFFFF;
-            }
-        } else {
-            std::fill(texBuf.begin(), texBuf.end(), 0xFFFF00FF);
         }
-        }
+        
+        // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО ---
+        // Защищает драйвер MTK от невыровненных указателей стека игры.
+        // Мы отправляем наш безопасный, выделенный в куче std::vector.
+        GLint oldAlign = 4;
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &oldAlign);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexImage2D(target, level, GL_RGBA, width, height, border, GL_RGBA, GL_UNSIGNED_BYTE, texBuf.data());
+        glPixelStorei(GL_UNPACK_ALIGNMENT, oldAlign);
+        return;
     }
+    
+    // Фолбек для 3D текстур или мипмапов (если дойдет сюда)
     glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
 }
 
@@ -2133,24 +2146,38 @@ extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, 
                 }
             }
         }
+        
+        // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО ---
+        // Отправляем всю обновленную текстуру целиком, чтобы синхронизировать состояние.
+        GLint oldAlign = 4;
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &oldAlign);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexImage2D(target, level, GL_RGBA, texW, texH, 0, GL_RGBA, GL_UNSIGNED_BYTE, texBuf.data());
+        glPixelStorei(GL_UNPACK_ALIGNMENT, oldAlign);
+        return;
     }
     glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
 }
 
 extern "C" void Stub_glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const GLvoid *data) {
     LogToJava("[GL-TEX] glCompressedTexSubImage2D called!");
+    // Перехватываем, чтобы железо не читало сырой указатель игры, если это неподдерживаемый PVRTC
+    if (target == GL_TEXTURE_2D && level == 0 && g_cpuTextures.count(g_cpuActiveTexture)) {
+        return; 
+    }
     glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
 }
 
 extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid *data) {
     LogToJava("[GL-TEX] glCompressedTexImage2D: tex=" + std::to_string(g_cpuActiveTexture) + " w=" + std::to_string(width) + " h=" + std::to_string(height) + " intFmt=0x" + std::to_string(internalformat) + " size=" + std::to_string(imageSize));
+    
     if (target == GL_TEXTURE_2D && level == 0) {
         g_cpuTexW[g_cpuActiveTexture] = width;
         g_cpuTexH[g_cpuActiveTexture] = height;
         std::vector<uint32_t>& texBuf = g_cpuTextures[g_cpuActiveTexture];
         texBuf.resize(width * height);
         
-        // PVRTC не реализован на CPU. Рисуем серую шахматку.
+        // PVRTC не поддерживается на Android аппаратно. Рисуем безопасную шахматку.
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 bool isDark = ((x / 8) % 2) == ((y / 8) % 2);
@@ -2158,6 +2185,15 @@ extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum i
             }
         }
         LogToJava("HLE_WARNING: Stub_glCompressedTexImage2D PVRTC перехвачен! Заменено на шахматку.");
+        
+        // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО ---
+        // Сканируем несжатую шахматку аппаратному драйверу, чтобы он не упал при чтении битого указателя
+        GLint oldAlign = 4;
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &oldAlign);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexImage2D(target, level, GL_RGBA, width, height, border, GL_RGBA, GL_UNSIGNED_BYTE, texBuf.data());
+        glPixelStorei(GL_UNPACK_ALIGNMENT, oldAlign);
+        return;
     }
     glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
 }
