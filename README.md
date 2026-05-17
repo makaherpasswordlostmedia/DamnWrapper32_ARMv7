@@ -2,6 +2,10 @@ DamnWrapper32 (ARMv7) [by XaView]
 
 -IOS emulator (wrapper) that currently support these games:
 
+Action Buggy (All versions)
+Compatability: Fully working but saves not tested, idk.
+Perfomance: 25-30 fps on Snapdragon 7 Gen 2+
+---
 Traps N Gems (All versions)
 Compatability: Fully working but saves not tested, idk.
 Perfomance: Actually... Idk, it runs very slow but showing 25-32 fps, my timers broken or this game slow down instead to frame skip, idk
