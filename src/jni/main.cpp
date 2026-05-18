@@ -3506,22 +3506,42 @@ void RenderHLEUI() {
 // ==========================================
 // HLE OBJECTIVE-C RUNTIME
 // ==========================================
+extern uint32_t g_min_vmaddr;
+extern uint32_t g_max_vmaddr;
+
+// Динамически исправляет "забытые" ребазером указатели на лету
+inline uint32_t FixObjCPtr(uint32_t ptr) {
+    if (g_appSlide > 0 && ptr >= g_min_vmaddr && ptr < g_max_vmaddr) {
+        return ptr + g_appSlide;
+    }
+    return ptr;
+}
+
 std::string GetObjCClassName(void* obj) {
     if (!obj || (uintptr_t)obj < 0x1000) return "nil";
     uint32_t isa = 0;
+    
     if (!SafeRead32((uintptr_t)obj, &isa)) return "InvalidObj";
+    isa = FixObjCPtr(isa);
+    
     if (isa == 0xDEADBEEF) return ((HLEClass*)obj)->className;
+    
     if (isa > 0x1000) {
         uint32_t cls0 = 0;
         if (!SafeRead32(isa, &cls0)) return "InvalidIsa";
         if (cls0 == 0xDEADBEEF) return std::string(((HLEClass*)isa)->className) + "(instance)";
+        
         uint32_t cls4 = 0;
         if (SafeRead32(isa + 16, &cls4)) {
-            uint32_t data_ptr = cls4 & ~3;
+            uint32_t data_ptr = FixObjCPtr(cls4 & ~3);
             if (data_ptr > 0x1000) {
                 uint32_t name_ptr = 0;
                 if (SafeRead32(data_ptr + 16, &name_ptr) && name_ptr > 0x1000) {
-                    if (isValidString((const char*)name_ptr)) return std::string((const char*)name_ptr);
+                    name_ptr = FixObjCPtr(name_ptr);
+                    char name_buf[128] = {0};
+                    if (SafeReadString(name_ptr, name_buf, 127)) {
+                        if (name_buf[0] != '\0') return std::string(name_buf);
+                    }
                 }
             }
         }
@@ -3530,23 +3550,57 @@ std::string GetObjCClassName(void* obj) {
 }
 
 void* FindMethodIMP(uint32_t class_ptr, const char* selName) {
+    class_ptr = FixObjCPtr(class_ptr);
     if (!class_ptr || class_ptr < 0x1000) return nullptr;
-    uint32_t* cls = (uint32_t*)class_ptr; 
-    // Если мы дошли до HLE-класса (заглушки), значит в нативном коде реализации нет
-    if (cls[0] == 0xDEADBEEF) return nullptr;
-    uint32_t data_ptr = cls[4] & ~3; if (!data_ptr || data_ptr < 0x1000) return nullptr;
-    uint32_t* ro = (uint32_t*)data_ptr; uint32_t methodList_ptr = ro[5]; 
+    
+    uint32_t cls0 = 0;
+    if (!SafeRead32(class_ptr, &cls0)) return nullptr;
+    if (cls0 == 0xDEADBEEF) return nullptr;
+    
+    uint32_t cls4 = 0;
+    if (!SafeRead32(class_ptr + 16, &cls4)) return nullptr;
+    
+    uint32_t data_ptr = FixObjCPtr(cls4 & ~3);
+    if (!data_ptr || data_ptr < 0x1000) return nullptr;
+    
+    uint32_t ro5 = 0;
+    if (!SafeRead32(data_ptr + 20, &ro5)) return nullptr;
+    
+    uint32_t methodList_ptr = FixObjCPtr(ro5);
     if (methodList_ptr && methodList_ptr > 0x1000) {
-        uint32_t* mlist = (uint32_t*)methodList_ptr; uint32_t count = mlist[1];
-        if (count < 10000) { 
-            uint32_t* methods = mlist + 2; 
-            for (uint32_t i = 0; i < count; i++) {
-                uint32_t m_name_ptr = methods[i*3 + 0]; uint32_t m_imp = methods[i*3 + 2];
-                if (isValidString((const char*)m_name_ptr)) { if (strcmp((const char*)m_name_ptr, selName) == 0) return (void*)m_imp; }
+        uint32_t mlist1 = 0;
+        if (SafeRead32(methodList_ptr + 4, &mlist1)) {
+            uint32_t count = mlist1;
+            if (count < 10000) {
+                uint32_t methods_base = methodList_ptr + 8;
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t m_name_ptr = 0, m_imp = 0;
+                    if (SafeRead32(methods_base + i * 12 + 0, &m_name_ptr) &&
+                        SafeRead32(methods_base + i * 12 + 8, &m_imp)) {
+                        
+                        m_name_ptr = FixObjCPtr(m_name_ptr);
+                        m_imp = FixObjCPtr(m_imp);
+                        
+                        char name_buf[128] = {0};
+                        if (SafeReadString(m_name_ptr, name_buf, 127)) {
+                            if (name_buf[0] != '\0' && strcmp(name_buf, selName) == 0) {
+                                return (void*)m_imp;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    uint32_t super_class = cls[1]; if (super_class && super_class != class_ptr) return FindMethodIMP(super_class, selName);
+    
+    uint32_t super_class = 0;
+    if (SafeRead32(class_ptr + 4, &super_class)) {
+        super_class = FixObjCPtr(super_class);
+        if (super_class && super_class != class_ptr) {
+            return FindMethodIMP(super_class, selName);
+        }
+    }
+    
     return nullptr;
 }
 
@@ -3554,23 +3608,29 @@ void* GetNSValuePtr(void* nsvalue) { return (void*)((uint32_t*)nsvalue)[1]; }
 
 // --- HELPER: Поиск ближайшего системного класса (HLE) в дереве наследования ---
 std::string GetBaseSystemClassName(uint32_t class_ptr) {
+    class_ptr = FixObjCPtr(class_ptr);
     if (!class_ptr || class_ptr < 0x1000) return "Unknown";
     
-    int depth = 0; // Защита от бесконечного цикла, если дерево сломано
+    int depth = 0; 
     uint32_t current = class_ptr;
     
     while (current > 0x1000 && depth++ < 20) {
-        uint32_t* cls = (uint32_t*)current;
-        // Если наткнулись на HLE-класс (наш системный маркер)
-        if (cls[0] == 0xDEADBEEF) {
+        uint32_t cls0 = 0;
+        if (!SafeRead32(current, &cls0)) break;
+        if (cls0 == 0xDEADBEEF) {
             return ((HLEClass*)current)->className;
         }
-        // Шагаем к родителю
-        uint32_t super_class = cls[1];
-        if (!super_class || super_class == current) break;
-        current = super_class;
+        
+        uint32_t super_class = 0;
+        if (SafeRead32(current + 4, &super_class)) {
+            super_class = FixObjCPtr(super_class);
+            if (!super_class || super_class == current) break;
+            current = super_class;
+        } else {
+            break;
+        }
     }
-    return "NSObject"; // Фолбек, если дошли до конца и ничего не поняли
+    return "NSObject"; 
 }
 // ------------------------------------------------------------------------------
 
