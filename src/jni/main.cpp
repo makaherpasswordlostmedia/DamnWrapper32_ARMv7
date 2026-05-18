@@ -10242,14 +10242,14 @@ void* CreateDynamicStub(const std::string& name) {
     uint32_t* stub = (uint32_t*)(exec_mem + offset);
     
     // ARM32 Машинный код: Безопасный вызов LogDynamicStub(name_str, lr) и возврат 0
-    stub[0] = 0xE92D401F; // push {r0, r1, r2, r3, r4, lr} (выравнивание стека)
-    stub[1] = 0xE59F0014; // ldr r0, [pc, #20] -> name_str (первый аргумент)
-    stub[2] = 0xE1A0100E; // mov r1, lr -> оригинальный LR (второй аргумент)
+    stub[0] = 0xE92D401F; // push {r0, r1, r2, r3, r4, lr}
+    stub[1] = 0xE59F0014; // ldr r0, [pc, #20] -> name_str
+    stub[2] = 0xE1A0100E; // mov r1, lr -> оригинальный LR
     stub[3] = 0xE59FC010; // ldr r12, [pc, #16] -> LogDynamicStub
     stub[4] = 0xE12FFF3C; // blx r12
     stub[5] = 0xE8BD401F; // pop {r0, r1, r2, r3, r4, lr}
-    stub[6] = 0xE3A00000; // mov r0, #0 (возвращаем 0)
-    stub[7] = 0xE12FFF1E; // bx lr (возврат в игру)
+    stub[6] = 0xE3A00000; // mov r0, #0
+    stub[7] = 0xE12FFF1E; // bx lr
     stub[8] = (uint32_t)name_str;
     stub[9] = (uint32_t)(void*)LogDynamicStub;
     
@@ -10257,6 +10257,41 @@ void* CreateDynamicStub(const std::string& name) {
     
     offset += 64;
     g_missingSymbolAddrs[(uintptr_t)stub] = name;
+    return stub;
+}
+
+// --- ТРАМПЛИН ДЛЯ ВЫРАВНИВАНИЯ СТЕКА (АДАПТАЦИЯ IOS ABI -> ANDROID AAPCS) ---
+// Спасает драйвера MTK/Mali от SIGBUS/SIGSEGV при вызове тяжелых OpenGL функций
+void* CreateAlignedTrampoline(void* real_func) {
+    static uint8_t* exec_mem = nullptr;
+    static int offset = 0;
+    if (!exec_mem) {
+        exec_mem = (uint8_t*)mmap(nullptr, 1024 * 1024, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (exec_mem == MAP_FAILED) return real_func;
+    }
+    if (offset >= (1024 * 1024) - 68) return real_func;
+    
+    uint32_t* stub = (uint32_t*)(exec_mem + offset);
+    stub[0] = 0xE92D000F; // push {r0-r3}           ; Сохраняем регистровые аргументы
+    stub[1] = 0xE92D4010; // push {r4, lr}          ; Сохраняем контекст
+    stub[2] = 0xE1A0400D; // mov r4, sp             ; Запоминаем оригинальный SP
+    stub[3] = 0xE3CDB007; // bic sp, sp, #7         ; КРИТИЧНО: Выравниваем SP до 8 байт
+    stub[4] = 0xE24DD020; // sub sp, sp, #32        ; Выделяем место под стековые аргументы (до 8 штук)
+    stub[5] = 0xE284C018; // add ip, r4, #24        ; ip указывает на оригинальные стековые аргументы
+    stub[6] = 0xE89C4FE0; // ldmia ip, {r5-r11, lr} ; Читаем 32 байта стековых аргументов игры
+    stub[7] = 0xE88D4FE0; // stmia sp, {r5-r11, lr} ; Копируем их на наш выровненный стек
+    stub[8] = 0xE284C008; // add ip, r4, #8         ; ip указывает на сохраненные r0-r3
+    stub[9] = 0xE89C000F; // ldmia ip, {r0-r3}      ; Восстанавливаем первые 4 аргумента
+    stub[10]= 0xE59FC008; // ldr ip, [pc, #8]       ; Загружаем указатель на C++ обертку
+    stub[11]= 0xE12FFF3C; // blx ip                 ; Прыжок в C++ с идеальным 8-байтным стеком!
+    stub[12]= 0xE1A0D004; // mov sp, r4             ; Возвращаем старый кривой SP для iOS
+    stub[13]= 0xE8BD4010; // pop {r4, lr}           ; Восстанавливаем контекст
+    stub[14]= 0xE28DD010; // add sp, sp, #16        ; Снимаем r0-r3 со стека
+    stub[15]= 0xE12FFF1E; // bx lr                  ; Возврат в игру
+    stub[16]= (uint32_t)real_func;
+    
+    __builtin___clear_cache((char*)stub, (char*)(stub + 17));
+    offset += 68;
     return stub;
 }
 // --------------------------------------------------------------
@@ -10278,6 +10313,22 @@ void* ResolveSymbol(const std::string& name) {
         if (stubPtr != (void*)Stub_GenericUnimplemented) {
             if (!g_machOLoaded) g_implementedSymbols[hleName] = true;
             else if (!g_implementedSymbols.count(hleName)) { LogToJava("C-API-IMPLEMENTED: " + hleName); g_implementedSymbols[hleName] = true; }
+            
+            // ВАЖНО: Применяем защиту выравнивания стека ко всем тяжелым функциям OpenGL/OpenAL.
+            bool needs_align = (hleName.find("_gl") == 0 || hleName.find("_alc") == 0 || hleName.find("_alS") == 0);
+            
+            // Исключаем функции, которые используют макрос __builtin_return_address для дебаггера
+            if (hleName == "_glGetIntegerv" || hleName == "_glGetFloatv" || hleName == "_glScissor" || 
+                hleName == "_glGetRenderbufferParameteriv" || hleName == "_glGetRenderbufferParameterivOES") {
+                needs_align = false;
+            }
+            
+            if (needs_align) {
+                static std::map<void*, void*> trampolines;
+                if (!trampolines.count(stubPtr)) trampolines[stubPtr] = CreateAlignedTrampoline(stubPtr);
+                return trampolines[stubPtr];
+            }
+            
             return stubPtr;
         }
     }
