@@ -11070,10 +11070,11 @@ void* NativeExecutionThread(void* arg) {
     uint32_t entry = g_entryPoint;
     
     // ВАЖНО: Стартовая точка iOS-приложений (crt1.o _start) не использует C-соглашение о вызовах!
-    // Она ожидает, что ядро (XNU) положило аргументы прямо на стек в определенном порядке.
+    // ИСПРАВЛЕНИЕ: ЖЕСТКОЕ ВЫРАВНИВАНИЕ СТЕКА К 8 БАЙТАМ для защиты драйверов MediaTek/Mali
     asm volatile (
-        "mov r0, #0\n"       // Выделяем 0 для NULL-указателей
-        "push {r0}\n"        // Padding для выравнивания стека (8 байт по стандарту ARM)
+        "mov r0, #0\n"
+        "bic sp, sp, #7\n"   // <--- КРИТИЧЕСКИЙ ФИКС: Сбрасываем 3 младших бита SP (выравнивание до 8)
+        "push {r0}\n"        // Padding для выравнивания стека (8 байт по стандарту ARM AAPCS)
         "push {r0}\n"        // apple[0] (доп. данные Mach-O, оставляем NULL)
         "push {r0}\n"        // envp[0]  (переменные окружения, NULL)
         "push {r0}\n"        // argv[1]  (конец списка аргументов, NULL)
@@ -11089,7 +11090,6 @@ void* NativeExecutionThread(void* arg) {
     LogToJava("NativeExecutionThread: Выход из iOS.");
     return nullptr;
 }
-
 
 // --- ЗАГЛУШКИ C++ ABI ДЛЯ STD::STRING (libstdc++ GCC 4.2) ---
 struct LibStdStringRep {
