@@ -1929,6 +1929,25 @@ std::map<GLuint, int> g_cpuTexH;
 GLuint g_cpuActiveTexture = 0;
 extern int g_clientActiveTexture;
 
+// Вспомогательная функция для вычисления точного размера текстуры в байтах
+static inline size_t SafeGetGLTextureSize(GLsizei width, GLsizei height, GLenum format, GLenum type) {
+    size_t bpp = 4;
+    if (format == GL_RGB && type == 0x8363) bpp = 2; // GL_UNSIGNED_SHORT_5_6_5
+    else if (format == GL_RGBA && type == 0x8033) bpp = 2; // GL_UNSIGNED_SHORT_4_4_4_4
+    else if (format == GL_RGBA && type == 0x8034) bpp = 2; // GL_UNSIGNED_SHORT_5_5_5_1
+    else if (format == GL_RGB && type == GL_UNSIGNED_BYTE) bpp = 3;
+    else if (format == GL_ALPHA && type == GL_UNSIGNED_BYTE) bpp = 1;
+    else if (format == 0x1909 && type == GL_UNSIGNED_BYTE) bpp = 1; // GL_LUMINANCE
+    else if (format == 0x190A && type == GL_UNSIGNED_BYTE) bpp = 2; // GL_LUMINANCE_ALPHA
+    else if (format == 0x80E1 && type == GL_UNSIGNED_BYTE) bpp = 4; // GL_BGRA_EXT
+
+    GLint align = 4;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
+    int rowLength = width * bpp;
+    int stride = rowLength + ((align - (rowLength % align)) % align);
+    return stride * height;
+}
+
 extern "C" void Stub_glBindTexture(GLenum target, GLuint texture) {
     if (target == GL_TEXTURE_2D) g_cpuActiveTexture = texture;
     glBindTexture(target, texture);
@@ -1936,7 +1955,6 @@ extern "C" void Stub_glBindTexture(GLenum target, GLuint texture) {
 
 extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
     LogToJava("[GL-TEX] glTexImage2D: tex=" + std::to_string(g_cpuActiveTexture) + " w=" + std::to_string(width) + " h=" + std::to_string(height) + " intFmt=0x" + std::to_string(internalformat) + " fmt=0x" + std::to_string(format) + " type=0x" + std::to_string(type) + " pixels=" + std::to_string(pixels != nullptr));
-    
     if (target == GL_TEXTURE_2D && level == 0) {
         g_cpuTexW[g_cpuActiveTexture] = width;
         g_cpuTexH[g_cpuActiveTexture] = height;
@@ -2047,20 +2065,21 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
                 std::fill(texBuf.begin(), texBuf.end(), 0xFFFF00FF);
             }
         }
-        
-        // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО ---
-        // Защищает драйвер MTK от невыровненных указателей стека игры.
-        // Мы отправляем наш безопасный, выделенный в куче std::vector.
-        GLint oldAlign = 4;
-        glGetIntegerv(GL_UNPACK_ALIGNMENT, &oldAlign);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-        glTexImage2D(target, level, GL_RGBA, width, height, border, GL_RGBA, GL_UNSIGNED_BYTE, texBuf.data());
-        glPixelStorei(GL_UNPACK_ALIGNMENT, oldAlign);
-        return;
+    }
+
+    // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО (ИСПРАВЛЕНИЕ КРАША MTK) ---
+    const GLvoid* safe_pixels = pixels;
+    std::vector<uint8_t> aligned_buf;
+    if (pixels != nullptr && ((uintptr_t)pixels % 8 != 0)) {
+        size_t totalBytes = SafeGetGLTextureSize(width, height, format, type);
+        if (totalBytes > 0) {
+            aligned_buf.resize(totalBytes);
+            memcpy(aligned_buf.data(), pixels, totalBytes);
+            safe_pixels = aligned_buf.data();
+        }
     }
     
-    // Фолбек для 3D текстур или мипмапов (если дойдет сюда)
-    glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    glTexImage2D(target, level, internalformat, width, height, border, format, type, safe_pixels);
 }
 
 extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
@@ -2146,38 +2165,47 @@ extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, 
                 }
             }
         }
-        
-        // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО ---
-        // Отправляем всю обновленную текстуру целиком, чтобы синхронизировать состояние.
-        GLint oldAlign = 4;
-        glGetIntegerv(GL_UNPACK_ALIGNMENT, &oldAlign);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-        glTexImage2D(target, level, GL_RGBA, texW, texH, 0, GL_RGBA, GL_UNSIGNED_BYTE, texBuf.data());
-        glPixelStorei(GL_UNPACK_ALIGNMENT, oldAlign);
-        return;
     }
-    glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+    
+    // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО (ИСПРАВЛЕНИЕ КРАША MTK) ---
+    const GLvoid* safe_pixels = pixels;
+    std::vector<uint8_t> aligned_buf;
+    if (pixels != nullptr && ((uintptr_t)pixels % 8 != 0)) {
+        size_t totalBytes = SafeGetGLTextureSize(width, height, format, type);
+        if (totalBytes > 0) {
+            aligned_buf.resize(totalBytes);
+            memcpy(aligned_buf.data(), pixels, totalBytes);
+            safe_pixels = aligned_buf.data();
+        }
+    }
+
+    glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, safe_pixels);
 }
 
 extern "C" void Stub_glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const GLvoid *data) {
     LogToJava("[GL-TEX] glCompressedTexSubImage2D called!");
-    // Перехватываем, чтобы железо не читало сырой указатель игры, если это неподдерживаемый PVRTC
-    if (target == GL_TEXTURE_2D && level == 0 && g_cpuTextures.count(g_cpuActiveTexture)) {
-        return; 
+    
+    // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО (ИСПРАВЛЕНИЕ КРАША MTK) ---
+    const GLvoid* safe_data = data;
+    std::vector<uint8_t> aligned_buf;
+    if (data != nullptr && imageSize > 0 && ((uintptr_t)data % 8 != 0)) {
+        aligned_buf.resize(imageSize);
+        memcpy(aligned_buf.data(), data, imageSize);
+        safe_data = aligned_buf.data();
     }
-    glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
+    
+    glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, safe_data);
 }
 
 extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid *data) {
     LogToJava("[GL-TEX] glCompressedTexImage2D: tex=" + std::to_string(g_cpuActiveTexture) + " w=" + std::to_string(width) + " h=" + std::to_string(height) + " intFmt=0x" + std::to_string(internalformat) + " size=" + std::to_string(imageSize));
-    
     if (target == GL_TEXTURE_2D && level == 0) {
         g_cpuTexW[g_cpuActiveTexture] = width;
         g_cpuTexH[g_cpuActiveTexture] = height;
         std::vector<uint32_t>& texBuf = g_cpuTextures[g_cpuActiveTexture];
         texBuf.resize(width * height);
         
-        // PVRTC не поддерживается на Android аппаратно. Рисуем безопасную шахматку.
+        // PVRTC не реализован на CPU. Рисуем серую шахматку.
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 bool isDark = ((x / 8) % 2) == ((y / 8) % 2);
@@ -2185,17 +2213,18 @@ extern "C" void Stub_glCompressedTexImage2D(GLenum target, GLint level, GLenum i
             }
         }
         LogToJava("HLE_WARNING: Stub_glCompressedTexImage2D PVRTC перехвачен! Заменено на шахматку.");
-        
-        // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО ---
-        // Сканируем несжатую шахматку аппаратному драйверу, чтобы он не упал при чтении битого указателя
-        GLint oldAlign = 4;
-        glGetIntegerv(GL_UNPACK_ALIGNMENT, &oldAlign);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-        glTexImage2D(target, level, GL_RGBA, width, height, border, GL_RGBA, GL_UNSIGNED_BYTE, texBuf.data());
-        glPixelStorei(GL_UNPACK_ALIGNMENT, oldAlign);
-        return;
     }
-    glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
+    
+    // --- БЕЗОПАСНАЯ ОТПРАВКА В ЖЕЛЕЗО (ИСПРАВЛЕНИЕ КРАША MTK) ---
+    const GLvoid* safe_data = data;
+    std::vector<uint8_t> aligned_buf;
+    if (data != nullptr && imageSize > 0 && ((uintptr_t)data % 8 != 0)) {
+        aligned_buf.resize(imageSize);
+        memcpy(aligned_buf.data(), data, imageSize);
+        safe_data = aligned_buf.data();
+    }
+    
+    glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, safe_data);
 }
 
 std::map<GLint, std::vector<float>> g_uniformShadowFloat;
