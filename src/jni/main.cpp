@@ -10683,7 +10683,7 @@ void LoadMachO(const std::string& bundlePath) {
     lseek(fd, arch_offset, SEEK_SET); mach_header mh; read(fd, &mh, sizeof(mh));
 
     // --- ПЕРВЫЙ ПРОХОД: Вычисляем min/max vmaddr и slide ---
-    uint32_t min_vmaddr = 0xFFFFFFFF; uint32_t max_vmaddr = 0;
+    g_min_vmaddr = 0xFFFFFFFF; g_max_vmaddr = 0;
     uint32_t scan_offset = arch_offset + sizeof(mach_header);
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         load_command lc; lseek(fd, scan_offset, SEEK_SET); read(fd, &lc, sizeof(lc));
