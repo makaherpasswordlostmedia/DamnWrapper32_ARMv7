@@ -11119,6 +11119,17 @@ void LoadMachO(const std::string& bundlePath) {
             if (seg.vmsize > 0) {
                 if (seg.vmaddr < min_vmaddr) min_vmaddr = seg.vmaddr;
                 if (seg.vmaddr + seg.vmsize > max_vmaddr) max_vmaddr = seg.vmaddr + seg.vmsize;
+                // Учитываем BSS/zerofill секции, которые могут выходить за vmsize сегмента
+                uint32_t sec_off2 = scan_offset + sizeof(segment_command);
+                for (uint32_t s2 = 0; s2 < seg.nsects; s2++) {
+                    section sect2; lseek(fd, sec_off2, SEEK_SET); read(fd, &sect2, sizeof(sect2));
+                    uint8_t stype2 = sect2.flags & 0xff;
+                    if ((stype2 == 1 || stype2 == 12) && sect2.size > 0) {
+                        uint32_t bss_end = sect2.addr + sect2.size;
+                        if (bss_end > max_vmaddr) max_vmaddr = bss_end;
+                    }
+                    sec_off2 += sizeof(section);
+                }
             }
         }
         scan_offset += lc.cmdsize;
@@ -11178,6 +11189,26 @@ void LoadMachO(const std::string& bundlePath) {
                     if (strncmp(sect.sectname, "__objc_classlist", 16) == 0) classlist_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
                     
+                    // Если BSS/zerofill секция выходит за vmsize сегмента — маппируем отдельно.
+                    // Линкер wolf3d занижает vmsize __DATA, не включая весь __bss/__common.
+                    // S_ZEROFILL=1, S_GB_ZEROFILL=12
+                    if ((type == 1 || type == 12) && sect.size > 0) {
+                        uint32_t seg_end = target_addr + seg.vmsize;
+                        uint32_t bss_end = sect.addr + sect.size;
+                        if (bss_end > seg_end) {
+                            uint32_t extra_start = (sect.addr >= seg_end) ? sect.addr : seg_end;
+                            extra_start = extra_start & ~4095u; // выровнять вниз
+                            uint32_t extra_end = (bss_end + 4095) & ~4095u;
+                            uint32_t extra_size = extra_end - extra_start;
+                            void* extra = mmap((void*)extra_start, extra_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+                            if (extra != MAP_FAILED) {
+                                char buf[192];
+                                snprintf(buf, sizeof(buf), "MMAP-BSS: Секция %.16s расширена: 0x%08X+0x%X (за vmsize сегмента)", sect.sectname, extra_start, extra_size);
+                                LogToJava(buf);
+                            }
+                        }
+                    }
+
                     MachOSectionInfo sinfo;
                     sinfo.name = std::string(sect.segname, strnlen(sect.segname, 16)) + "," + std::string(sect.sectname, strnlen(sect.sectname, 16));
                     sinfo.start = sect.addr;
