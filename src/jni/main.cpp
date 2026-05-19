@@ -8260,7 +8260,6 @@ extern "C" void* wrap_alcCreateContext(void* device, const int* attrlist) { LogT
 extern "C" uint8_t wrap_alcMakeContextCurrent(void* context) { LogToJava("HLE: alcMakeContextCurrent"); return 1; }
 extern "C" void wrap_alGenSources(int n, uint32_t* sources) { for(int i=0; i<n; i++) sources[i] = g_alIdCounter++; }
 extern "C" void wrap_alGenBuffers(int n, uint32_t* buffers) { for(int i=0; i<n; i++) buffers[i] = g_alIdCounter++; }
-
 extern "C" void wrap_alSourcei(uint32_t source, int param, int value) {
     JNIEnv* env = GetJNIEnv(); if (!env || !g_mainActivity) return;
     jclass clazz = env->GetObjectClass(g_mainActivity);
@@ -8370,6 +8369,81 @@ extern "C" void wrap_alcProcessContext(void* context) {}
 extern "C" void wrap_alcSuspendContext(void* context) {
     LogToJava("HLE: alcSuspendContext");
 }
+
+// --- Недостающие OpenAL функции ---
+// Wolf3D вызывает их при инициализации звуковой системы (Sound_Device_Setup).
+// Отсутствие resolve'а любой из них = вызов по нулевому/мусорному адресу = краш.
+
+extern "C" int wrap_alGetError() {
+    return 0; // AL_NO_ERROR
+}
+
+extern "C" int wrap_alcGetError(void* device) {
+    return 0; // ALC_NO_ERROR
+}
+
+extern "C" const char* wrap_alGetString(int param) {
+    // AL_VENDOR=0xB001, AL_RENDERER=0xB004, AL_VERSION=0xB002, AL_EXTENSIONS=0xB004
+    if (param == 0xB001) return "DamnWrapper";
+    if (param == 0xB002) return "1.1";
+    if (param == 0xB003) return "DamnWrapper OpenAL";
+    if (param == 0xB004) return "";
+    return "";
+}
+
+extern "C" void wrap_alEnable(int capability) {}
+extern "C" void wrap_alDisable(int capability) {}
+extern "C" uint8_t wrap_alIsEnabled(int capability) { return 0; }
+
+extern "C" void wrap_alDistanceModel(int distanceModel) {
+    LogToJava("HLE: alDistanceModel " + std::to_string(distanceModel));
+}
+extern "C" void wrap_alDopplerFactor(float value) {}
+extern "C" void wrap_alDopplerVelocity(float value) {}
+extern "C" void wrap_alSpeedOfSound(float value) {}
+
+// Listener
+extern "C" void wrap_alListener3f(int param, float v1, float v2, float v3) {}
+extern "C" void wrap_alListenerfv(int param, const float* values) {}
+extern "C" void wrap_alListeneri(int param, int value) {}
+extern "C" void wrap_alListener3i(int param, int v1, int v2, int v3) {}
+extern "C" void wrap_alListeneriv(int param, const int* values) {}
+extern "C" void wrap_alGetListenerf(int param, float* value) { if (value) *value = (param == 0x100A) ? 1.0f : 0.0f; }
+extern "C" void wrap_alGetListener3f(int param, float* v1, float* v2, float* v3) { if(v1)*v1=0; if(v2)*v2=0; if(v3)*v3=0; }
+extern "C" void wrap_alGetListenerfv(int param, float* values) {}
+extern "C" void wrap_alGetListeneri(int param, int* value) { if (value) *value = 0; }
+extern "C" void wrap_alGetListener3i(int param, int* v1, int* v2, int* v3) { if(v1)*v1=0; if(v2)*v2=0; if(v3)*v3=0; }
+extern "C" void wrap_alGetListeneriv(int param, int* values) {}
+
+// Source extra
+extern "C" void wrap_alSourcefv(uint32_t source, int param, const float* values) {}
+extern "C" void wrap_alSourceiv(uint32_t source, int param, const int* values) {}
+extern "C" void wrap_alSource3i(uint32_t source, int param, int v1, int v2, int v3) {}
+extern "C" void wrap_alGetSourcef(uint32_t source, int param, float* value) { if (value) *value = 0.0f; }
+extern "C" void wrap_alGetSource3f(uint32_t source, int param, float* v1, float* v2, float* v3) { if(v1)*v1=0;if(v2)*v2=0;if(v3)*v3=0; }
+extern "C" void wrap_alGetSourcefv(uint32_t source, int param, float* values) {}
+extern "C" void wrap_alGetSourceiv(uint32_t source, int param, int* values) {}
+
+// Buffer extra
+extern "C" void wrap_alBufferi(uint32_t buffer, int param, int value) {}
+extern "C" void wrap_alBuffer3i(uint32_t buffer, int param, int v1, int v2, int v3) {}
+extern "C" void wrap_alBuffer3f(uint32_t buffer, int param, float v1, float v2, float v3) {}
+extern "C" void wrap_alBufferiv(uint32_t buffer, int param, const int* values) {}
+extern "C" void wrap_alGetBufferi(uint32_t buffer, int param, int* value) { if (value) *value = 0; }
+extern "C" void wrap_alGetBuffer3i(uint32_t buffer, int param, int* v1, int* v2, int* v3) { if(v1)*v1=0;if(v2)*v2=0;if(v3)*v3=0; }
+extern "C" void wrap_alGetBufferf(uint32_t buffer, int param, float* value) { if (value) *value = 0.0f; }
+extern "C" void wrap_alGetBuffer3f(uint32_t buffer, int param, float* v1, float* v2, float* v3) { if(v1)*v1=0;if(v2)*v2=0;if(v3)*v3=0; }
+extern "C" void wrap_alGetBufferfv(uint32_t buffer, int param, float* values) {}
+extern "C" void wrap_alGetBufferiv(uint32_t buffer, int param, int* values) {}
+extern "C" void wrap_alBufferfv(uint32_t buffer, int param, const float* values) {}
+
+extern "C" uint8_t wrap_alIsSource(uint32_t sid) { return sid >= 1 && sid < (uint32_t)g_alIdCounter ? 1 : 0; }
+extern "C" uint8_t wrap_alIsBuffer(uint32_t bid) { return bid >= 1 && bid < (uint32_t)g_alIdCounter ? 1 : 0; }
+
+extern "C" void wrap_alSourceUnqueueBuffers(uint32_t source, int nb, uint32_t* buffers) {
+    if (buffers) for (int i = 0; i < nb; i++) buffers[i] = 0;
+}
+// --- Конец недостающих OpenAL функций ---
 
 extern "C" int* wrap___error() { return &errno; }
 
@@ -10502,7 +10576,19 @@ std::map<std::string, void*> g_hleStubs = {
  STB_W(CFStringCreateExternalRepresentation), STB_W(CFStringCreateFromExternalRepresentation), STB_W(CFStringCreateWithCStringNoCopy), STB_W(CFStringCreateWithCharacters), STB_W(CFStringGetCharacters), STB_W(CFStringGetMaximumSizeForEncoding), STB_W(CFStringGetTypeID), STB_W(CFURLCreateFromFileSystemRepresentation), STB_W(CFURLCreateStringByAddingPercentEscapes), STB_W(CFURLCreateStringByReplacingPercentEscapes), STB_W(CFURLCreateWithString), STB_W(CFArrayCreate), STB_W(CFArrayCreateMutable), STB_W(CFArrayGetCount), STB_W(CFArrayGetValueAtIndex), STB_W(CFArrayAppendValue), STB_W(CFArrayRemoveAllValues), STB_W(CFDictionaryCreateMutable), STB_W(CFDictionaryGetValue), STB_W(CFDictionarySetValue), STB_W(CFDictionaryRemoveValue), STB_W(CFBundleGetInfoDictionary), STB_W(CFBundleGetMainBundle), STB_W(CFBundleGetIdentifier), STB_W(CFBundleGetValueForInfoDictionaryKey), STB_W(CFBundleCopyResourcesDirectoryURL), STB_W(CFURLCopyFileSystemPath), STB_W(CFURLGetFileSystemRepresentation), STB_W(CFRunLoopGetCurrent), STB_W(CFRunLoopGetMain), STB_W(CFUUIDCreate), STB_W(CFUUIDCreateString), STB_W(CFTimeZoneCopySystem), STB_W(CFTimeZoneCopyDefault), STB_W(CFTimeZoneGetName), STB_W(CFTimeZoneGetSecondsFromGMT), STB_W(CFAbsoluteTimeGetGregorianDate), STB_W(CFAbsoluteTimeGetDayOfWeek), STB_W(CC_MD5), STB_W(CC_SHA1), STB_W(CC_SHA256), STB_W(CCCrypt), STB_W(CCCryptorCreate), STB_W(CCCryptorUpdate), STB_W(CCCryptorFinal), STB_W(CCCryptorRelease), STB_W(CCCryptorGetOutputLength), STB_W(AudioComponentFindNext), STB_W(AudioComponentInstanceNew), STB_W(UIGraphicsGetCurrentContext), STB_W(UIGraphicsPushContext), STB_W(UIGraphicsPopContext), STB_W(UIGraphicsBeginImageContext), STB_W(UIGraphicsEndImageContext), STB_W(UIGraphicsGetImageFromCurrentImageContext), STB_W(UIRectFill), STB_W(UIImagePNGRepresentation), STB_W(NSAllocateObject), STB_W(NSStringFromClass), STB_W(NSStringFromSelector), STB_W(CFBitVectorCreate), STB_W(CFBitVectorCreateMutableCopy), STB_W(CFBitVectorGetBitAtIndex), STB_W(CFBitVectorSetBitAtIndex),
     STB_V(kCFAllocatorDefault), STB_V(kCFAllocatorNull), STB_V(kCFBooleanFalse), STB_V(kCFBooleanTrue), STB_V(kCFErrorDescriptionKey), STB_V(kCFHTTPVersion1_1), STB_V(kCFPreferencesAnyHost), STB_V(kCFPreferencesCurrentUser), STB_V(kCFStreamPropertyHTTPResponseHeader), STB_V(kCFStreamPropertyHTTPShouldAutoredirect), STB_V(kSecAttrAccessGroup), STB_V(kSecAttrAccount), STB_V(kSecAttrGeneric), STB_V(kSecAttrService), STB_V(kSecClass), STB_V(kSecClassGenericPassword), STB_V(kSecMatchLimit), STB_V(kSecMatchLimitOne), STB_V(kSecReturnAttributes), STB_V(kSecReturnData), STB_V(kSecValueData), STB_V(kCFRunLoopDefaultMode), STB_V(kCFRunLoopCommonModes), STB_V(kCFTypeArrayCallBacks), STB_V(kCFTypeDictionaryKeyCallBacks), STB_V(kCFTypeDictionaryValueCallBacks), STB_V(kCFBundleIdentifierKey), STB_V(kCFNumberNaN), STB_V(kCFNumberNegativeInfinity), STB_V(kCFNumberPositiveInfinity), {"_ADBannerContentSizeIdentifierLandscape", (void*)&hle_ADBannerContentSizeIdentifierLandscape_ptr}, {"_ADBannerContentSizeIdentifierPortrait", (void*)&hle_ADBannerContentSizeIdentifierPortrait_ptr},
     
-    STB_W(alcOpenDevice), STB_W(alcCreateContext), STB_W(alcMakeContextCurrent), STB_W(alGenSources), STB_W(alGenBuffers), STB_W(alSourcei), STB_W(alSourcef), STB_W(alBufferData), STB_W(alSourceQueueBuffers), STB_W(alSourcePlay), STB_W(alSourceStop), STB_W(alDeleteBuffers), STB_W(alDeleteSources), STB_W(alGetSourcei), STB_W(alListenerf), STB_W(alSource3f), STB_W(alcCloseDevice), STB_W(alcDestroyContext), STB_W(alcGetString), STB_W(alcProcessContext), STB_W(alcSuspendContext), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
+    STB_W(alcOpenDevice), STB_W(alcCreateContext), STB_W(alcMakeContextCurrent), STB_W(alGenSources), STB_W(alGenBuffers), STB_W(alSourcei), STB_W(alSourcef), STB_W(alBufferData), STB_W(alSourceQueueBuffers), STB_W(alSourcePlay), STB_W(alSourceStop), STB_W(alDeleteBuffers), STB_W(alDeleteSources), STB_W(alGetSourcei), STB_W(alListenerf), STB_W(alSource3f), STB_W(alcCloseDevice), STB_W(alcDestroyContext), STB_W(alcGetString), STB_W(alcProcessContext), STB_W(alcSuspendContext),
+    // Недостающие OpenAL функции — без них _Sound_Device_Setup крашится
+    STB_W(alGetError), STB_W(alcGetError), STB_W(alGetString),
+    STB_W(alEnable), STB_W(alDisable), STB_W(alIsEnabled),
+    STB_W(alDistanceModel), STB_W(alDopplerFactor), STB_W(alDopplerVelocity), STB_W(alSpeedOfSound),
+    STB_W(alListener3f), STB_W(alListenerfv), STB_W(alListeneri), STB_W(alListener3i), STB_W(alListeneriv),
+    STB_W(alGetListenerf), STB_W(alGetListener3f), STB_W(alGetListenerfv), STB_W(alGetListeneri), STB_W(alGetListener3i), STB_W(alGetListeneriv),
+    STB_W(alSourcefv), STB_W(alSourceiv), STB_W(alSource3i),
+    STB_W(alGetSourcef), STB_W(alGetSource3f), STB_W(alGetSourcefv), STB_W(alGetSourceiv),
+    STB_W(alBufferi), STB_W(alBuffer3i), STB_W(alBuffer3f), STB_W(alBufferiv), STB_W(alBufferfv),
+    STB_W(alGetBufferi), STB_W(alGetBuffer3i), STB_W(alGetBufferf), STB_W(alGetBuffer3f), STB_W(alGetBufferfv), STB_W(alGetBufferiv),
+    STB_W(alIsSource), STB_W(alIsBuffer),
+    STB_W(alSourceUnqueueBuffers), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
     {"_SCNetworkReachabilityScheduleWithRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }}, {"_SCNetworkReachabilitySetCallback", (void*)+[](void* target, void* callout, void* context) -> bool { return true; }}, {"_SCNetworkReachabilityUnscheduleFromRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }},
     {"__Block_object_assign", (void*)wrap_Block_object_assign}, {"__Block_copy", (void*)wrap_Block_copy}, {"__Block_release", (void*)wrap_Block_release},
 
@@ -11151,6 +11237,11 @@ void LoadMachO(const std::string& bundlePath) {
     }
     // --------------------------------------------------------
 
+    // Очищаем глобальный список секций перед заполнением — иначе при повторном
+    // вызове LoadMachO (или после hot-reload) накапливаются дублирующие записи,
+    // что приводит к двойному ребейзу через второй проход.
+    g_machoSections.clear();
+
     uint32_t cmd_offset = arch_offset + sizeof(mach_header); symtab_command symtab = {0}; dysymtab_command dysymtab = {0}; uint32_t dyld_bind_off = 0, dyld_bind_size = 0; uint32_t dyld_lazy_bind_off = 0, dyld_lazy_bind_size = 0; uint32_t dyld_rebase_off = 0, dyld_rebase_size = 0; std::vector<segment_command> loaded_segments; std::vector<section> dysym_sections; std::vector<section> classlist_sections; std::vector<section> init_func_sections;
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         lseek(fd, cmd_offset, SEEK_SET); load_command lc; read(fd, &lc, sizeof(lc));
@@ -11570,60 +11661,50 @@ void LoadMachO(const std::string& bundlePath) {
                     }
                     scan_cmd_offset += lc.cmdsize;
                 }
-                // === ВТОРОЙ ПРОХОД: повторное сканирование __data и __const ===
-                // Диагностика: найти слоты с двойным ребейзом ДО второго прохода
-                {
-                    uint32_t pre_slid_min = min_vmaddr + g_appSlide;
-                    uint32_t pre_slid_max = max_vmaddr + g_appSlide;
-                    for (const auto& sec_pre : g_machoSections) {
-                        if (sec_pre.name.find("__DATA,__data") == std::string::npos) continue;
-                        uint32_t sz = sec_pre.end - sec_pre.start;
-                        if (sz < 4) continue;
-                        uint32_t* pp = (uint32_t*)sec_pre.start;
-                        for (uint32_t jj = 0; jj < sz/4; jj++) {
-                            uint32_t vv = pp[jj];
-                            if (vv > pre_slid_max) {
-                                uint32_t vv_back = vv - g_appSlide;
-                                if (vv_back >= pre_slid_min && vv_back < pre_slid_max) {
-                                    char pre_buf[256];
-                                    snprintf(pre_buf, sizeof(pre_buf),
-                                        "PRE-PASS2-DOUBLE: [__data+0x%X] val=0x%08X (double, back=0x%08X)",
-                                        jj*4, vv, vv_back);
-                                    LogToJava(std::string(pre_buf));
-                                }
-                            }
-                        }
-                        break; // только __data
-                    }
-                }
-                // Некоторые указатели пропускаются первым проходом из-за PIC-эвристики
-                // или ложных срабатываний isValidString до того, как секции были полностью готовы.
+                // === ВТОРОЙ ПРОХОД: только секции-таблицы указателей, которые первый проход
+                // мог пропустить целиком. __DATA,__data НЕ включаем — он уже обработан
+                // первым проходом с эвристическими проверками. Добавлять его сюда без
+                // аналогичных проверок означает ребейзить числовые поля структур (flags,
+                // modified, value у cvar_t и т.п.), что ломает логику игры.
                 {
                     uint32_t second_pass_count = 0;
                     for (const auto& sec2 : g_machoSections) {
-                        bool is_data_sec = (sec2.name.find("__DATA,__data") != std::string::npos ||
-                                            sec2.name.find("__DATA,__const") != std::string::npos ||
-                                            sec2.name.find("__DATA,__cfstring") != std::string::npos ||
-                                            sec2.name.find("__DATA,__objc_data") != std::string::npos ||
-                                            sec2.name.find("__DATA,__objc_const") != std::string::npos);
-                        if (!is_data_sec) continue;
+                        // Только секции где каждое выровненное 32-битное слово — указатель.
+                        // __DATA,__data исключён намеренно: там смесь данных и указателей,
+                        // безопасно обрабатывается только первым проходом с проверками.
+                        bool is_ptr_table_sec = (
+                            sec2.name.find("__DATA,__const") != std::string::npos ||
+                            sec2.name.find("__DATA,__cfstring") != std::string::npos ||
+                            sec2.name.find("__DATA,__objc_data") != std::string::npos ||
+                            sec2.name.find("__DATA,__objc_const") != std::string::npos ||
+                            sec2.name.find("__DATA,__objc_classrefs") != std::string::npos ||
+                            sec2.name.find("__DATA,__objc_superrefs") != std::string::npos ||
+                            sec2.name.find("__DATA,__objc_selrefs") != std::string::npos ||
+                            sec2.name.find("__DATA,__objc_classlist") != std::string::npos ||
+                            sec2.name.find("__DATA,__objc_catlist") != std::string::npos ||
+                            sec2.name.find("__DATA,__objc_protolist") != std::string::npos ||
+                            sec2.name.find("__DATA,__objc_protorefs") != std::string::npos);
+                        if (!is_ptr_table_sec) continue;
                         uint32_t sec2_size = sec2.end - sec2.start;
                         if (sec2_size < 4) continue;
                         uint32_t* ptr2 = (uint32_t*)sec2.start;
                         uint32_t count2 = sec2_size / 4;
                         bool is_cfstring_sec = (sec2.name.find("__cfstring") != std::string::npos);
                         for (uint32_t j2 = 0; j2 < count2; j2++) {
-                            // ФИКС: В __cfstring структура = {isa[0], flags[1], str_ptr[2], length[3]}.
-                            // Поля flags(1) и length(3) — не указатели, ребейзить их нельзя.
+                            // В __cfstring структура = {isa[0], flags[1], str_ptr[2], length[3]}.
+                            // Поля flags(1) и length(3) — не указатели, пропускаем.
                             if (is_cfstring_sec && (j2 % 4 == 1 || j2 % 4 == 3)) continue;
                             uint32_t val2 = ptr2[j2];
-                            // Уже ребейзнутый?
                             uint32_t slid_min2 = min_vmaddr + g_appSlide;
                             uint32_t slid_max2 = max_vmaddr + g_appSlide;
+                            // Уже ребейзнутый — пропустить
                             if (val2 >= slid_min2 && val2 < slid_max2) continue;
-                            // В оригинальном диапазоне?
+                            // Не в оригинальном диапазоне — не указатель
                             if (val2 < min_vmaddr || val2 >= max_vmaddr || val2 <= 0x1000) continue;
+                            // Указатели должны быть выровнены по 4 байтам
+                            if ((val2 & 3) != 0) continue;
                             uintptr_t slot2 = (uintptr_t)&ptr2[j2];
+                            // Уже обработан первым проходом
                             if (g_rebasedSlots.find(slot2) != g_rebasedSlots.end()) continue;
                             // Цель должна попадать в известную секцию
                             uint32_t shifted2 = val2 + g_appSlide;
@@ -11637,34 +11718,11 @@ void LoadMachO(const std::string& bundlePath) {
                             second_pass_count++;
                         }
                     }
-                    LogToJava("REBASE-TRACE: Второй проход (__data/__const): дополнительно сдвинуто " + std::to_string(second_pass_count) + " указателей.");
-
-                    // ДИАГНОСТИКА: логируем состояние слота 0x10040a68 (cvar_t s_device) после всех проходов
-                    {
-                        uint32_t diag_slid = 0x10040a68;
-                        uint32_t diag_slid_min = min_vmaddr + g_appSlide;
-                        uint32_t diag_slid_max = max_vmaddr + g_appSlide;
-                        if (diag_slid >= diag_slid_min && diag_slid < diag_slid_max) {
-                            uint32_t* diag_ptr = (uint32_t*)diag_slid;
-                            char diag_buf[256];
-                            // Логируем первые 8 dwords (начало cvar_t структуры)
-                            snprintf(diag_buf, sizeof(diag_buf),
-                                "CVAR-DIAG: [0x%08X] = 0x%08X 0x%08X 0x%08X 0x%08X (cvar_t s_device dump, slid_range=[0x%X,0x%X))",
-                                diag_slid, diag_ptr[0], diag_ptr[1], diag_ptr[2], diag_ptr[3],
-                                diag_slid_min, diag_slid_max);
-                            LogToJava(std::string(diag_buf));
-                        }
-                    }
+                    LogToJava("REBASE-TRACE: Второй проход (ptr-table секции): дополнительно сдвинуто " + std::to_string(second_pass_count) + " указателей.");
                 }
                 // === КОНЕЦ ВТОРОГО ПРОХОДА ===
 
                 // === SANITY PASS: откатываем двойной ребейз только в известных literal pool слотах ===
-                // Проблема предыдущей реализации: сканирование __text по 4 байта как uint32[]
-                // без учёта границ инструкций — Thumb-2 инструкции, чьи байты случайно образуют
-                // значение 0x20xxxxxx, ошибочно перезаписываются и ломают код (краш в glGenBuffers).
-                // Правильное решение: проверяем ТОЛЬКО слоты из g_rebasedSlots — те адреса,
-                // которые кастомный парсер явно идентифицировал как literal pool entries и изменил.
-                // Если после ребейза значение оказалось > slid_max (двойной ребейз) — откатываем.
                 {
                     uint32_t sanity_fixed = 0;
                     uint32_t slid_min = min_vmaddr + g_appSlide;
@@ -11698,53 +11756,6 @@ void LoadMachO(const std::string& bundlePath) {
                     }
                 }
                 // === КОНЕЦ SANITY PASS ===
-
-                // === DATA SANITY PASS: откатываем двойной ребейз в data-секциях ===
-                // Значения > slid_max в data = double-rebase. Безопасно откатить если
-                // v - g_appSlide попадает в [slid_min, slid_max).
-                {
-                    uint32_t data_sanity_fixed = 0;
-                    uint32_t slid_min_ds = min_vmaddr + g_appSlide;
-                    uint32_t slid_max_ds = max_vmaddr + g_appSlide;
-                    for (const auto& sec : g_machoSections) {
-                        bool is_data = (sec.name.find("__DATA") != std::string::npos ||
-                                        sec.name.find("__data") != std::string::npos ||
-                                        sec.name.find("__const") != std::string::npos ||
-                                        sec.name.find("__objc_") != std::string::npos ||
-                                        sec.name.find("__cfstring") != std::string::npos);
-                        bool is_code_or_str = (sec.name.find("__text") != std::string::npos ||
-                                               sec.name.find("__cstring") != std::string::npos ||
-                                               sec.name.find("__objc_methname") != std::string::npos ||
-                                               sec.name.find("__objc_classname") != std::string::npos ||
-                                               sec.name.find("__objc_methtype") != std::string::npos ||
-                                               sec.name.find("__stub") != std::string::npos ||
-                                               sec.name.find("__bss") != std::string::npos ||
-                                               sec.name.find("__common") != std::string::npos);
-                        if (!is_data || is_code_or_str) continue;
-                        uint32_t sec_size = sec.end - sec.start;
-                        if (sec_size < 4) continue;
-                        uint32_t* dp = (uint32_t*)sec.start;
-                        uint32_t dc = sec_size / 4;
-                        for (uint32_t j = 0; j < dc; j++) {
-                            uint32_t v = dp[j];
-                            if (v <= slid_max_ds) continue;
-                            uint32_t v_back = v - g_appSlide;
-                            if (v_back >= slid_min_ds && v_back < slid_max_ds) {
-                                char dbg_buf[256];
-                                snprintf(dbg_buf, sizeof(dbg_buf),
-                                    "DATA-SANITY: [%s+0x%X] 0x%08X -> 0x%08X (rollback double-rebase)",
-                                    sec.name.c_str(), j*4, v, v_back);
-                                LogToJava(std::string(dbg_buf));
-                                dp[j] = v_back;
-                                data_sanity_fixed++;
-                            }
-                        }
-                    }
-                    if (data_sanity_fixed > 0) {
-                        LogToJava("REBASE-SANITY: Откатано двойных ребейзов в data-секциях: " + std::to_string(data_sanity_fixed));
-                    }
-                }
-                // === КОНЕЦ DATA SANITY PASS ===
 
                 LogToJava("CUSTOM-PARSER: Обработка Mach-O завершена.");
             }
