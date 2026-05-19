@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <ucontext.h>
 #include <map>
+#include <unordered_set>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -8784,6 +8785,17 @@ extern "C" int wrap___snprintf_chk(char *str, size_t maxlen, int flag, size_t bo
     }
     return ret; 
 }
+// iOS/Darwin security wrappers — не реализованы, но нужны для корректной работы строк
+extern "C" int wrap___vsnprintf_chk(char *str, size_t maxlen, int flag, size_t bos, const char *format, va_list ap) {
+    return vsnprintf(str, maxlen, format, ap);
+}
+extern "C" char* wrap___strncpy_chk(char* dst, const char* src, size_t len, size_t dstlen) {
+    return strncpy(dst, src, len);
+}
+extern "C" int wrap_putc(int c, void* fp) { return fputc(c, unwrap_file(fp)); }
+extern "C" double wrap_rint(double x) { return round(x); }
+extern "C" float wrap_rintf(float x) { return roundf(x); }
+extern "C" char* wrap_dlerror(void) { return nullptr; }
 extern "C" int wrap___tolower(int c) { return (c >= 'A' && c <= 'Z') ? (c + 32) : c; }
 extern "C" int wrap___toupper(int c) { return (c >= 'a' && c <= 'z') ? (c - 32) : c; }
 
@@ -10377,7 +10389,8 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(glEnableClientState), STB_W(glDisableClientState), STB_W(glVertexPointer), STB_W(glColorPointer), STB_W(glTexCoordPointer), STB_W(glNormalPointer), STB_W(glClientActiveTexture), STB_W(glColor4f), STB_W(glColor4ub), STB_W(glMultiTexCoord4f), STB_W(glNormal3f), STB_W(glAlphaFunc), STB_W(glLoadIdentity), STB_W(glLoadMatrixf), STB_W(glMatrixMode), STB_W(glPopMatrix), STB_W(glPushMatrix), STB_W(glScalef), STB_W(glTranslatef), STB_W(glRotatef), STB_W(glOrthof), STB_W(glFrustumf), STB_W(glMultMatrixf), STB_W(glShadeModel), STB_W(glTexEnvf), STB_W(glTexEnvfv), STB_W(glTexEnvi), STB_W(glClipPlanef), STB_W(glDiscardFramebufferEXT), STB_W(glFogf), STB_W(glFogfv), STB_W(glLightModelf), STB_W(glLightModelfv), STB_W(glLightf), STB_W(glLightfv), STB_W(glMaterialf), STB_W(glMaterialfv),     STB_W(glPointParameterf), STB_W(glPointParameterfv), STB_W(glPointSize), STB_W(glResolveMultisampleFramebufferAPPLE), STB_W(glTexEnvx), STB_W(glCurrentPaletteMatrixOES), STB_W(glLoadPaletteFromModelViewMatrixOES), STB_W(glMatrixIndexPointerOES), STB_W(glWeightPointerOES), STB_W(glPointSizePointerOES),
     {"_glCurrentPaletteMatrix", (void*)wrap_glCurrentPaletteMatrixOES}, {"_glLoadPaletteFromModelViewMatrix", (void*)wrap_glLoadPaletteFromModelViewMatrixOES}, {"_glMatrixIndexPointer", (void*)wrap_glMatrixIndexPointerOES}, {"_glWeightPointer", (void*)wrap_glWeightPointerOES},
 
-    STB_W(__assert_rtn), STB_W(__error), STB_W(__memset_chk), STB_W(strnstr), STB_W(__memcpy_chk), STB_W(__memmove_chk), STB_W(__strcpy_chk), STB_W(__strcat_chk), STB_W(__sprintf_chk), STB_W(__snprintf_chk), STB_W(__tolower), STB_W(__toupper),
+    STB_W(__assert_rtn), STB_W(__error), STB_W(__memset_chk), STB_W(strnstr), STB_W(__memcpy_chk), STB_W(__memmove_chk), STB_W(__strcpy_chk), STB_W(__strcat_chk), STB_W(__sprintf_chk), STB_W(__snprintf_chk), STB_W(__vsnprintf_chk), STB_W(__strncpy_chk), STB_W(__tolower), STB_W(__toupper),
+    {"_putc", (void*)wrap_putc}, {"_rint", (void*)wrap_rint}, {"_rintf", (void*)wrap_rintf}, {"_dlerror", (void*)wrap_dlerror},
     {"__Znwm", (void*)wrap_malloc}, {"__Znwj", (void*)wrap_malloc}, {"__Znam", (void*)wrap_malloc}, {"__Znaj", (void*)wrap_malloc}, {"__ZdlPv", (void*)wrap_free}, {"__ZdaPv", (void*)wrap_free},
     {"___dynamic_cast", (void*)wrap_dynamic_cast}, {"___cxa_throw", (void*)wrap_cxa_throw}, {"___cxa_allocate_exception", (void*)malloc}, {"___cxa_free_exception", (void*)free}, STB_W(__cxa_guard_acquire), STB_W(__cxa_guard_release), STB_W(__cxa_begin_catch), STB_W(__cxa_call_unexpected), STB_W(__cxa_rethrow), STB_W(objc_begin_catch), STB_W(_Unwind_SjLj_Resume), STB_W(dyld_stub_binder), STB_W(__divsi3), STB_W(__fixdfdi), STB_W(__fixsfdi), STB_W(__fixunsdfdi), STB_W(__floatdidf), STB_W(__floatundidf), STB_W(__floatundisf), STB_W(__gxx_personality_sj0), STB_W(__maskrune), STB_W(__modsi3), STB_W(__objc_personality_v0), STB_W(__udivdi3), STB_W(__udivsi3), STB_W(__divdi3), STB_W(__fixunssfdi), STB_W(__cxa_demangle), STB_W(__umoddi3), STB_W(__umodsi3),
     STB_W(crc32), STB_W(deflate), STB_W(deflateEnd), STB_W(deflateInit2_), STB_W(inflate), STB_W(inflateEnd), STB_W(inflateInit2_), STB_W(inflateInit_), STB_W(inflateReset),
@@ -10989,6 +11002,10 @@ void LoadMachO(const std::string& bundlePath) {
                 char hexSlide[32]; snprintf(hexSlide, sizeof(hexSlide), "0x%X", g_appSlide);
                 LogToJava(std::string("HLE: Применяем Total Rebase (Custom Parser), смещение: ") + hexSlide);
 
+                // ЗАЩИТА ОТ ДВОЙНОГО РЕБЕЙЗА: множество физических адресов уже ребейзнутых слотов
+                // Нужна т.к. wolf3d имеет две секции __const (в __TEXT и __DATA) и literal pools в __text
+                std::unordered_set<uintptr_t> g_rebasedSlots;
+
                 // ZLIB PROTECTOR: Сканируем память на наличие магических таблиц Zlib до начала ребейза
                 std::vector<std::pair<uint32_t, uint32_t>> zlib_blacklist;
                 auto add_to_blacklist = [&](const uint8_t* sig, size_t sig_len, size_t size_to_blacklist, const char* name) {
@@ -11033,7 +11050,8 @@ void LoadMachO(const std::string& bundlePath) {
                         uint32_t sect_offset = scan_cmd_offset + sizeof(segment_command);
                         for(uint32_t s = 0; s < seg.nsects; s++) {
                             section sect; lseek(fd, sect_offset, SEEK_SET); read(fd, &sect, sizeof(sect));
-                            std::string sectname = sect.sectname;
+                            // sect.sectname — char[16], может не иметь нуль-терминатора!
+                            std::string sectname(sect.sectname, strnlen(sect.sectname, 16));
                             
                             bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub");
                             bool isString = (sectname == "__cstring" || sectname == "__objc_methname" || sectname == "__objc_classname" || sectname == "__objc_methtype");
@@ -11114,9 +11132,13 @@ void LoadMachO(const std::string& bundlePath) {
                                                 memcpy(&val, (void*)shifted_literal, 4);
                                                 
                                                 if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
-                                                    val += g_appSlide;
-                                                    memcpy((void*)shifted_literal, &val, 4);
-                                                    modified_literals++;
+                                                    // Защита от двойного ребейза: пропускаем уже обработанные слоты
+                                                    if (g_rebasedSlots.find(shifted_literal) == g_rebasedSlots.end()) {
+                                                        val += g_appSlide;
+                                                        memcpy((void*)shifted_literal, &val, 4);
+                                                        g_rebasedSlots.insert(shifted_literal);
+                                                        modified_literals++;
+                                                    }
                                                 }
                                             }
                                         }
@@ -11230,8 +11252,14 @@ void LoadMachO(const std::string& bundlePath) {
                                         }
 
                                         if (safe_to_rebase) {
-                                            ptr[j] = val + g_appSlide;
-                                            data_rebased_count++;
+                                            uintptr_t slot_addr = (uintptr_t)&ptr[j];
+                                            if (g_rebasedSlots.find(slot_addr) == g_rebasedSlots.end()) {
+                                                ptr[j] = val + g_appSlide;
+                                                g_rebasedSlots.insert(slot_addr);
+                                                data_rebased_count++;
+                                            } else {
+                                                if (f_diag) fprintf(f_diag, "  -> SKIPPED (double-rebase guard)\n");
+                                            }
                                         }
                                     }
                                 }
