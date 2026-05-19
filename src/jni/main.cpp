@@ -11345,14 +11345,47 @@ void LoadMachO(const std::string& bundlePath) {
                                     
                                     if (is_ldr_pc && literal_addr >= min_vmaddr && literal_addr < max_vmaddr) {
                                         // Интеллектуальный Lookahead: Ищем ADD Rd, PC (паттерн позиционно-независимого кода)
+                                        // Увеличен до 64 инструкций: iOS-компилятор (llvm/gcc armv7) генерирует PIC-паттерны
+                                        // где ADD Rd, PC может отстоять на десятки инструкций от LDR Rd, [PC, #N].
+                                        // Если найден ADD Rd, PC — значение в literal pool является PIC-смещением,
+                                        // ребейзить его нельзя, иначе ADD Rd, PC даст address + 2*slide.
+                                        // Дополнительно: если Rd перезаписывается раньше ADD — ADD не относится к этому LDR,
+                                        // поэтому сбрасываем поиск и считаем что это абсолютный адрес.
                                         bool is_pic_offset = false;
                                         const uint16_t* scan_ptr = ptr + (insn_size / 2);
-                                        for (int i = 0; i < 12 && (const uint8_t*)scan_ptr < code + code_size; i++) {
+                                        for (int i = 0; i < 64 && (const uint8_t*)scan_ptr < code + code_size; i++) {
                                             uint16_t scan_hw = *scan_ptr;
+                                            // Проверяем ADD Rd, PC
                                             if (target_rd < 8 && scan_hw == (0x4478 | target_rd)) {
                                                 is_pic_offset = true; break;
                                             } else if (target_rd >= 8 && scan_hw == (0x44F8 | (target_rd & 7))) {
                                                 is_pic_offset = true; break;
+                                            }
+                                            // Проверяем перезапись Rd: если регистр переписан до ADD Rd, PC —
+                                            // этот LDR уже не PIC. Проверяем наиболее распространённые случаи:
+                                            // MOV Rd, Rm (T1: 0x4600 | Rd<<3 ... нет, Thumb MOV Rd,Rm = 0x4600|(Rm<<3)|Rd для lo)
+                                            // LDR Rd, [...] (другой LDR в тот же регистр) — просто выходим
+                                            {
+                                                bool clobbers = false;
+                                                size_t sw_size = GetThumbInstructionSize(scan_hw);
+                                                if (sw_size == 2) {
+                                                    // 16-bit LDR Rd,[...]: 0x4800|(Rd<<8) — новый LDR в тот же Rd
+                                                    if ((scan_hw & 0xF800) == 0x4800 && ((scan_hw >> 8) & 7) == (target_rd & 7) && target_rd < 8)
+                                                        clobbers = true;
+                                                    // MOV Rd, #imm (MOVS): 0x2000|(Rd<<8)|imm — перезапись Rd
+                                                    if ((scan_hw & 0xF800) == 0x2000 && ((scan_hw >> 8) & 7) == (target_rd & 7) && target_rd < 8)
+                                                        clobbers = true;
+                                                } else if (sw_size == 4) {
+                                                    uint16_t hw2_scan = *(scan_ptr + 1);
+                                                    uint32_t rd_field = (hw2_scan >> 12) & 0xF;
+                                                    // LDR.W Rd,[PC,#imm] (0xF85F/0xF8DF): новый LDR в тот же Rd
+                                                    if ((scan_hw & 0xFF7F) == 0xF85F && rd_field == target_rd)
+                                                        clobbers = true;
+                                                    // MOV.W / MOVW Rd,#imm (0xF240 | ...): перезапись Rd
+                                                    if ((scan_hw & 0xFBF0) == 0xF240 && rd_field == target_rd)
+                                                        clobbers = true;
+                                                }
+                                                if (clobbers) break; // Rd перезаписан — ADD Rd,PC уже не наш
                                             }
                                             scan_ptr += GetThumbInstructionSize(scan_hw) / 2;
                                         }
