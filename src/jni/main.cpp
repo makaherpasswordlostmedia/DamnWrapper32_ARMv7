@@ -11131,7 +11131,12 @@ void LoadMachO(const std::string& bundlePath) {
                                                 uint32_t val = 0;
                                                 memcpy(&val, (void*)shifted_literal, 4);
                                                 
-                                                if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
+                                                // Защита: если значение уже в ребейзнутом диапазоне — пропустить
+                                                uint32_t slid_min = min_vmaddr + g_appSlide;
+                                                uint32_t slid_max = max_vmaddr + g_appSlide;
+                                                bool already_rebased = (val >= slid_min && val < slid_max);
+                                                
+                                                if (!already_rebased && val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
                                                     // Защита от двойного ребейза: пропускаем уже обработанные слоты
                                                     if (g_rebasedSlots.find(shifted_literal) == g_rebasedSlots.end()) {
                                                         val += g_appSlide;
@@ -11174,6 +11179,13 @@ void LoadMachO(const std::string& bundlePath) {
                                         LogToJava(alert_buf);
                                     }
                                     
+                                    // Защита от двойного ребейза: если значение уже в ребейзнутом диапазоне — пропустить
+                                    uint32_t slid_min = min_vmaddr + g_appSlide;
+                                    uint32_t slid_max = max_vmaddr + g_appSlide;
+                                    if (val >= slid_min && val < slid_max) {
+                                        if (f_diag) fprintf(f_diag, "ADDR: 0x%08X | VAL: 0x%08X | TGT: already-slid-range       | RESULT: IGNORED (Already Rebased)\n", sect.addr + j*4, val);
+                                        continue;
+                                    }
                                     if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
                                         bool safe_to_rebase = true;
                                         std::string target_section = "Unknown";
