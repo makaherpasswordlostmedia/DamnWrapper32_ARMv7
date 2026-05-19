@@ -8792,7 +8792,6 @@ extern "C" int wrap___vsnprintf_chk(char *str, size_t maxlen, int flag, size_t b
 extern "C" char* wrap___strncpy_chk(char* dst, const char* src, size_t len, size_t dstlen) {
     return strncpy(dst, src, len);
 }
-extern "C" int wrap_putc(int c, void* fp) { return fputc(c, unwrap_file(fp)); }
 extern "C" double wrap_rint(double x) { return round(x); }
 extern "C" float wrap_rintf(float x) { return roundf(x); }
 extern "C" char* wrap_dlerror(void) { return nullptr; }
@@ -8802,6 +8801,7 @@ extern "C" int wrap___toupper(int c) { return (c >= 'a' && c <= 'z') ? (c - 32) 
 FILE* unwrap_file(void* fp);
 
 extern "C" int wrap_fputc(int c, void* fp) { return fputc(c, unwrap_file(fp)); }
+extern "C" int wrap_putc(int c, void* fp) { return fputc(c, unwrap_file(fp)); }
 extern "C" int wrap_fscanf(void* fp, const char* format, ...) {
     va_list args;
     va_start(args, format);
