@@ -493,7 +493,17 @@ void UpdateTextCache(void* view, const std::string& text, float logicalH);
 
 bool isValidString(const char* str) {
     if (!str || (uintptr_t)str < 0x1000) return false;
+    // Проверяем доступность страницы через mincore, чтобы не словить SIGSEGV
+    // при обращении к PROT_NONE регионам во время ребейза.
+    uintptr_t page_start = (uintptr_t)str & ~(uintptr_t)(4096 - 1);
+    unsigned char vec = 0;
+    if (mincore((void*)page_start, 4096, &vec) != 0) return false;
     for (int i = 0; i < 10000; i++) {
+        // Каждый раз при переходе на новую страницу — перепроверяем доступность
+        if ((i & 4095) == 0 && i > 0) {
+            uintptr_t cur_page = ((uintptr_t)(str + i)) & ~(uintptr_t)(4096 - 1);
+            if (mincore((void*)cur_page, 4096, &vec) != 0) return false;
+        }
         unsigned char c = (unsigned char)str[i];
         if (c == 0) return true;
         if (c < 32 && c != '\n' && c != '\r' && c != '\t') return false;
@@ -8747,11 +8757,51 @@ extern "C" char* wrap_strnstr(const char* s, const char* find, size_t slen) {
 }
 extern "C" void* wrap___memcpy_chk(void* dest, const void* src, size_t len, size_t destlen) { return memcpy(dest, src, len); }
 extern "C" void* wrap___memmove_chk(void* dest, const void* src, size_t len, size_t destlen) { return memmove(dest, src, len); }
+// Безопасная обёртка strlen — защита от невалидных указателей (краш в _my_CopyString)
+extern "C" size_t wrap_strlen(const char* s) {
+    if (!s || (uintptr_t)s < 0x1000) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "SAFETY: wrap_strlen получил невалидный указатель: %p — возвращаем 0", (void*)s);
+        LogToJava(buf);
+        return 0;
+    }
+    uintptr_t page = (uintptr_t)s & ~(uintptr_t)(4096 - 1);
+    unsigned char vec = 0;
+    if (mincore((void*)page, 4096, &vec) != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "SAFETY: wrap_strlen: указатель %p в недоступной странице (mincore fail) — возвращаем 0", (void*)s);
+        LogToJava(buf);
+        return 0;
+    }
+    return strlen(s);
+}
+
+// Безопасная обёртка strcpy — защита от невалидных src (краш в _my_CopyString)
+extern "C" char* wrap_strcpy(char* dest, const char* src) {
+    if (!src || (uintptr_t)src < 0x1000) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "SAFETY: wrap_strcpy получил невалидный src: %p — dest не тронут", (void*)src);
+        LogToJava(buf);
+        if (dest) dest[0] = '\0';
+        return dest;
+    }
+    uintptr_t page = (uintptr_t)src & ~(uintptr_t)(4096 - 1);
+    unsigned char vec = 0;
+    if (mincore((void*)page, 4096, &vec) != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "SAFETY: wrap_strcpy: src %p в недоступной странице (mincore fail) — dest не тронут", (void*)src);
+        LogToJava(buf);
+        if (dest) dest[0] = '\0';
+        return dest;
+    }
+    return strcpy(dest, src);
+}
+
 extern "C" char* wrap___strcpy_chk(char* dest, const char* src, size_t destlen) { 
     if (src && (strstr(src, "pngConf") || strstr(src, "jungle"))) {
         LogToJava(std::string("C-API-DEBUG: [__strcpy_chk] Копируется подозрительная строка: [") + src + "]");
     }
-    return strcpy(dest, src); 
+    return wrap_strcpy(dest, src); 
 }
 extern "C" char* wrap_strcat(char* dest, const char* src) {
     char* res = strcat(dest, src);
@@ -10338,7 +10388,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(mach_absolute_time), STB_W(mach_timebase_info), STB_S(CFAbsoluteTimeGetCurrent), {"___cxa_pure_virtual", (void*)Stub_cxa_pure_virtual},
     
     STB_W(malloc), STB_W(free), STB_W(calloc), STB_W(realloc), STB_D(memcpy), STB_D(memmove), STB_D(memset), STB_D(memcmp), {"_memchr", (void*)(void*(*)(void*, int, size_t))memchr},
-    STB_D(strcpy), STB_D(strncpy), STB_D(strcmp), STB_D(strncmp), STB_D(strlen), STB_W(strcat), STB_W(strncat), {"_strchr", (void*)(char*(*)(char*, int))strchr}, {"_strrchr", (void*)(char*(*)(char*, int))strrchr}, {"_strstr", (void*)(char*(*)(char*, const char*))strstr},
+    STB_W(strcpy), STB_D(strncpy), STB_D(strcmp), STB_D(strncmp), STB_W(strlen), STB_W(strcat), STB_W(strncat), {"_strchr", (void*)(char*(*)(char*, int))strchr}, {"_strrchr", (void*)(char*(*)(char*, int))strrchr}, {"_strstr", (void*)(char*(*)(char*, const char*))strstr},
     STB_D(strdup), STB_D(strcasecmp), STB_D(strncasecmp), STB_D(strcspn), {"_strpbrk", (void*)(char*(*)(char*, const char*))strpbrk},
     STB_D(atoi), STB_D(atof), STB_D(atol), STB_D(strtol), STB_D(strtod), STB_D(strtoul), STB_W(strtoll), STB_D(sprintf), STB_D(snprintf), STB_D(vsprintf), STB_D(vsnprintf), STB_D(sscanf), STB_W(printf), STB_W(puts), STB_D(putchar), STB_W(vprintf), STB_W(vfprintf),
     STB_W(fopen), STB_W(fclose), STB_W(fread), STB_W(fwrite), STB_W(fseek), STB_W(ftell), STB_W(fgetpos), STB_W(fsetpos), STB_W(fputc), STB_W(fscanf), STB_W(fflush), STB_W(fputs), STB_W(fprintf), STB_W(fgetc), STB_W(fgets), STB_W(feof), STB_W(ferror), STB_W(fileno), {"___srget", (void*)wrap___srget},
@@ -10927,7 +10977,16 @@ void LoadMachO(const std::string& bundlePath) {
             if (seg.vmsize > 0) {
                 uint32_t target_addr = seg.vmaddr + g_appSlide;
                 void* mapped = mmap((void*)target_addr, seg.vmsize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
-                if (mapped != MAP_FAILED && seg.filesize > 0) { lseek(fd, arch_offset + seg.fileoff, SEEK_SET); read(fd, mapped, seg.filesize); }
+                if (mapped == MAP_FAILED) {
+                    char mmap_err_buf[256];
+                    snprintf(mmap_err_buf, sizeof(mmap_err_buf),
+                        "MMAP-ERROR: Не удалось замапить сегмент %.16s по адресу 0x%08X (размер: 0x%X): errno=%d (%s)",
+                        seg.segname, target_addr, seg.vmsize, errno, strerror(errno));
+                    LogToJava(mmap_err_buf);
+                } else if (seg.filesize > 0) {
+                    lseek(fd, arch_offset + seg.fileoff, SEEK_SET);
+                    read(fd, mapped, seg.filesize);
+                }
                 uint32_t sect_offset = cmd_offset + sizeof(segment_command);
                 for(uint32_t s = 0; s < seg.nsects; s++) { 
                     section sect; lseek(fd, sect_offset, SEEK_SET); read(fd, &sect, sizeof(sect)); 
@@ -10938,7 +10997,7 @@ void LoadMachO(const std::string& bundlePath) {
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
                     
                     MachOSectionInfo sinfo;
-                    sinfo.name = std::string(sect.segname) + "," + std::string(sect.sectname);
+                    sinfo.name = std::string(sect.segname, strnlen(sect.segname, 16)) + "," + std::string(sect.sectname, strnlen(sect.sectname, 16));
                     sinfo.start = sect.addr;
                     sinfo.end = sect.addr + sect.size;
                     g_machoSections.push_back(sinfo);
@@ -11283,6 +11342,44 @@ void LoadMachO(const std::string& bundlePath) {
                     }
                     scan_cmd_offset += lc.cmdsize;
                 }
+                // === ВТОРОЙ ПРОХОД: повторное сканирование __data и __const ===
+                // Некоторые указатели пропускаются первым проходом из-за PIC-эвристики
+                // или ложных срабатываний isValidString до того, как секции были полностью готовы.
+                {
+                    uint32_t second_pass_count = 0;
+                    for (const auto& sec2 : g_machoSections) {
+                        bool is_data_sec = (sec2.name.find("__DATA,__data") != std::string::npos ||
+                                            sec2.name.find("__DATA,__const") != std::string::npos);
+                        if (!is_data_sec) continue;
+                        uint32_t sec2_size = sec2.end - sec2.start;
+                        if (sec2_size < 4) continue;
+                        uint32_t* ptr2 = (uint32_t*)sec2.start;
+                        uint32_t count2 = sec2_size / 4;
+                        for (uint32_t j2 = 0; j2 < count2; j2++) {
+                            uint32_t val2 = ptr2[j2];
+                            // Уже ребейзнутый?
+                            uint32_t slid_min2 = min_vmaddr + g_appSlide;
+                            uint32_t slid_max2 = max_vmaddr + g_appSlide;
+                            if (val2 >= slid_min2 && val2 < slid_max2) continue;
+                            // В оригинальном диапазоне?
+                            if (val2 < min_vmaddr || val2 >= max_vmaddr || val2 <= 0x1000) continue;
+                            uintptr_t slot2 = (uintptr_t)&ptr2[j2];
+                            if (g_rebasedSlots.find(slot2) != g_rebasedSlots.end()) continue;
+                            // Цель должна попадать в известную секцию
+                            uint32_t shifted2 = val2 + g_appSlide;
+                            bool in_known = false;
+                            for (const auto& sI2 : g_machoSections) {
+                                if (shifted2 >= sI2.start && shifted2 < sI2.end) { in_known = true; break; }
+                            }
+                            if (!in_known) continue;
+                            ptr2[j2] = shifted2;
+                            g_rebasedSlots.insert(slot2);
+                            second_pass_count++;
+                        }
+                    }
+                    LogToJava("REBASE-TRACE: Второй проход (__data/__const): дополнительно сдвинуто " + std::to_string(second_pass_count) + " указателей.");
+                }
+                // === КОНЕЦ ВТОРОГО ПРОХОДА ===
                 LogToJava("CUSTOM-PARSER: Обработка Mach-O завершена.");
             }
             // ------------------------------------
