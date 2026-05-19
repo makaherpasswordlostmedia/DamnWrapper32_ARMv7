@@ -11119,17 +11119,6 @@ void LoadMachO(const std::string& bundlePath) {
             if (seg.vmsize > 0) {
                 if (seg.vmaddr < min_vmaddr) min_vmaddr = seg.vmaddr;
                 if (seg.vmaddr + seg.vmsize > max_vmaddr) max_vmaddr = seg.vmaddr + seg.vmsize;
-                // Учитываем BSS/zerofill секции, которые могут выходить за vmsize сегмента
-                uint32_t sec_off2 = scan_offset + sizeof(segment_command);
-                for (uint32_t s2 = 0; s2 < seg.nsects; s2++) {
-                    section sect2; lseek(fd, sec_off2, SEEK_SET); read(fd, &sect2, sizeof(sect2));
-                    uint8_t stype2 = sect2.flags & 0xff;
-                    if ((stype2 == 1 || stype2 == 12) && sect2.size > 0) {
-                        uint32_t bss_end = sect2.addr + sect2.size;
-                        if (bss_end > max_vmaddr) max_vmaddr = bss_end;
-                    }
-                    sec_off2 += sizeof(section);
-                }
             }
         }
         scan_offset += lc.cmdsize;
@@ -11189,26 +11178,6 @@ void LoadMachO(const std::string& bundlePath) {
                     if (strncmp(sect.sectname, "__objc_classlist", 16) == 0) classlist_sections.push_back(sect);
                     if (strncmp(sect.sectname, "__mod_init_func", 16) == 0) init_func_sections.push_back(sect);
                     
-                    // Если BSS/zerofill секция выходит за vmsize сегмента — маппируем отдельно.
-                    // Линкер wolf3d занижает vmsize __DATA, не включая весь __bss/__common.
-                    // S_ZEROFILL=1, S_GB_ZEROFILL=12
-                    if ((type == 1 || type == 12) && sect.size > 0) {
-                        uint32_t seg_end = target_addr + seg.vmsize;
-                        uint32_t bss_end = sect.addr + sect.size;
-                        if (bss_end > seg_end) {
-                            uint32_t extra_start = (sect.addr >= seg_end) ? sect.addr : seg_end;
-                            extra_start = extra_start & ~4095u; // выровнять вниз
-                            uint32_t extra_end = (bss_end + 4095) & ~4095u;
-                            uint32_t extra_size = extra_end - extra_start;
-                            void* extra = mmap((void*)extra_start, extra_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
-                            if (extra != MAP_FAILED) {
-                                char buf[192];
-                                snprintf(buf, sizeof(buf), "MMAP-BSS: Секция %.16s расширена: 0x%08X+0x%X (за vmsize сегмента)", sect.sectname, extra_start, extra_size);
-                                LogToJava(buf);
-                            }
-                        }
-                    }
-
                     MachOSectionInfo sinfo;
                     sinfo.name = std::string(sect.segname, strnlen(sect.segname, 16)) + "," + std::string(sect.sectname, strnlen(sect.sectname, 16));
                     sinfo.start = sect.addr;
@@ -11645,34 +11614,39 @@ void LoadMachO(const std::string& bundlePath) {
                 }
                 // === КОНЕЦ ВТОРОГО ПРОХОДА ===
 
-                // === SANITY PASS: откатываем двойной ребейз в __text literal pools ===
-                // Если literal pool slot содержит значение выше (max_vmaddr+slide) но
-                // (val - slide) попадает в корректный ребейзнутый диапазон [slid_min, slid_max] —
-                // это признак двойного ребейза (напр. из-за ложного PIC-определения).
-                // Откатываем: val -= g_appSlide.
+                // === SANITY PASS: откатываем двойной ребейз только в известных literal pool слотах ===
+                // Проблема предыдущей реализации: сканирование __text по 4 байта как uint32[]
+                // без учёта границ инструкций — Thumb-2 инструкции, чьи байты случайно образуют
+                // значение 0x20xxxxxx, ошибочно перезаписываются и ломают код (краш в glGenBuffers).
+                // Правильное решение: проверяем ТОЛЬКО слоты из g_rebasedSlots — те адреса,
+                // которые кастомный парсер явно идентифицировал как literal pool entries и изменил.
+                // Если после ребейза значение оказалось > slid_max (двойной ребейз) — откатываем.
                 {
                     uint32_t sanity_fixed = 0;
                     uint32_t slid_min = min_vmaddr + g_appSlide;
                     uint32_t slid_max = max_vmaddr + g_appSlide;
-                    for (const auto& sec : g_machoSections) {
-                        // Только code-секции — там literal pools
-                        bool is_text = (sec.name.find("__text") != std::string::npos &&
-                                        sec.name.find("__cstring") == std::string::npos);
-                        if (!is_text) continue;
-                        uint32_t sz = sec.end - sec.start;
-                        if (sz < 4) continue;
-                        uint32_t* p = (uint32_t*)sec.start;
-                        uint32_t cnt = sz / 4;
-                        for (uint32_t i = 0; i < cnt; i++) {
-                            uint32_t v = p[i];
-                            // Значение выше slid_max — потенциальный двойной ребейз
-                            if (v <= slid_max) continue;
-                            uint32_t v_back = v - g_appSlide;
-                            // После отката попадает в правильный ребейзнутый диапазон?
-                            if (v_back >= slid_min && v_back < slid_max) {
-                                p[i] = v_back;
-                                sanity_fixed++;
+                    for (uintptr_t slot_addr : g_rebasedSlots) {
+                        // Проверяем что слот находится в code-секции (__text, __stub_helper и т.п.)
+                        // Это отфильтровывает data-секции (там двойной ребейз обработан 2-м проходом)
+                        bool in_text = false;
+                        for (const auto& sec : g_machoSections) {
+                            bool is_text_sec = (sec.name.find("__text") != std::string::npos &&
+                                                sec.name.find("__cstring") == std::string::npos);
+                            if (!is_text_sec) continue;
+                            if (slot_addr >= sec.start && slot_addr + 4 <= sec.end) {
+                                in_text = true;
+                                break;
                             }
+                        }
+                        if (!in_text) continue;
+                        uint32_t v = *reinterpret_cast<uint32_t*>(slot_addr);
+                        // Значение выше slid_max — признак двойного ребейза
+                        if (v <= slid_max) continue;
+                        uint32_t v_back = v - g_appSlide;
+                        // После отката должно попасть в корректный ребейзнутый диапазон
+                        if (v_back >= slid_min && v_back < slid_max) {
+                            *reinterpret_cast<uint32_t*>(slot_addr) = v_back;
+                            sanity_fixed++;
                         }
                     }
                     if (sanity_fixed > 0) {
