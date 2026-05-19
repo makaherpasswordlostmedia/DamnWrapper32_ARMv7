@@ -10863,6 +10863,7 @@ static void ApplyMyCopyStringPatch() {
 }
 
 void LoadMachO(const std::string& bundlePath) {
+    g_machoSections.clear(); // ФИКС: Очищаем секции чтобы не дублировались при повторном вызове
     HLEClass* cls_NSString = new HLEClass{0xDEADBEEF, "NSString"};    g_hleClasses["NSString"] = cls_NSString; g_hleClasses["__CFConstantStringClassReference"] = cls_NSString; g_hleStubs["___CFConstantStringClassReference"] = cls_NSString;    g_hleClasses["CADisplayLink"] = new HLEClass{0xDEADBEEF, "CADisplayLink"}; g_hleClasses["UIButton"] = new HLEClass{0xDEADBEEF, "UIButton"}; g_hleClasses["UISwitch"] = new HLEClass{0xDEADBEEF, "UISwitch"}; g_hleClasses["UILabel"] = new HLEClass{0xDEADBEEF, "UILabel"}; g_hleClasses["UIColor"] = new HLEClass{0xDEADBEEF, "UIColor"};     g_hleClasses["UIView"] = new HLEClass{0xDEADBEEF, "UIView"}; g_hleClasses["UITextView"] = new HLEClass{0xDEADBEEF, "UITextView"}; g_hleClasses["UITextField"] = new HLEClass{0xDEADBEEF, "UITextField"}; g_hleClasses["UIWindow"] = new HLEClass{0xDEADBEEF, "UIWindow"}; g_hleClasses["UIScreen"] = new HLEClass{0xDEADBEEF, "UIScreen"}; g_hleClasses["UINib"] = new HLEClass{0xDEADBEEF, "UINib"}; g_hleClasses["NSBundle"] = new HLEClass{0xDEADBEEF, "NSBundle"}; g_hleClasses["NSURL"] = new HLEClass{0xDEADBEEF, "NSURL"}; g_hleClasses["NSThread"] = new HLEClass{0xDEADBEEF, "NSThread"};     g_hleClasses["NSURLConnection"] = new HLEClass{0xDEADBEEF, "NSURLConnection"}; g_hleClasses["NSAutoreleasePool"] = new HLEClass{0xDEADBEEF, "NSAutoreleasePool"}; g_hleClasses["GKLocalPlayer"] = new HLEClass{0xDEADBEEF, "GKLocalPlayer"}; g_hleClasses["UIViewController"] = new HLEClass{0xDEADBEEF, "UIViewController"}; g_hleClasses["UIImageView"] = new HLEClass{0xDEADBEEF, "UIImageView"}; g_hleClasses["UIImage"] = new HLEClass{0xDEADBEEF, "UIImage"};
     g_hleClasses["GKAchievement"] = new HLEClass{0xDEADBEEF, "GKAchievement"};
     g_hleClasses["UIPasteboard"] = new HLEClass{0xDEADBEEF, "UIPasteboard"};
@@ -11427,8 +11428,18 @@ void LoadMachO(const std::string& bundlePath) {
                                                 else if (target_section.find("__cfstring") != std::string::npos) {
                                                     uint32_t* cfstr = (uint32_t*)shifted_val;
                                                     uint32_t str_ptr = cfstr[2];
-                                                    if (str_ptr < min_vmaddr || str_ptr >= max_vmaddr) { safe_to_rebase = false; reason = "CFString: Invalid Ptr"; }
-                                                    else if (!isValidString((const char*)(str_ptr + g_appSlide))) { safe_to_rebase = false; reason = "CFString: Invalid Str"; }
+                                                    // ФИКС: cfstr[2] может быть уже ребейзнутым (если __cfstring обработана до __data).
+                                                    // Принимаем оба варианта: оригинальный и уже слайднутый.
+                                                    uint32_t slid_str_min = min_vmaddr + g_appSlide;
+                                                    uint32_t slid_str_max = max_vmaddr + g_appSlide;
+                                                    bool str_already_slid = (str_ptr >= slid_str_min && str_ptr < slid_str_max);
+                                                    bool str_original_ok  = (str_ptr >= min_vmaddr && str_ptr < max_vmaddr);
+                                                    if (!str_already_slid && !str_original_ok) {
+                                                        safe_to_rebase = false; reason = "CFString: Invalid Ptr";
+                                                    } else {
+                                                        uint32_t str_resolved = str_already_slid ? str_ptr : (str_ptr + g_appSlide);
+                                                        if (!isValidString((const char*)str_resolved)) { safe_to_rebase = false; reason = "CFString: Invalid Str"; }
+                                                    }
                                                 }
                                             } else {
                                                 if ((val & 3) != 0) {
@@ -11480,13 +11491,20 @@ void LoadMachO(const std::string& bundlePath) {
                     uint32_t second_pass_count = 0;
                     for (const auto& sec2 : g_machoSections) {
                         bool is_data_sec = (sec2.name.find("__DATA,__data") != std::string::npos ||
-                                            sec2.name.find("__DATA,__const") != std::string::npos);
+                                            sec2.name.find("__DATA,__const") != std::string::npos ||
+                                            sec2.name.find("__DATA,__cfstring") != std::string::npos ||
+                                            sec2.name.find("__DATA,__objc_data") != std::string::npos ||
+                                            sec2.name.find("__DATA,__objc_const") != std::string::npos);
                         if (!is_data_sec) continue;
                         uint32_t sec2_size = sec2.end - sec2.start;
                         if (sec2_size < 4) continue;
                         uint32_t* ptr2 = (uint32_t*)sec2.start;
                         uint32_t count2 = sec2_size / 4;
+                        bool is_cfstring_sec = (sec2.name.find("__cfstring") != std::string::npos);
                         for (uint32_t j2 = 0; j2 < count2; j2++) {
+                            // ФИКС: В __cfstring структура = {isa[0], flags[1], str_ptr[2], length[3]}.
+                            // Поля flags(1) и length(3) — не указатели, ребейзить их нельзя.
+                            if (is_cfstring_sec && (j2 % 4 == 1 || j2 % 4 == 3)) continue;
                             uint32_t val2 = ptr2[j2];
                             // Уже ребейзнутый?
                             uint32_t slid_min2 = min_vmaddr + g_appSlide;
