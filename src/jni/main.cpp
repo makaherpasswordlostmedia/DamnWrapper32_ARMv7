@@ -11483,6 +11483,112 @@ void LoadMachO(const std::string& bundlePath) {
         if (!batchLog.empty()) LogToJava(batchLog);
     }
 
+// =============================================================================
+// БИНАРНЫЙ ПАТЧ: _my_CopyString
+// Проблема: игровая _my_CopyString вызывает свою же _my_strlcpy напрямую (не через
+// таблицу импортов), поэтому wrap_strlcpy/wrap_strlen не перехватывают вызов.
+// Решение: патчим первые байты _my_CopyString Thumb-трамплином на нашу замену.
+//
+// Оригинальная логика _my_CopyString(const char* src):
+//   len = strlen(src)
+//   buf = malloc(len + 1)
+//   _my_strlcpy(buf, src, len + 1)
+//   return buf
+// =============================================================================
+
+static char* hle_my_CopyString_replacement(const char* src) {
+    // Проверка нулевого и низкого указателя
+    if (!src || (uintptr_t)src < 0x1000) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "SAFETY: hle_my_CopyString: невалидный src=%p — возвращаем пустую строку", (void*)src);
+        LogToJava(buf);
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
+    // Проверка доступности страницы через mincore
+    uintptr_t page = (uintptr_t)src & ~(uintptr_t)(4095);
+    unsigned char vec = 0;
+    if (mincore((void*)page, 4096, &vec) != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "SAFETY: hle_my_CopyString: src=%p в недоступной странице (mincore fail) — возвращаем пустую строку", (void*)src);
+        LogToJava(buf);
+        char* empty = (char*)malloc(1);
+        if (empty) empty[0] = '\0';
+        return empty;
+    }
+    size_t len = strlen(src);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) return nullptr;
+    memcpy(buf, src, len + 1);
+    return buf;
+}
+
+// Записывает Thumb-трамплин по адресу target_thumb_addr (бит 0 снят, адрес чётный).
+// Трамплин: LDR PC, [PC, #0] (4 байта Thumb-2) + слово с целевым адресом (4 байта).
+// Итого 8 байт — перекрывает первые 2 Thumb-инструкции _my_CopyString.
+static void PatchThumbFunctionToReplacement(uint32_t func_addr_with_thumb_bit, void* replacement) {
+    // func_addr_with_thumb_bit — значение из g_appSymbols (уже с g_appSlide, Thumb → бит 0 = 1)
+    uint32_t code_addr = func_addr_with_thumb_bit & ~1u; // убираем Thumb-бит
+    uint8_t* ptr = (uint8_t*)code_addr;
+
+    // Снимаем защиту на запись для этой страницы
+    uintptr_t page = (uintptr_t)ptr & ~(uintptr_t)(4095);
+    if (mprotect((void*)page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        char log[128];
+        snprintf(log, sizeof(log), "PATCH: mprotect failed для 0x%08X: errno=%d", code_addr, errno);
+        LogToJava(log);
+        return;
+    }
+
+    // Thumb-2 трамплин: F000 F8DF = LDR.W PC, [PC, #0]
+    // Затем 4 байта — абсолютный адрес замены (ARM, без Thumb-бита).
+    // Итого 8 байт.
+    uint32_t dest = (uint32_t)(uintptr_t)replacement;
+    ptr[0] = 0xDF; ptr[1] = 0xF8; // Thumb-2 encoding: LDR.W PC, [PC, #0]
+    ptr[2] = 0x00; ptr[3] = 0xF0;
+    ptr[4] = (dest >>  0) & 0xFF;
+    ptr[5] = (dest >>  8) & 0xFF;
+    ptr[6] = (dest >> 16) & 0xFF;
+    ptr[7] = (dest >> 24) & 0xFF;
+
+    __builtin___clear_cache((char*)ptr, (char*)(ptr + 8));
+
+    char log[128];
+    snprintf(log, sizeof(log), "PATCH: _my_CopyString @ 0x%08X перенаправлена на hle_my_CopyString_replacement @ 0x%08X",
+        code_addr, dest);
+    LogToJava(log);
+}
+
+static void ApplyMyCopyStringPatch() {
+    // Символ может быть записан как "_my_CopyString" или "my_CopyString" в таблице
+    const char* candidates[] = { "_my_CopyString", "my_CopyString", nullptr };
+    for (int i = 0; candidates[i]; i++) {
+        auto it = g_appSymbols.find(candidates[i]);
+        if (it != g_appSymbols.end() && it->second > 0x1000) {
+            PatchThumbFunctionToReplacement(it->second, (void*)hle_my_CopyString_replacement);
+            return;
+        }
+    }
+    // Фолбек: известный статический offset из бинаря wolf3d (из лога: __TEXT,__text + 0x6670)
+    // _my_CopyString = g_appSlide + text_vmaddr + 0x6670
+    // Ищем секцию __text чтобы получить её vmaddr
+    for (const auto& sec : g_machoSections) {
+        if (sec.name.find("__TEXT,__text") != std::string::npos) {
+            uint32_t func_addr = sec.start + 0x6670 + 1; // +1 = Thumb
+            PatchThumbFunctionToReplacement(func_addr, (void*)hle_my_CopyString_replacement);
+            LogToJava("PATCH: _my_CopyString пропатчена по статическому offset 0x6670 (символ не найден в symtab)");
+            return;
+        }
+    }
+    LogToJava("PATCH-WARN: _my_CopyString не найдена ни в symtab, ни по статическому offset — патч не применён");
+}
+
+    // Патчим _my_CopyString до установки g_machOLoaded, пока сегменты ещё W+X
+    ApplyMyCopyStringPatch();
+
     g_machOLoaded = true; // С этого момента любые новые функции пишутся в лог мгновенно
     
     SwitchToRenderView();
