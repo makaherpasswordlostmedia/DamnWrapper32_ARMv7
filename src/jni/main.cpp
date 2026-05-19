@@ -11377,12 +11377,13 @@ void LoadMachO(const std::string& bundlePath) {
                                                         clobbers = true;
                                                 } else if (sw_size == 4) {
                                                     uint16_t hw2_scan = *(scan_ptr + 1);
-                                                    uint32_t rd_field = (hw2_scan >> 12) & 0xF;
-                                                    // LDR.W Rd,[PC,#imm] (0xF85F/0xF8DF): новый LDR в тот же Rd
-                                                    if ((scan_hw & 0xFF7F) == 0xF85F && rd_field == target_rd)
+                                                    // LDR.W Rd,[PC,#imm] (0xF85F/0xF8DF): Rd в hw2[15:12]
+                                                    uint32_t rd_ldr = (hw2_scan >> 12) & 0xF;
+                                                    if ((scan_hw & 0xFF7F) == 0xF85F && rd_ldr == target_rd)
                                                         clobbers = true;
-                                                    // MOV.W / MOVW Rd,#imm (0xF240 | ...): перезапись Rd
-                                                    if ((scan_hw & 0xFBF0) == 0xF240 && rd_field == target_rd)
+                                                    // MOV.W / MOVW Rd,#imm (T3: hw1&0xFBF0==0xF240): Rd в hw2[11:8], НЕ hw2[15:12]!
+                                                    uint32_t rd_mov = (hw2_scan >> 8) & 0xF;
+                                                    if ((scan_hw & 0xFBF0) == 0xF240 && rd_mov == target_rd)
                                                         clobbers = true;
                                                 }
                                                 if (clobbers) break; // Rd перезаписан — ADD Rd,PC уже не наш
@@ -11612,6 +11613,42 @@ void LoadMachO(const std::string& bundlePath) {
                     LogToJava("REBASE-TRACE: Второй проход (__data/__const): дополнительно сдвинуто " + std::to_string(second_pass_count) + " указателей.");
                 }
                 // === КОНЕЦ ВТОРОГО ПРОХОДА ===
+
+                // === SANITY PASS: откатываем двойной ребейз в __text literal pools ===
+                // Если literal pool slot содержит значение выше (max_vmaddr+slide) но
+                // (val - slide) попадает в корректный ребейзнутый диапазон [slid_min, slid_max] —
+                // это признак двойного ребейза (напр. из-за ложного PIC-определения).
+                // Откатываем: val -= g_appSlide.
+                {
+                    uint32_t sanity_fixed = 0;
+                    uint32_t slid_min = min_vmaddr + g_appSlide;
+                    uint32_t slid_max = max_vmaddr + g_appSlide;
+                    for (const auto& sec : g_machoSections) {
+                        // Только code-секции — там literal pools
+                        bool is_text = (sec.name.find("__text") != std::string::npos &&
+                                        sec.name.find("__cstring") == std::string::npos);
+                        if (!is_text) continue;
+                        uint32_t sz = sec.end - sec.start;
+                        if (sz < 4) continue;
+                        uint32_t* p = (uint32_t*)sec.start;
+                        uint32_t cnt = sz / 4;
+                        for (uint32_t i = 0; i < cnt; i++) {
+                            uint32_t v = p[i];
+                            // Значение выше slid_max — потенциальный двойной ребейз
+                            if (v <= slid_max) continue;
+                            uint32_t v_back = v - g_appSlide;
+                            // После отката попадает в правильный ребейзнутый диапазон?
+                            if (v_back >= slid_min && v_back < slid_max) {
+                                p[i] = v_back;
+                                sanity_fixed++;
+                            }
+                        }
+                    }
+                    if (sanity_fixed > 0) {
+                        LogToJava("REBASE-SANITY: Откатано двойных ребейзов в __text: " + std::to_string(sanity_fixed));
+                    }
+                }
+                // === КОНЕЦ SANITY PASS ===
                 LogToJava("CUSTOM-PARSER: Обработка Mach-O завершена.");
             }
             // ------------------------------------
