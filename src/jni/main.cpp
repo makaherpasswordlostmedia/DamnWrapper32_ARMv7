@@ -9999,23 +9999,73 @@ extern "C" int wrap_AudioQueuePrime(void* inAQ, uint32_t inNumberOfFramesToPrepa
 }
 extern "C" int wrap_AudioQueueSetParameter(void* inAQ, uint32_t inParamID, float inValue) { return 0; }
 
-extern "C" int wrap_AudioSessionInitialize(void* inRunLoop, void* inRunLoopMode, void* inInterruptionListener, void* inClientData) { return 0; }
-extern "C" int wrap_AudioSessionSetActive(uint8_t active) { return 0; }
+extern "C" int wrap_AudioSessionInitialize(void* inRunLoop, void* inRunLoopMode, void* inInterruptionListener, void* inClientData) {
+    LogToJava("HLE_AUDIO: AudioSessionInitialize вызван");
+    return 0;
+}
+extern "C" int wrap_AudioSessionSetActive(uint8_t active) {
+    LogToJava(std::string("HLE_AUDIO: AudioSessionSetActive(") + (active ? "true" : "false") + ")");
+    return 0;
+}
 extern "C" int wrap_AudioSessionAddPropertyListener(uint32_t inID, void* inProc, void* inClientData) { return 0; }
-extern "C" int wrap_AudioSessionSetProperty(uint32_t inID, uint32_t inDataSize, const void* inData) { return 0; }
-extern "C" int wrap_AudioSessionGetProperty(uint32_t inID, uint32_t* ioDataSize, void* outData) { 
-    if (inID == 0x63687372) { // 'chsr' (CurrentHardwareSampleRate)
-        if (ioDataSize) *ioDataSize = 8;
-        if (outData) { double sr = 44100.0; memcpy(outData, &sr, 8); }
-        return 0;
+extern "C" int wrap_AudioSessionSetProperty(uint32_t inID, uint32_t inDataSize, const void* inData) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "HLE_AUDIO: AudioSessionSetProperty id=0x%08X size=%u", inID, inDataSize);
+    LogToJava(std::string(buf));
+    return 0;
+}
+
+// Вспомогательный макрос для безопасной записи AudioSession property
+#define AUDIOSESSION_WRITE_DOUBLE(val) do { \
+    if (ioDataSize) *ioDataSize = 8; \
+    if (outData) { double _v = (val); memcpy(outData, &_v, 8); } \
+    return 0; \
+} while(0)
+#define AUDIOSESSION_WRITE_FLOAT(val) do { \
+    if (ioDataSize) *ioDataSize = 4; \
+    if (outData) { float _v = (val); memcpy(outData, &_v, 4); } \
+    return 0; \
+} while(0)
+#define AUDIOSESSION_WRITE_UINT32(val) do { \
+    if (ioDataSize) *ioDataSize = 4; \
+    if (outData) { uint32_t _v = (val); memcpy(outData, &_v, 4); } \
+    return 0; \
+} while(0)
+
+extern "C" int wrap_AudioSessionGetProperty(uint32_t inID, uint32_t* ioDataSize, void* outData) {
+    switch (inID) {
+        case 0x63687372: // 'chsr' kAudioSessionProperty_CurrentHardwareSampleRate (double)
+            AUDIOSESSION_WRITE_DOUBLE(44100.0);
+        case 0x70687372: // 'phsr' kAudioSessionProperty_PreferredHardwareSampleRate (double)
+            AUDIOSESSION_WRITE_DOUBLE(44100.0);
+        case 0x63686f76: // 'chov' kAudioSessionProperty_CurrentHardwareOutputVolume (float)
+            AUDIOSESSION_WRITE_FLOAT(1.0f);
+        case 0x63686f63: // 'choc' kAudioSessionProperty_CurrentHardwareOutputNumberChannels (uint32)
+            AUDIOSESSION_WRITE_UINT32(2);
+        case 0x63686963: // 'chic' kAudioSessionProperty_CurrentHardwareInputNumberChannels (uint32)
+            AUDIOSESSION_WRITE_UINT32(2);
+        case 0x61636174: // 'acat' kAudioSessionProperty_AudioCategory (uint32)
+            // kAudioSessionCategory_MediaPlayback = 2
+            AUDIOSESSION_WRITE_UINT32(2);
+        case 0x6F766364: // 'ovcd' kAudioSessionProperty_OtherAudioIsPlaying (uint32)
+            AUDIOSESSION_WRITE_UINT32(0);
+        case 0x726F7574: // 'rout' kAudioSessionProperty_AudioRoute (uint32)
+            AUDIOSESSION_WRITE_UINT32(0);
+        case 0x636D6978: // 'cmix' kAudioSessionProperty_OverrideCategoryMixWithOthers (uint32)
+            AUDIOSESSION_WRITE_UINT32(0);
+        case 0x64636D78: // 'dcmx' kAudioSessionProperty_OverrideCategoryDefaultToSpeaker (uint32)
+            AUDIOSESSION_WRITE_UINT32(0);
+        default: {
+            // Безопасный fallback: если размер известен и разумен — обнуляем, иначе пишем 4 байта нуля
+            uint32_t safeSize = (ioDataSize && *ioDataSize > 0 && *ioDataSize <= 64) ? *ioDataSize : 4;
+            if (ioDataSize) *ioDataSize = safeSize;
+            if (outData) memset(outData, 0, safeSize);
+            char buf[80];
+            snprintf(buf, sizeof(buf), "HLE_AUDIO: AudioSessionGetProperty UNKNOWN id=0x%08X -> 0 (size=%u)", inID, safeSize);
+            LogToJava(std::string(buf));
+            return 0;
+        }
     }
-    if (inID == 0x63686f76) { // 'chov' (CurrentHardwareOutputVolume)
-        if (ioDataSize) *ioDataSize = 4;
-        if (outData) { float vol = 1.0f; memcpy(outData, &vol, 4); }
-        return 0;
-    }
-    if (outData && ioDataSize) memset(outData, 0, *ioDataSize); 
-    return 0; 
 }
 
 struct HLE_AudioUnit {
