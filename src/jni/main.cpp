@@ -9198,79 +9198,48 @@ extern bool g_machOLoaded;
 
 // Защита от рекурсии внутри wrap_malloc/free/etc.
 //
-// ПОЧЕМУ НЕ thread_local:
-//   На Android NDK thread_local в .so реализован через __emutls_get_address,
-//   который при ПЕРВОМ обращении сам вызывает malloc → wrap_malloc → рекурсия.
-//   pthread_getspecific — единственный TLS-механизм безопасный внутри malloc.
+// История попыток:
+//   v1: thread_local bool  → __emutls делает malloc при первом обращении → рекурсия
+//   v2: pthread_key_t      → pthread_setspecific делает calloc при первом вызове
+//                            на новом потоке → рекурсия через wrap_calloc
 //
-// Схема: pthread_key инициализируется один раз через pthread_once.
-//   Значение ключа: NULL = не в malloc, (void*)1 = уже внутри.
-//   pthread_getspecific/setspecific не делают malloc — они безопасны.
-
-static pthread_key_t  g_wrapMallocKey;
-static pthread_once_t g_wrapMallocKeyOnce = PTHREAD_ONCE_INIT;
-
-static void _wrapMallocKeyCreate() {
-    pthread_key_create(&g_wrapMallocKey, nullptr);
-}
-
-// inline: вызывается очень часто, важна скорость
-static inline bool _inWrapMalloc() {
-    pthread_once(&g_wrapMallocKeyOnce, _wrapMallocKeyCreate);
-    return pthread_getspecific(g_wrapMallocKey) != nullptr;
-}
-static inline void _setInWrapMalloc(bool v) {
-    pthread_setspecific(g_wrapMallocKey, v ? (void*)1 : nullptr);
-}
+// Единственное надёжное решение: полностью убрать логирование из wrap_malloc/free.
+// LogToBlackBox и любой std::string внутри аллокатора — смертельны.
+// Оставляем только детектирование аномально больших аллокаций через snprintf
+// в статический буфер (без malloc).
 
 extern "C" void* wrap_malloc(size_t size) {
-    if (_inWrapMalloc()) return malloc(size);
-    _setInWrapMalloc(true);
-    uint32_t lr = (uint32_t)__builtin_return_address(0);
     void* res = malloc(size);
     if (size > 5 * 1024 * 1024) {
-        LogToJava("C-API-DEBUG: [malloc] АНОМАЛИЯ! Игра просит " + std::to_string(size) + " байт! Caller: " + GetModuleInfoForAddress(lr));
-    } else if (g_machOLoaded) {
-        LogToBlackBox("C-API-MEM: [malloc] ptr=" + std::to_string((uintptr_t)res) + " size=" + std::to_string(size) + " Caller: " + GetModuleInfoForAddress(lr));
+        uint32_t lr = (uint32_t)__builtin_return_address(0);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "C-API-DEBUG: [malloc] АНОМАЛИЯ! size=%zu lr=0x%X", size, lr);
+        LogToJava(std::string(buf));
     }
-    _setInWrapMalloc(false);
     return res;
 }
 extern "C" void* wrap_calloc(size_t num, size_t size) {
-    if (_inWrapMalloc()) return calloc(num, size);
-    _setInWrapMalloc(true);
-    uint32_t lr = (uint32_t)__builtin_return_address(0);
     void* res = calloc(num, size);
     if (num * size > 5 * 1024 * 1024) {
-        LogToJava("C-API-DEBUG: [calloc] АНОМАЛИЯ! Игра просит " + std::to_string(num * size) + " байт! Caller: " + GetModuleInfoForAddress(lr));
-    } else if (g_machOLoaded) {
-        LogToBlackBox("C-API-MEM: [calloc] ptr=" + std::to_string((uintptr_t)res) + " num=" + std::to_string(num) + " size=" + std::to_string(size) + " Caller: " + GetModuleInfoForAddress(lr));
+        uint32_t lr = (uint32_t)__builtin_return_address(0);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "C-API-DEBUG: [calloc] АНОМАЛИЯ! size=%zu lr=0x%X", num * size, lr);
+        LogToJava(std::string(buf));
     }
-    _setInWrapMalloc(false);
     return res;
 }
 extern "C" void* wrap_realloc(void* ptr, size_t size) {
-    if (_inWrapMalloc()) return realloc(ptr, size);
-    _setInWrapMalloc(true);
-    uint32_t lr = (uint32_t)__builtin_return_address(0);
     void* res = realloc(ptr, size);
     if (size > 5 * 1024 * 1024) {
-        LogToJava("C-API-DEBUG: [realloc] АНОМАЛИЯ! Игра просит " + std::to_string(size) + " байт! Caller: " + GetModuleInfoForAddress(lr));
-    } else if (g_machOLoaded) {
-        LogToBlackBox("C-API-MEM: [realloc] old_ptr=" + std::to_string((uintptr_t)ptr) + " new_ptr=" + std::to_string((uintptr_t)res) + " size=" + std::to_string(size) + " Caller: " + GetModuleInfoForAddress(lr));
+        uint32_t lr = (uint32_t)__builtin_return_address(0);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "C-API-DEBUG: [realloc] АНОМАЛИЯ! size=%zu lr=0x%X", size, lr);
+        LogToJava(std::string(buf));
     }
-    _setInWrapMalloc(false);
     return res;
 }
 extern "C" void wrap_free(void* ptr) {
-    if (_inWrapMalloc()) { free(ptr); return; }
-    _setInWrapMalloc(true);
-    uint32_t lr = (uint32_t)__builtin_return_address(0);
-    if (g_machOLoaded && ptr) {
-        LogToBlackBox("C-API-MEM: [free] ptr=" + std::to_string((uintptr_t)ptr) + " Caller: " + GetModuleInfoForAddress(lr));
-    }
     free(ptr);
-    _setInWrapMalloc(false);
 }
 
 // Хелпер для извлечения реального Android FILE* из нашей фейковой iOS структуры
