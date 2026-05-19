@@ -11500,7 +11500,9 @@ void LoadMachO(const std::string& bundlePath) {
                                                                      target_section.find("__program_vars") != std::string::npos || 
                                                                      target_section.find("__nl_symbol_ptr") != std::string::npos || 
                                                                      target_section.find("__lazy_symbol") != std::string::npos || 
-                                                                     target_section.find("__mod_init_func") != std::string::npos);
+                                                                     target_section.find("__mod_init_func") != std::string::npos ||
+                                                                     target_section.find("__DATA,__data") != std::string::npos ||
+                                                                     target_section.find("__TEXT,__const") != std::string::npos);
 
                                             if (is_code_target) {
                                                 if ((val & 1) == 0) { safe_to_rebase = false; reason = "Code: Even"; }
@@ -11569,6 +11571,31 @@ void LoadMachO(const std::string& bundlePath) {
                     scan_cmd_offset += lc.cmdsize;
                 }
                 // === ВТОРОЙ ПРОХОД: повторное сканирование __data и __const ===
+                // Диагностика: найти слоты с двойным ребейзом ДО второго прохода
+                {
+                    uint32_t pre_slid_min = min_vmaddr + g_appSlide;
+                    uint32_t pre_slid_max = max_vmaddr + g_appSlide;
+                    for (const auto& sec_pre : g_machoSections) {
+                        if (sec_pre.name.find("__DATA,__data") == std::string::npos) continue;
+                        uint32_t sz = sec_pre.end - sec_pre.start;
+                        if (sz < 4) continue;
+                        uint32_t* pp = (uint32_t*)sec_pre.start;
+                        for (uint32_t jj = 0; jj < sz/4; jj++) {
+                            uint32_t vv = pp[jj];
+                            if (vv > pre_slid_max) {
+                                uint32_t vv_back = vv - g_appSlide;
+                                if (vv_back >= pre_slid_min && vv_back < pre_slid_max) {
+                                    char pre_buf[256];
+                                    snprintf(pre_buf, sizeof(pre_buf),
+                                        "PRE-PASS2-DOUBLE: [__data+0x%X] val=0x%08X (double, back=0x%08X)",
+                                        jj*4, vv, vv_back);
+                                    LogToJava(std::string(pre_buf));
+                                }
+                            }
+                        }
+                        break; // только __data
+                    }
+                }
                 // Некоторые указатели пропускаются первым проходом из-за PIC-эвристики
                 // или ложных срабатываний isValidString до того, как секции были полностью готовы.
                 {
@@ -11611,6 +11638,23 @@ void LoadMachO(const std::string& bundlePath) {
                         }
                     }
                     LogToJava("REBASE-TRACE: Второй проход (__data/__const): дополнительно сдвинуто " + std::to_string(second_pass_count) + " указателей.");
+
+                    // ДИАГНОСТИКА: логируем состояние слота 0x10040a68 (cvar_t s_device) после всех проходов
+                    {
+                        uint32_t diag_slid = 0x10040a68;
+                        uint32_t diag_slid_min = min_vmaddr + g_appSlide;
+                        uint32_t diag_slid_max = max_vmaddr + g_appSlide;
+                        if (diag_slid >= diag_slid_min && diag_slid < diag_slid_max) {
+                            uint32_t* diag_ptr = (uint32_t*)diag_slid;
+                            char diag_buf[256];
+                            // Логируем первые 8 dwords (начало cvar_t структуры)
+                            snprintf(diag_buf, sizeof(diag_buf),
+                                "CVAR-DIAG: [0x%08X] = 0x%08X 0x%08X 0x%08X 0x%08X (cvar_t s_device dump, slid_range=[0x%X,0x%X))",
+                                diag_slid, diag_ptr[0], diag_ptr[1], diag_ptr[2], diag_ptr[3],
+                                diag_slid_min, diag_slid_max);
+                            LogToJava(std::string(diag_buf));
+                        }
+                    }
                 }
                 // === КОНЕЦ ВТОРОГО ПРОХОДА ===
 
@@ -11654,6 +11698,54 @@ void LoadMachO(const std::string& bundlePath) {
                     }
                 }
                 // === КОНЕЦ SANITY PASS ===
+
+                // === DATA SANITY PASS: откатываем двойной ребейз в data-секциях ===
+                // Значения > slid_max в data = double-rebase. Безопасно откатить если
+                // v - g_appSlide попадает в [slid_min, slid_max).
+                {
+                    uint32_t data_sanity_fixed = 0;
+                    uint32_t slid_min_ds = min_vmaddr + g_appSlide;
+                    uint32_t slid_max_ds = max_vmaddr + g_appSlide;
+                    for (const auto& sec : g_machoSections) {
+                        bool is_data = (sec.name.find("__DATA") != std::string::npos ||
+                                        sec.name.find("__data") != std::string::npos ||
+                                        sec.name.find("__const") != std::string::npos ||
+                                        sec.name.find("__objc_") != std::string::npos ||
+                                        sec.name.find("__cfstring") != std::string::npos);
+                        bool is_code_or_str = (sec.name.find("__text") != std::string::npos ||
+                                               sec.name.find("__cstring") != std::string::npos ||
+                                               sec.name.find("__objc_methname") != std::string::npos ||
+                                               sec.name.find("__objc_classname") != std::string::npos ||
+                                               sec.name.find("__objc_methtype") != std::string::npos ||
+                                               sec.name.find("__stub") != std::string::npos ||
+                                               sec.name.find("__bss") != std::string::npos ||
+                                               sec.name.find("__common") != std::string::npos);
+                        if (!is_data || is_code_or_str) continue;
+                        uint32_t sec_size = sec.end - sec.start;
+                        if (sec_size < 4) continue;
+                        uint32_t* dp = (uint32_t*)sec.start;
+                        uint32_t dc = sec_size / 4;
+                        for (uint32_t j = 0; j < dc; j++) {
+                            uint32_t v = dp[j];
+                            if (v <= slid_max_ds) continue;
+                            uint32_t v_back = v - g_appSlide;
+                            if (v_back >= slid_min_ds && v_back < slid_max_ds) {
+                                char dbg_buf[256];
+                                snprintf(dbg_buf, sizeof(dbg_buf),
+                                    "DATA-SANITY: [%s+0x%X] 0x%08X -> 0x%08X (rollback double-rebase)",
+                                    sec.name.c_str(), j*4, v, v_back);
+                                LogToJava(std::string(dbg_buf));
+                                dp[j] = v_back;
+                                data_sanity_fixed++;
+                            }
+                        }
+                    }
+                    if (data_sanity_fixed > 0) {
+                        LogToJava("REBASE-SANITY: Откатано двойных ребейзов в data-секциях: " + std::to_string(data_sanity_fixed));
+                    }
+                }
+                // === КОНЕЦ DATA SANITY PASS ===
+
                 LogToJava("CUSTOM-PARSER: Обработка Mach-O завершена.");
             }
             // ------------------------------------
