@@ -8810,6 +8810,34 @@ extern "C" char* wrap_strcat(char* dest, const char* src) {
     }
     return res;
 }
+// Безопасная обёртка strlcpy — основная точка краша _my_CopyString через _my_strlcpy
+// Игровой код: strlen(src) -> malloc -> strlcpy(dest, src, len+1)
+// wrap_strlen возвращает 0 при невалидном src, но _my_CopyString всё равно вызывает strlcpy
+// с тем же невалидным src. Без защиты здесь — неизбежный SIGSEGV.
+extern "C" size_t wrap_strlcpy(char* dst, const char* src, size_t size) {
+    if (!src || (uintptr_t)src < 0x1000) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "SAFETY: wrap_strlcpy получил невалидный src: %p (size=%zu) — записываем пустую строку",
+            (void*)src, size);
+        LogToJava(buf);
+        if (dst && size > 0) dst[0] = '\0';
+        return 0;
+    }
+    uintptr_t page = (uintptr_t)src & ~(uintptr_t)(4096 - 1);
+    unsigned char vec = 0;
+    if (mincore((void*)page, 4096, &vec) != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "SAFETY: wrap_strlcpy: src %p в недоступной странице (mincore fail, size=%zu) — записываем пустую строку",
+            (void*)src, size);
+        LogToJava(buf);
+        if (dst && size > 0) dst[0] = '\0';
+        return 0;
+    }
+    return strlcpy(dst, src, size);
+}
+
 extern "C" char* wrap_strncat(char* dest, const char* src, size_t n) {
     char* res = strncat(dest, src, n);
     if (res && (strstr(res, "pngConf") || strstr(res, "jungle"))) {
@@ -10404,7 +10432,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(sel_getName), STB_W(sel_registerName), STB_W(setjmp), STB_D(qsort), STB_W(readdir), {"_realpath$DARWIN_EXTSN", (void*)wrap_realpath_darwin}, STB_D(sleep), STB_D(sched_yield),
     STB_W(socket), STB_W(send), STB_W(sendto), STB_W(recv), STB_W(recvfrom), STB_W(setsockopt),
     
-    STB_D(acosf), STB_D(asinf), STB_D(strlcpy), STB_D(strtok), STB_D(strerror_r), STB_D(wcscmp), STB_D(wcscpy), STB_D(wcslen), {"_wcschr", (void*)(wchar_t*(*)(wchar_t*, wchar_t))wcschr}, STB_D(wcsncpy), STB_D(wcstombs), STB_D(wcstol), STB_W(memset_pattern16),
+    STB_D(acosf), STB_D(asinf), STB_W(strlcpy), STB_D(strtok), STB_D(strerror_r), STB_D(wcscmp), STB_D(wcscpy), STB_D(wcslen), {"_wcschr", (void*)(wchar_t*(*)(wchar_t*, wchar_t))wcschr}, STB_D(wcsncpy), STB_D(wcstombs), STB_D(wcstol), STB_W(memset_pattern16),
     {"_wmemchr", (void*)(wchar_t*(*)(wchar_t*, wchar_t, size_t))wmemchr}, STB_D(wmemcmp), STB_D(wmemcpy), STB_D(wmemmove), STB_D(swprintf), STB_W(vswprintf), STB_W(swscanf), STB_W(wcsncmp), STB_W(wcstof),
     STB_D(close), STB_D(closedir), STB_W(opendir), STB_W(access), STB_D(open), STB_D(read), STB_D(write), STB_D(lseek), STB_D(usleep), STB_D(nanosleep), STB_D(accept), STB_W(bind), STB_W(connect), STB_W(listen),
     {"_div", (void*)(div_t(*)(int, int))div}, STB_D(gethostbyaddr), STB_W(gethostbyname), STB_W(gethostname), STB_D(getnameinfo), STB_D(getpeername), STB_W(getsockname), STB_W(getsockopt), STB_D(if_nametoindex), STB_D(inet_addr),
