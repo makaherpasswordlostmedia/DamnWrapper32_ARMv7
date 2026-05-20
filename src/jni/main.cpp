@@ -11385,7 +11385,7 @@ void LoadMachO(const std::string& bundlePath) {
                             // sect.sectname — char[16], может не иметь нуль-терминатора!
                             std::string sectname(sect.sectname, strnlen(sect.sectname, 16));
                             
-                            bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub");
+                            bool isCode = (sectname == "__text" || sectname == "__symbol_stub" || sectname == "__stub_helper" || sectname == "__picsymbolstub" || sectname == "__symbolstub1");
                             bool isString = (sectname == "__cstring" || sectname == "__objc_methname" || sectname == "__objc_classname" || sectname == "__objc_methtype");
                             
                                 if (isCode && sect.size > 0) {
@@ -11567,6 +11567,7 @@ void LoadMachO(const std::string& bundlePath) {
                                         if (target_section != "Unknown") {
                                             bool is_code_target = (target_section.find("__text") != std::string::npos || 
                                                                    target_section.find("__symbol_stub") != std::string::npos || 
+                                                                   target_section.find("__symbolstub") != std::string::npos ||
                                                                    target_section.find("__stub_helper") != std::string::npos || 
                                                                    target_section.find("__picsymbolstub") != std::string::npos);
                                             
@@ -11640,6 +11641,16 @@ void LoadMachO(const std::string& bundlePath) {
                                         if (f_diag) {
                                             fprintf(f_diag, "ADDR: 0x%08X | VAL: 0x%08X | TGT: %-25s | RESULT: %s (%s)\n", sect.addr + j*4, val, target_section.c_str(), safe_to_rebase ? "REBASED" : "IGNORED", reason.c_str());
                                         }
+                                        // Диагностика конкретных адресов краша (видна в логе всегда)
+                                        if (val == 0x40a68 || val == 0x2bbf0 || val == 0x3fdac) {
+                                            char dbg[192];
+                                            snprintf(dbg, sizeof(dbg),
+                                                "REBASE-1ST: sec=%s slot=0x%08X val=0x%08X tgt=%s result=%s(%s)",
+                                                sectname.c_str(), sect.addr + j*4, val,
+                                                target_section.c_str(),
+                                                safe_to_rebase ? "REBASED" : "IGNORED", reason.c_str());
+                                            LogToJava(dbg);
+                                        }
 
                                         if (safe_to_rebase) {
                                             uintptr_t slot_addr = (uintptr_t)&ptr[j];
@@ -11661,17 +11672,19 @@ void LoadMachO(const std::string& bundlePath) {
                     }
                     scan_cmd_offset += lc.cmdsize;
                 }
-                // === ВТОРОЙ ПРОХОД: только секции-таблицы указателей, которые первый проход
-                // мог пропустить целиком. __DATA,__data НЕ включаем — он уже обработан
-                // первым проходом с эвристическими проверками. Добавлять его сюда без
-                // аналогичных проверок означает ребейзить числовые поля структур (flags,
-                // modified, value у cvar_t и т.п.), что ломает логику игры.
+                }
+                // === ВТОРОЙ ПРОХОД: ptr-table секции + __DATA,__data (пропущенные первым проходом) ===
+                // Первый проход пропускает слоты с target_section=="Unknown" (адрес попадает
+                // в gap между секциями или в __bss/__common диапазон вне g_machoSections).
+                // Для cvar_t-полей указывающих в __bss это единственный способ их ребейзнуть.
+                // Гарантии против двойного ребейза:
+                //   1. g_rebasedSlots — пропускаем всё что уже обработал первый проход
+                //   2. already-rebased guard: val2 >= slid_min && val2 < slid_max → skip
+                //   3. alignment check: (val2 & 3) != 0 → skip
+                //   4. in_known check: цель должна быть в g_machoSections (или в [min..max] для __data)
                 {
                     uint32_t second_pass_count = 0;
                     for (const auto& sec2 : g_machoSections) {
-                        // Только секции где каждое выровненное 32-битное слово — указатель.
-                        // __DATA,__data исключён намеренно: там смесь данных и указателей,
-                        // безопасно обрабатывается только первым проходом с проверками.
                         bool is_ptr_table_sec = (
                             sec2.name.find("__DATA,__const") != std::string::npos ||
                             sec2.name.find("__DATA,__cfstring") != std::string::npos ||
@@ -11683,13 +11696,17 @@ void LoadMachO(const std::string& bundlePath) {
                             sec2.name.find("__DATA,__objc_classlist") != std::string::npos ||
                             sec2.name.find("__DATA,__objc_catlist") != std::string::npos ||
                             sec2.name.find("__DATA,__objc_protolist") != std::string::npos ||
-                            sec2.name.find("__DATA,__objc_protorefs") != std::string::npos);
+                            sec2.name.find("__DATA,__objc_protorefs") != std::string::npos ||
+                            // __DATA,__data: первый проход пропускает "Unknown Target" слоты
+                            // (указатели в __bss, gaps, и т.д.) — подбираем их здесь.
+                            sec2.name.find("__DATA,__data") != std::string::npos);
                         if (!is_ptr_table_sec) continue;
                         uint32_t sec2_size = sec2.end - sec2.start;
                         if (sec2_size < 4) continue;
                         uint32_t* ptr2 = (uint32_t*)sec2.start;
                         uint32_t count2 = sec2_size / 4;
                         bool is_cfstring_sec = (sec2.name.find("__cfstring") != std::string::npos);
+                        bool is_data_sec     = (sec2.name.find("__DATA,__data") != std::string::npos);
                         for (uint32_t j2 = 0; j2 < count2; j2++) {
                             // В __cfstring структура = {isa[0], flags[1], str_ptr[2], length[3]}.
                             // Поля flags(1) и length(3) — не указатели, пропускаем.
@@ -11701,58 +11718,64 @@ void LoadMachO(const std::string& bundlePath) {
                             if (val2 >= slid_min2 && val2 < slid_max2) continue;
                             // Не в оригинальном диапазоне — не указатель
                             if (val2 < min_vmaddr || val2 >= max_vmaddr || val2 <= 0x1000) continue;
-                            // Указатели должны быть выровнены по 4 байтам
-                            if ((val2 & 3) != 0) continue;
+                            // Для __data: указатели выровнены по 4 байтам
+                            if (is_data_sec && (val2 & 3) != 0) continue;
                             uintptr_t slot2 = (uintptr_t)&ptr2[j2];
                             // Уже обработан первым проходом
                             if (g_rebasedSlots.find(slot2) != g_rebasedSlots.end()) continue;
-                            // Цель должна попадать в известную секцию
+                            // Цель должна попадать в известную секцию ИЛИ в общий диапазон бинаря
+                            // (covers __bss/__common которые есть в памяти но могут быть gap в g_machoSections)
                             uint32_t shifted2 = val2 + g_appSlide;
                             bool in_known = false;
                             for (const auto& sI2 : g_machoSections) {
                                 if (shifted2 >= sI2.start && shifted2 < sI2.end) { in_known = true; break; }
                             }
+                            // Для __data: также принимаем цели в общем vmaddr диапазоне
+                            // (например __bss которая может быть в g_machoSections с size=0 или отсутствовать)
+                            if (!in_known && is_data_sec) {
+                                in_known = (shifted2 >= slid_min2 + 0x1000 && shifted2 < slid_max2);
+                            }
                             if (!in_known) continue;
                             ptr2[j2] = shifted2;
                             g_rebasedSlots.insert(slot2);
                             second_pass_count++;
+                            // Диагностика для конкретных адресов краша
+                            if (val2 == 0x40a68 || val2 == 0x2bbf0) {
+                                char dbg[128];
+                                snprintf(dbg, sizeof(dbg), "REBASE-2ND: slot=0x%08X val=0x%08X->0x%08X sec=%s",
+                                    (uint32_t)slot2, val2, shifted2, sec2.name.c_str());
+                                LogToJava(dbg);
+                            }
                         }
                     }
                     LogToJava("REBASE-TRACE: Второй проход (ptr-table секции): дополнительно сдвинуто " + std::to_string(second_pass_count) + " указателей.");
                 }
                 // === КОНЕЦ ВТОРОГО ПРОХОДА ===
 
-                // === SANITY PASS: откатываем двойной ребейз только в известных literal pool слотах ===
+
+                // === SANITY PASS: откатываем двойной ребейз в code и data секциях ===
                 {
                     uint32_t sanity_fixed = 0;
                     uint32_t slid_min = min_vmaddr + g_appSlide;
                     uint32_t slid_max = max_vmaddr + g_appSlide;
                     for (uintptr_t slot_addr : g_rebasedSlots) {
-                        // Проверяем что слот находится в code-секции (__text, __stub_helper и т.п.)
-                        // Это отфильтровывает data-секции (там двойной ребейз обработан 2-м проходом)
-                        bool in_text = false;
-                        for (const auto& sec : g_machoSections) {
-                            bool is_text_sec = (sec.name.find("__text") != std::string::npos &&
-                                                sec.name.find("__cstring") == std::string::npos);
-                            if (!is_text_sec) continue;
-                            if (slot_addr >= sec.start && slot_addr + 4 <= sec.end) {
-                                in_text = true;
-                                break;
-                            }
-                        }
-                        if (!in_text) continue;
                         uint32_t v = *reinterpret_cast<uint32_t*>(slot_addr);
                         // Значение выше slid_max — признак двойного ребейза
                         if (v <= slid_max) continue;
                         uint32_t v_back = v - g_appSlide;
                         // После отката должно попасть в корректный ребейзнутый диапазон
                         if (v_back >= slid_min && v_back < slid_max) {
+                            char dbg[128];
+                            snprintf(dbg, sizeof(dbg),
+                                "REBASE-SANITY: slot=0x%08X double=0x%08X fixed=0x%08X",
+                                (uint32_t)slot_addr, v, v_back);
+                            LogToJava(dbg);
                             *reinterpret_cast<uint32_t*>(slot_addr) = v_back;
                             sanity_fixed++;
                         }
                     }
                     if (sanity_fixed > 0) {
-                        LogToJava("REBASE-SANITY: Откатано двойных ребейзов в __text: " + std::to_string(sanity_fixed));
+                        LogToJava("REBASE-SANITY: Откатано двойных ребейзов: " + std::to_string(sanity_fixed));
                     }
                 }
                 // === КОНЕЦ SANITY PASS ===
