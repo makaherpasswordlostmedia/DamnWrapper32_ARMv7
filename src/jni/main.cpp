@@ -11672,7 +11672,6 @@ void LoadMachO(const std::string& bundlePath) {
                     }
                     scan_cmd_offset += lc.cmdsize;
                 }
-                }
                 // === ВТОРОЙ ПРОХОД: ptr-table секции + __DATA,__data (пропущенные первым проходом) ===
                 // Первый проход пропускает слоты с target_section=="Unknown" (адрес попадает
                 // в gap между секциями или в __bss/__common диапазон вне g_machoSections).
@@ -11794,8 +11793,7 @@ void LoadMachO(const std::string& bundlePath) {
                 for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
             }
         }
-    }
-    cmd_offset = arch_offset + sizeof(mach_header);
+    } // end if (symtab.cmdsize > 0)
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         load_command lc; lseek(fd, cmd_offset, SEEK_SET); read(fd, &lc, sizeof(lc));
         if (lc.cmd == 1) { segment_command seg; lseek(fd, cmd_offset, SEEK_SET); read(fd, &seg, sizeof(seg)); if (seg.vmsize > 0) { int prot = PROT_READ; if (seg.initprot & 2) prot |= PROT_WRITE; if (seg.initprot & 4) prot |= PROT_EXEC; mprotect((void*)(seg.vmaddr + g_appSlide), seg.vmsize, prot); } }
