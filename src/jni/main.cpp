@@ -11293,11 +11293,47 @@ void LoadMachO(const std::string& bundlePath) {
         for (uint32_t i = 0; i < symtab.nsyms; i++) { 
             if (symTable[i].n_un.n_strx > 0) { 
                 std::string symName = &strTable[symTable[i].n_un.n_strx]; 
-                if (symTable[i].n_sect > 0) g_appSymbols[symName] = symTable[i].n_value + g_appSlide; 
+                if (symTable[i].n_sect > 0) {
+                    uint32_t symVal = symTable[i].n_value + g_appSlide;
+                    // N_ARM_THUMB_DEF (0x0008 в n_desc) — символ определён в Thumb-режиме
+                    if (symTable[i].n_desc & 0x0008) symVal |= 1;
+                    g_appSymbols[symName] = symVal;
+                }
                 if (symName == "_glCompileShader") isES2 = true;
                 if (symName == "_glEnableClientState" || symName == "_glVertexPointer") isES1 = true;
             } 
         }
+        // --- КОРРЕКЦИЯ THUMB-БИТА g_entryPoint ---
+        // LC_UNIXTHREAD у старых iOS-бинарей может иметь cpsr=0 и чётный pc,
+        // даже если код реально Thumb. Источник правды — n_desc флаг 0x0008
+        // у символа _start, который мы уже правильно проставили выше.
+        if (g_appSymbols.count("_start")) {
+            uint32_t startSym = g_appSymbols["_start"];
+            // _start из таблицы символов уже включает g_appSlide и Thumb-бит
+            g_entryPoint = startSym;
+            char _efix[128];
+            snprintf(_efix, sizeof(_efix), "ENTRY-FIX: _start из symtab → entry=0x%X (thumb=%d)", g_entryPoint, (int)(g_entryPoint & 1));
+            LogToJava(std::string(_efix));
+        } else if (g_entryPoint != 0 && !(g_entryPoint & 1)) {
+            // Нет символа _start — используем байтовую эвристику:
+            // Thumb-2 PUSH.W кодируется как [2D E9 xx xx] в памяти (little-endian).
+            // ARM PUSH кодируется как [xx xx 2D E9] — совсем другой паттерн.
+            // Также Thumb-16 PUSH кодируется как [F0..FF 2D] в первых двух байтах.
+            uint8_t* codePtr = (uint8_t*)g_entryPoint;
+            bool looksThumb = false;
+            // Thumb-2 PUSH.W {regs, lr}: первые два байта = 2D E9
+            if (codePtr[0] == 0x2D && codePtr[1] == 0xE9) looksThumb = true;
+            // Thumb-16 PUSH {regs}: первый байт = 0x2D, второй = 0xB5 или 0xB4
+            else if (codePtr[1] == 0x2D && (codePtr[0] == 0xB5 || codePtr[0] == 0xB4)) looksThumb = true;
+            if (looksThumb) {
+                g_entryPoint |= 1;
+                char _efix[128];
+                snprintf(_efix, sizeof(_efix), "ENTRY-FIX: эвристика по байтам → entry=0x%X (thumb=1)", g_entryPoint);
+                LogToJava(std::string(_efix));
+            }
+        }
+        // --- КОНЕЦ КОРРЕКЦИИ ---
+
         std::string renderStr = "Unknown";
         if (isES1 && isES2) renderStr = "OpenGL ES 1.1/2.0 (Dual)";
         else if (isES2) renderStr = "OpenGL ES 2.0 Only";
