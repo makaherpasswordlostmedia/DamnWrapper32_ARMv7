@@ -11915,32 +11915,40 @@ void* NativeExecutionThread(void* arg) {
 
     asm volatile (
         // --- Выравниваем SP по 8 байтам ---
+        // После выравнивания укладываем 6 слов (6×4 = 24 байта, кратно 8),
+        // чтобы SP на входе в _start оставался выровненным по 8.
+        // Без этого 5 push (20 байт) дают остаток 4 — крэш на первой инструкции
+        // когда _start делает ADD/STM с требованием 8-байтного выравнивания.
         "mov r0, sp\n"
         "bic r0, r0, #7\n"
         "mov sp, r0\n"
 
-        // --- Строим стек XNU ABI снизу вверх (последний push = наименьший адрес = вершина стека) ---
-        // apple[0] = NULL (кладём первым, окажется последним в памяти)
+        // --- Строим стек XNU ABI снизу вверх ---
+        // XNU _start ожидает на вершине стека: argc, argv[0], NULL, envp_NULL, apple_NULL
+        //
+        //   высокий адрес (дно)
+        //   [ padding          ]  <- выравнивающий слот (не читается _start)
+        //   [ apple[0] = NULL  ]  <- NULL-terminated apple[]
+        //   [ envp[0]  = NULL  ]  <- NULL-terminated envp[]
+        //   [ argv[1]  = NULL  ]  <- терминатор argv
+        //   [ argv[0]  = path  ]  <- argv[0]
+        //   [ argc     = 1     ]  <- SP после всех push, _start читает [SP]
+        //   низкий адрес (вершина)
+        //
         "mov r0, #0\n"
+        "push {r0}\n"          // padding — для выравнивания по 8
         "push {r0}\n"          // apple[0] = NULL
-        // envp[0] = NULL
-        "push {r0}\n"          // envp[0] = NULL
-        // argv[1] = NULL (терминатор)
-        "push {r0}\n"          // argv[1] = NULL
-        // argv[0] = exe_name
-        "push {r5}\n"          // argv[0] = exe_name (r5 = exe_name_reg)
-        // argc = 1 (вершина стека — _start читает отсюда)
+        "push {r0}\n"          // envp[0]  = NULL
+        "push {r0}\n"          // argv[1]  = NULL (терминатор)
+        "push {r5}\n"          // argv[0]  = exe_name (r5 = exe_name_reg)
         "mov r0, #1\n"
-        "push {r0}\n"          // argc = 1
+        "push {r0}\n"          // argc     = 1  <-- вершина стека
 
         // --- Прыжок в iOS ---
-        // r4 содержит g_entryPoint с Thumb LSB=1, BX переключит режим в Thumb.
-        // r4 никем выше не трогался, значение гарантированно сохранено.
+        // r4 содержит g_entryPoint; если isThumb — LSB=1, BX переключит в Thumb.
+        // r4 не трогался с момента инициализации выше, значение сохранено.
         "bx r4\n"
 
-        // Входные операнды: entry_reg уже привязан к r4, exe_name_reg — к r5.
-        // Не указываем их как "r"(%N) в теле, а используем напрямую по имени регистра,
-        // чтобы исключить любую возможность переназначения компилятором.
         :
         : "r"(entry_reg), "r"(exe_name_reg)
         : "r0", "memory"
