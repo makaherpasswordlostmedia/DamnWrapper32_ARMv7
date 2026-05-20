@@ -11915,7 +11915,9 @@ void* NativeExecutionThread(void* arg) {
 
     asm volatile (
         // --- Выравниваем SP по 8 байтам ---
-        "bic sp, sp, #7\n"
+        "mov r0, sp\n"
+        "bic r0, r0, #7\n"
+        "mov sp, r0\n"
 
         // --- Строим стек XNU ABI снизу вверх (последний push = наименьший адрес = вершина стека) ---
         // apple[0] = NULL (кладём первым, окажется последним в памяти)
