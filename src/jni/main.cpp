@@ -11885,30 +11885,62 @@ void* NativeExecutionThread(void* arg) {
         return nullptr; 
     }
     
-    LogToJava("NativeExecutionThread: Подготовка к прыжку в сырой _start (XNU ABI). g_entryPoint = 0x" + std::to_string(g_entryPoint));
+    {
+        char _ep_hex[32];
+        snprintf(_ep_hex, sizeof(_ep_hex), "0x%X", g_entryPoint);
+        LogToJava("NativeExecutionThread: Подготовка к прыжку в сырой _start (XNU ABI). g_entryPoint = " + std::string(_ep_hex));
+    }
     LogToJava("NativeExecutionThread: ---> ПРЫЖОК В IOS <---");
 
 #if defined(__arm__)
-    const char* exe_name = g_execPath.c_str();
-    uint32_t entry = g_entryPoint;
-    
-    // ВАЖНО: Стартовая точка iOS-приложений (crt1.o _start) не использует C-соглашение о вызовах!
-    // ИСПРАВЛЕНИЕ: ЖЕСТКОЕ ВЫРАВНИВАНИЕ СТЕКА К 8 БАЙТАМ для защиты драйверов MediaTek/Mali
+    // Сохраняем все нужные значения в переменных с явной привязкой к регистрам,
+    // чтобы компилятор не мог переиспользовать их в теле asm.
+    // entry_reg — ОБЯЗАТЕЛЬНО не r0, не r1, не r12, не sp/lr, иначе
+    // инструкции внутри блока перетрут его до BX.
+    register uint32_t entry_reg asm("r4") = g_entryPoint;
+    register const char* exe_name_reg asm("r5") = g_execPath.c_str();
+
+    // XNU/Darwin _start stack layout (стек растёт вниз, push кладёт последнее первым):
+    //
+    //   высокий адрес
+    //   [ apple[0] = NULL   ]  <- apple[] (Mach-O extra, NULL-terminated)
+    //   [ NULL              ]  <- envp[0] = NULL  (пустой envp, NULL-terminated)
+    //   [ NULL              ]  <- argv[1] = NULL  (терминатор argv)
+    //   [ argv[0] = exeName ]  <- argv[0]
+    //   [ argc = 1          ]  <- вершина стека, первое что читает _start
+    //   низкий адрес  <-- SP после всех push
+    //
+    // Итого 5 слов = 20 байт; чтобы SP был выровнен по 8 после всех push,
+    // добавляем один слот padding (6 слов = 24 байта, кратно 8).
+
     asm volatile (
+        // --- Выравниваем SP по 8 байтам ---
+        "bic sp, sp, #7\n"
+
+        // --- Строим стек XNU ABI снизу вверх (последний push = наименьший адрес = вершина стека) ---
+        // apple[0] = NULL (кладём первым, окажется последним в памяти)
         "mov r0, #0\n"
-        "mov r12, sp\n"
-        "bic r12, r12, #7\n"
-        "mov sp, r12\n"
-   // <--- КРИТИЧЕСКИЙ ФИКС: Сбрасываем 3 младших бита SP (выравнивание до 8)
-        "push {r0}\n"        // Padding для выравнивания стека (8 байт по стандарту ARM AAPCS)
-        "push {r0}\n"        // apple[0] (доп. данные Mach-O, оставляем NULL)
-        "push {r0}\n"        // envp[0]  (переменные окружения, NULL)
-        "push {r0}\n"        // argv[1]  (конец списка аргументов, NULL)
-        "push {%0}\n"        // argv[0]  (Указатель на имя экзешника)
-        "mov r0, #1\n"       // argc = 1
-        "push {r0}\n"        // Кладем argc на саму вершину стека
-        "bx %1\n"            // Прыгаем в iOS! Функция _start сама вызовет exit() в конце.
-        :: "r"(exe_name), "r"(entry)
+        "push {r0}\n"          // apple[0] = NULL
+        // envp[0] = NULL
+        "push {r0}\n"          // envp[0] = NULL
+        // argv[1] = NULL (терминатор)
+        "push {r0}\n"          // argv[1] = NULL
+        // argv[0] = exe_name
+        "push {r5}\n"          // argv[0] = exe_name (r5 = exe_name_reg)
+        // argc = 1 (вершина стека — _start читает отсюда)
+        "mov r0, #1\n"
+        "push {r0}\n"          // argc = 1
+
+        // --- Прыжок в iOS ---
+        // r4 содержит g_entryPoint с Thumb LSB=1, BX переключит режим в Thumb.
+        // r4 никем выше не трогался, значение гарантированно сохранено.
+        "bx r4\n"
+
+        // Входные операнды: entry_reg уже привязан к r4, exe_name_reg — к r5.
+        // Не указываем их как "r"(%N) в теле, а используем напрямую по имени регистра,
+        // чтобы исключить любую возможность переназначения компилятором.
+        :
+        : "r"(entry_reg), "r"(exe_name_reg)
         : "r0", "memory"
     );
 #endif
