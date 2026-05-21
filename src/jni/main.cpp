@@ -6034,6 +6034,23 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "EAGLContext" && strcmp(op, "renderbufferStorage:fromDrawable:") == 0) {
             uint32_t lr = (uint32_t)__builtin_return_address(0);
             LogToJava("[SIZE-TRACE] renderbufferStorage:fromDrawable: вызван. Caller: " + GetModuleInfoForAddress(lr));
+            // ФИКС ЧЁРНОГО ЭКРАНА: В GPU-режиме (бит 64) реально выделяем хранилище
+            // рендербуфера. Без этого FBO игры остаётся пустым — ничего не рисуется.
+            if (g_gpuOffloadMask & 64) {
+                GLint boundRbo = 0;
+                glGetIntegerv(GL_RENDERBUFFER_BINDING, &boundRbo);
+                if (boundRbo != 0) {
+                    EGLint realW = g_surfaceWidth, realH = g_surfaceHeight;
+                    EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+                    if (surf != EGL_NO_SURFACE) {
+                        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &realW);
+                        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &realH);
+                    }
+                    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8_OES, realW, realH);
+                    LogToJava("[SIZE-TRACE] renderbufferStorage: GPU rbo выделен " +
+                              std::to_string(realW) + "x" + std::to_string(realH));
+                }
+            }
             return 1;
         }
         
@@ -13300,8 +13317,20 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     };
     EGLConfig config; EGLint numConfigs; eglChooseConfig(g_eglDisplay, attribs, &config, 1, &numConfigs);
     const EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE }; g_eglContext = eglCreateContext(g_eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
+
+    // ФИКС ЧЁРНОГО ЭКРАНА (ES 1.1): Игры на чистом OpenGL ES 1.1 не используют шейдеры,
+    // поэтому CPU-растеризатор их не может обработать. Принудительно включаем GPU-режим:
+    // бит 1 (GPU eglSwapBuffers) + бит 2 (GPU glClear) + бит 32 (GPU state calls) + бит 64 (GPU FBO).
+    // Определяем ES-версию по g_activeESVersion — она уставливается в LoadMachO ДО onSurfaceCreated.
+    if (g_activeESVersion == 1 && !(g_gpuOffloadMask & 1)) {
+        g_gpuOffloadMask |= (1 | 2 | 32 | 64);
+        LogToJava("onSurfaceCreated: ES 1.1 игра обнаружена — принудительно включён GPU-режим (gpuOffloadMask=0x" +
+                  [&]{ char buf[16]; snprintf(buf, sizeof(buf), "%X", g_gpuOffloadMask); return std::string(buf); }() + ")");
+    }
+
     if (g_gpuOffloadMask & 1) {
         g_eglSurface = eglCreateWindowSurface(g_eglDisplay, config, g_nativeWindow, nullptr);
+        LogToJava("onSurfaceCreated: Создана WindowSurface для прямого GPU-рендера.");
     } else {
         // ФИКС СПЛЮСНУТОГО ЭКРАНА: Создаем PBuffer в размер экрана игры, а не 64x64
         const EGLint pbufferAttribs[] = { EGL_WIDTH, g_surfaceWidth, EGL_HEIGHT, g_surfaceHeight, EGL_NONE };
