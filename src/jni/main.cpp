@@ -1705,8 +1705,15 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
 
     EGLBoolean res = EGL_TRUE;
     if (g_gpuOffloadMask & 1) {
-        // --- GPU ОВЕРЛЕИ ---
-        if (g_onScreenDebugOverlay || g_showPerfOverlay) {
+        // ФИКС ЧЁРНОГО ЭКРАНА (ES 1.1 CPU-render path):
+        // Если GPU draw (бит 16) НЕ выставлен, игра рисует через CPUExtractAndDraw в g_cpuColorBuffer.
+        // Этот буфер нужно blit'ить на экран ВСЕГДА — не только при включённом оверлее.
+        // Условие: либо оверлей есть, либо CPU-rendering (нет бита 16 → буфер не пустой).
+        bool needCpuBlit = (g_onScreenDebugOverlay || g_showPerfOverlay) ||
+                           (!(g_gpuOffloadMask & 16) && g_cpuColorBuffer.size() == (size_t)(g_surfaceWidth * g_surfaceHeight));
+
+        // --- GPU BLIT CPU-БУФЕРА + ОВЕРЛЕИ ---
+        if (needCpuBlit) {
             static GLuint overlayTex = 0;
             static GLuint overlayProg = 0;
             if (overlayTex == 0) {
@@ -1734,8 +1741,14 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
             GLboolean cullFace = glIsEnabled(GL_CULL_FACE);
             
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            // Для чистого blit без оверлея — без блендинга (непрозрачный игровой кадр)
+            bool hasOverlay = (g_onScreenDebugOverlay || g_showPerfOverlay);
+            if (hasOverlay) {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            } else {
+                glDisable(GL_BLEND);
+            }
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
             
@@ -1767,13 +1780,16 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             glActiveTexture(oldActiveTex);
             glBindTexture(GL_TEXTURE_2D, oldTex);
             glBindBuffer(GL_ARRAY_BUFFER, oldArrayBuf);
-            if (!blendEnabled) glDisable(GL_BLEND);
+            if (blendEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
             if (depthTest) glEnable(GL_DEPTH_TEST);
             if (cullFace) glEnable(GL_CULL_FACE);
         }
         
-        // Очищаем буфер прозрачным цветом, чтобы в следующем кадре оверлеи рисовались на чистом фоне
-        std::fill(g_cpuColorBuffer.begin(), g_cpuColorBuffer.end(), 0x00000000);
+        // Очищаем CPU-буфер для следующего кадра.
+        // При CPU-rendering (нет бита 16) — в чёрный непрозрачный (игра сама вызовет glClear).
+        // При GPU overlay режиме — прозрачный, чтобы GPU-кадр игры просвечивал.
+        uint32_t cpuClearVal = (g_gpuOffloadMask & 16) ? 0x00000000u : 0xFF000000u;
+        std::fill(g_cpuColorBuffer.begin(), g_cpuColorBuffer.end(), cpuClearVal);
 
         SyncLog("[RENDER] Отправка буфера на экран (GPU eglSwapBuffers)...");
         res = eglSwapBuffers(g_eglDisplay, g_eglSurface);
