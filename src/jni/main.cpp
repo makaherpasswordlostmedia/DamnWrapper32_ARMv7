@@ -11830,6 +11830,8 @@ void LoadMachO(const std::string& bundlePath) {
             }
         }
     } // end if (symtab.cmdsize > 0)
+    // ВАЖНО: cmd_offset уже израсходован первым циклом — сбрасываем на начало load commands
+    cmd_offset = arch_offset + sizeof(mach_header);
     for (uint32_t i = 0; i < mh.ncmds; i++) {
         load_command lc; lseek(fd, cmd_offset, SEEK_SET); read(fd, &lc, sizeof(lc));
         if (lc.cmd == 1) { segment_command seg; lseek(fd, cmd_offset, SEEK_SET); read(fd, &seg, sizeof(seg)); if (seg.vmsize > 0) { int prot = PROT_READ | PROT_WRITE; if (seg.initprot & 4) prot |= PROT_EXEC; mprotect((void*)(seg.vmaddr + g_appSlide), seg.vmsize, prot); } }
