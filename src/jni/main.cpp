@@ -11434,7 +11434,109 @@ void LoadMachO(const std::string& bundlePath) {
                                 uint32_t current_addr = sect.addr;
                                 const uint8_t* code = (const uint8_t*)(sect.addr + g_appSlide);
                                 size_t code_size = sect.size;
-                                
+
+                                // ПРЕ-ПАСС: находим все PIC literal pool адреса задом-наперёд.
+                                // Для каждого ADD Rd, PC ищем последний LDR Rd, [PC, #N] с тем же Rd,
+                                // не пересекая перезапись Rd и не выходя за 512 инструкций назад.
+                                // Это решает проблему forward-lookahead когда ADD далеко от LDR (>64 инструкций).
+                                std::unordered_set<uint32_t> pic_literal_addrs; // pre-slide vmaddr-ы PIC пулов
+                                {
+                                    // Строим таблицу адресов начала каждой инструкции (pre-slide vmaddr -> index в insn_starts)
+                                    // Для быстрого backward scan.
+                                    struct InsnInfo { uint32_t vmaddr; size_t hw_size; }; // hw_size = 1 or 2 (halfwords)
+                                    std::vector<InsnInfo> insns;
+                                    insns.reserve(code_size / 2);
+                                    {
+                                        const uint16_t* p2 = (const uint16_t*)code;
+                                        size_t rem2 = code_size;
+                                        uint32_t cur2 = sect.addr;
+                                        while (rem2 >= 2) {
+                                            uint16_t h = *p2;
+                                            size_t sz = GetThumbInstructionSize(h);
+                                            if (sz == 4 && rem2 < 4) break;
+                                            insns.push_back({cur2, sz / 2});
+                                            p2 += sz / 2;
+                                            cur2 += sz;
+                                            rem2 -= sz;
+                                        }
+                                    }
+                                    int n = (int)insns.size();
+                                    for (int idx = 0; idx < n; idx++) {
+                                        const uint16_t* ip = (const uint16_t*)(code + (insns[idx].vmaddr - sect.addr));
+                                        uint16_t h1 = *ip;
+                                        bool is_add_rd_pc = false;
+                                        uint32_t add_rd = 0;
+                                        // ADD Rd, PC (16-bit T1): 0100 0100 DN 1111 Rdn[2:0]
+                                        // Rm=PC=1111, so: 0100 0100 DN 1111 Rdn[2:0]
+                                        // DN=0 (Rd<8):  0100 0100 0111 1xxx = 0x4478 | Rd  (Rd=0..7)
+                                        // DN=1 (Rd>=8): 0100 0100 1111 1xxx = 0x44F8 | (Rd&7) (Rd=8..15)
+                                        if (insns[idx].hw_size == 1) {
+                                            if ((h1 & 0xFFF8) == 0x4478) { // DN=0, Rm=PC, Rdn[2:0]
+                                                is_add_rd_pc = true;
+                                                add_rd = h1 & 7;
+                                            } else if ((h1 & 0xFFF8) == 0x44F8) { // DN=1, Rm=PC, Rdn[2:0]
+                                                is_add_rd_pc = true;
+                                                add_rd = 8 + (h1 & 7);
+                                            }
+                                        }
+                                        if (!is_add_rd_pc) continue;
+                                        // Нашли ADD Rd, PC. Ищем назад последний LDR Rd, [PC, #N]
+                                        // без перезаписи add_rd между ними, не более 512 инструкций назад.
+                                        for (int back = idx - 1; back >= 0 && (idx - back) <= 512; back--) {
+                                            const uint16_t* bp = (const uint16_t*)(code + (insns[back].vmaddr - sect.addr));
+                                            uint16_t bh1 = *bp;
+                                            size_t bsz = insns[back].hw_size;
+                                            // Проверяем: это LDR add_rd, [PC, #N]?
+                                            uint32_t lit = 0; bool found_ldr = false;
+                                            if (bsz == 1 && (bh1 & 0xF800) == 0x4800) {
+                                                // 16-bit: Rd = bits[10:8]
+                                                uint32_t rd = (bh1 >> 8) & 7;
+                                                if (rd == (add_rd & 7) && add_rd < 8) {
+                                                    uint32_t imm8 = bh1 & 0xFF;
+                                                    uint32_t pc = insns[back].vmaddr + 4;
+                                                    lit = (pc & ~3u) + imm8 * 4;
+                                                    found_ldr = true;
+                                                }
+                                            } else if (bsz == 2) {
+                                                uint16_t bh2 = *(bp + 1);
+                                                if ((bh1 & 0xFF7F) == 0xF85F) {
+                                                    uint32_t rd = (bh2 >> 12) & 0xF;
+                                                    if (rd == add_rd) {
+                                                        uint32_t offset = bh2 & 0x0FFF;
+                                                        uint32_t pc = insns[back].vmaddr + 4;
+                                                        if ((bh1 & 0x0080) == 0) lit = (pc & ~3u) - offset;
+                                                        else                      lit = (pc & ~3u) + offset;
+                                                        found_ldr = true;
+                                                    }
+                                                }
+                                            }
+                                            if (found_ldr) {
+                                                if (lit >= min_vmaddr && lit < max_vmaddr)
+                                                    pic_literal_addrs.insert(lit);
+                                                break; // нашли соответствующий LDR, дальше не ищем
+                                            }
+                                            // Проверяем: перезаписывает ли эта инструкция add_rd?
+                                            // (если да — ADD уже не связан с более ранним LDR в add_rd)
+                                            bool clobbers = false;
+                                            if (bsz == 1) {
+                                                if ((bh1 & 0xF800) == 0x4800 && ((bh1 >> 8) & 7) == (add_rd & 7) && add_rd < 8)
+                                                    clobbers = true; // LDR Rd,[PC] в тот же регистр
+                                                if ((bh1 & 0xF800) == 0x2000 && ((bh1 >> 8) & 7) == (add_rd & 7) && add_rd < 8)
+                                                    clobbers = true; // MOVS Rd, #imm
+                                            } else if (bsz == 2) {
+                                                uint16_t bh2 = *(bp + 1);
+                                                uint32_t rd_ldr = (bh2 >> 12) & 0xF;
+                                                if ((bh1 & 0xFF7F) == 0xF85F && rd_ldr == add_rd)
+                                                    clobbers = true; // LDR.W Rd,[PC]
+                                                uint32_t rd_mov = (bh2 >> 8) & 0xF;
+                                                if ((bh1 & 0xFBF0) == 0xF240 && rd_mov == add_rd)
+                                                    clobbers = true; // MOVW Rd,#imm
+                                            }
+                                            if (clobbers) break;
+                                        }
+                                    }
+                                }
+
                                 int parsed_count = 0;
                                 int modified_literals = 0;
                                 
@@ -11476,52 +11578,10 @@ void LoadMachO(const std::string& bundlePath) {
                                     }
                                     
                                     if (is_ldr_pc && literal_addr >= min_vmaddr && literal_addr < max_vmaddr) {
-                                        // Интеллектуальный Lookahead: Ищем ADD Rd, PC (паттерн позиционно-независимого кода)
-                                        // Увеличен до 64 инструкций: iOS-компилятор (llvm/gcc armv7) генерирует PIC-паттерны
-                                        // где ADD Rd, PC может отстоять на десятки инструкций от LDR Rd, [PC, #N].
-                                        // Если найден ADD Rd, PC — значение в literal pool является PIC-смещением,
-                                        // ребейзить его нельзя, иначе ADD Rd, PC даст address + 2*slide.
-                                        // Дополнительно: если Rd перезаписывается раньше ADD — ADD не относится к этому LDR,
-                                        // поэтому сбрасываем поиск и считаем что это абсолютный адрес.
-                                        bool is_pic_offset = false;
-                                        const uint16_t* scan_ptr = ptr + (insn_size / 2);
-                                        for (int i = 0; i < 64 && (const uint8_t*)scan_ptr < code + code_size; i++) {
-                                            uint16_t scan_hw = *scan_ptr;
-                                            // Проверяем ADD Rd, PC
-                                            if (target_rd < 8 && scan_hw == (0x4478 | target_rd)) {
-                                                is_pic_offset = true; break;
-                                            } else if (target_rd >= 8 && scan_hw == (0x44F8 | (target_rd & 7))) {
-                                                is_pic_offset = true; break;
-                                            }
-                                            // Проверяем перезапись Rd: если регистр переписан до ADD Rd, PC —
-                                            // этот LDR уже не PIC. Проверяем наиболее распространённые случаи:
-                                            // MOV Rd, Rm (T1: 0x4600 | Rd<<3 ... нет, Thumb MOV Rd,Rm = 0x4600|(Rm<<3)|Rd для lo)
-                                            // LDR Rd, [...] (другой LDR в тот же регистр) — просто выходим
-                                            {
-                                                bool clobbers = false;
-                                                size_t sw_size = GetThumbInstructionSize(scan_hw);
-                                                if (sw_size == 2) {
-                                                    // 16-bit LDR Rd,[...]: 0x4800|(Rd<<8) — новый LDR в тот же Rd
-                                                    if ((scan_hw & 0xF800) == 0x4800 && ((scan_hw >> 8) & 7) == (target_rd & 7) && target_rd < 8)
-                                                        clobbers = true;
-                                                    // MOV Rd, #imm (MOVS): 0x2000|(Rd<<8)|imm — перезапись Rd
-                                                    if ((scan_hw & 0xF800) == 0x2000 && ((scan_hw >> 8) & 7) == (target_rd & 7) && target_rd < 8)
-                                                        clobbers = true;
-                                                } else if (sw_size == 4) {
-                                                    uint16_t hw2_scan = *(scan_ptr + 1);
-                                                    // LDR.W Rd,[PC,#imm] (0xF85F/0xF8DF): Rd в hw2[15:12]
-                                                    uint32_t rd_ldr = (hw2_scan >> 12) & 0xF;
-                                                    if ((scan_hw & 0xFF7F) == 0xF85F && rd_ldr == target_rd)
-                                                        clobbers = true;
-                                                    // MOV.W / MOVW Rd,#imm (T3: hw1&0xFBF0==0xF240): Rd в hw2[11:8], НЕ hw2[15:12]!
-                                                    uint32_t rd_mov = (hw2_scan >> 8) & 0xF;
-                                                    if ((scan_hw & 0xFBF0) == 0xF240 && rd_mov == target_rd)
-                                                        clobbers = true;
-                                                }
-                                                if (clobbers) break; // Rd перезаписан — ADD Rd,PC уже не наш
-                                            }
-                                            scan_ptr += GetThumbInstructionSize(scan_hw) / 2;
-                                        }
+                                        // Проверяем через pre-pass таблицу: является ли этот literal PIC-смещением.
+                                        // Это надёжнее forward-lookahead, т.к. ADD Rd, PC может быть на сотни
+                                        // инструкций дальше LDR (выходит за старый лимит 64).
+                                        bool is_pic_offset = (pic_literal_addrs.count(literal_addr) > 0);
 
                                         // Если это НЕ относительное PIC смещение, значит это абсолютный указатель - делаем ребейз
                                         if (!is_pic_offset) {
