@@ -6287,6 +6287,17 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
 
         if (strcmp(op, "class") == 0) return (uint64_t)isa;
 
+        // ФИКС ЧЁРНОГО ЭКРАНА: Wolf3D вызывает [EAGLView presentFramebuffer] для показа кадра.
+        // Нативный IMP этого метода внутри вызывает [context presentRenderbuffer:] напрямую
+        // через IMP (минуя objc_msgSend), поэтому обычный HLE-перехват не срабатывает.
+        // Перехватываем здесь, ДО вызова нативного кода, и делаем eglSwapBuffers напрямую.
+        if (strcmp(op, "presentFramebuffer") == 0) {
+            LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " presentFramebuffer] -> HLE eglSwapBuffers");
+            RenderHLEUI();
+            MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface);
+            return 1;
+        }
+
         void* imp = FindMethodIMP(isa, op);
         if (imp) {
             LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " " + std::string(op) + "]");
@@ -13318,14 +13329,15 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     EGLConfig config; EGLint numConfigs; eglChooseConfig(g_eglDisplay, attribs, &config, 1, &numConfigs);
     const EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE }; g_eglContext = eglCreateContext(g_eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
 
-    // ФИКС ЧЁРНОГО ЭКРАНА (ES 1.1): Игры на чистом OpenGL ES 1.1 не используют шейдеры,
-    // поэтому CPU-растеризатор их не может обработать. Принудительно включаем GPU-режим:
-    // бит 1 (GPU eglSwapBuffers) + бит 2 (GPU glClear) + бит 32 (GPU state calls) + бит 64 (GPU FBO).
-    // Определяем ES-версию по g_activeESVersion — она уставливается в LoadMachO ДО onSurfaceCreated.
-    if (g_activeESVersion == 1 && !(g_gpuOffloadMask & 1)) {
+    // ФИКС ЧЁРНОГО ЭКРАНА (ES 1.1): GPU-biты 2+32+64 нужны для glClear/glEnable/FBO.
+    // Добавляем их всегда для ES 1.1, независимо от бита 1 (swap), который Java уже могла выставить.
+    if (g_activeESVersion == 1) {
+        int prev = g_gpuOffloadMask;
         g_gpuOffloadMask |= (1 | 2 | 32 | 64);
-        LogToJava("onSurfaceCreated: ES 1.1 игра обнаружена — принудительно включён GPU-режим (gpuOffloadMask=0x" +
-                  [&]{ char buf[16]; snprintf(buf, sizeof(buf), "%X", g_gpuOffloadMask); return std::string(buf); }() + ")");
+        if (g_gpuOffloadMask != prev) {
+            LogToJava("onSurfaceCreated: ES 1.1 — принудительно включён GPU-режим (gpuOffloadMask=0x" +
+                      [&]{ char buf[16]; snprintf(buf, sizeof(buf), "%X", g_gpuOffloadMask); return std::string(buf); }() + ")");
+        }
     }
 
     if (g_gpuOffloadMask & 1) {
