@@ -491,18 +491,32 @@ std::map<void*, UITextCache> g_uiTextCache;
 
 void UpdateTextCache(void* view, const std::string& text, float logicalH);
 
+// Проверяет читаемость страницы через /proc/self/mem — надёжнее mincore на Android.
+// mincore возвращает ENOMEM для страниц выделенных scudo:secondary и других аллокаторов
+// даже если страница реально присутствует и читаема. pread на /proc/self/mem лишён этого бага.
+static int g_procSelfMemFd = -1;
+static bool isPageReadable(uintptr_t addr) {
+    if (addr < 0x1000) return false;
+    uintptr_t page = addr & ~(uintptr_t)(4095);
+    if (g_procSelfMemFd < 0) {
+        g_procSelfMemFd = open("/proc/self/mem", O_RDONLY);
+        if (g_procSelfMemFd < 0) {
+            unsigned char vec = 0;
+            return mincore((void*)page, 4096, &vec) == 0;
+        }
+    }
+    char probe[1];
+    return pread(g_procSelfMemFd, probe, 1, (off_t)page) == 1;
+}
+
 bool isValidString(const char* str) {
     if (!str || (uintptr_t)str < 0x1000) return false;
-    // Проверяем доступность страницы через mincore, чтобы не словить SIGSEGV
-    // при обращении к PROT_NONE регионам во время ребейза.
     uintptr_t page_start = (uintptr_t)str & ~(uintptr_t)(4096 - 1);
-    unsigned char vec = 0;
-    if (mincore((void*)page_start, 4096, &vec) != 0) return false;
+    if (!isPageReadable(page_start)) return false;
     for (int i = 0; i < 10000; i++) {
-        // Каждый раз при переходе на новую страницу — перепроверяем доступность
         if ((i & 4095) == 0 && i > 0) {
             uintptr_t cur_page = ((uintptr_t)(str + i)) & ~(uintptr_t)(4096 - 1);
-            if (mincore((void*)cur_page, 4096, &vec) != 0) return false;
+            if (!isPageReadable(cur_page)) return false;
         }
         unsigned char c = (unsigned char)str[i];
         if (c == 0) return true;
@@ -8839,11 +8853,9 @@ extern "C" size_t wrap_strlen(const char* s) {
         LogToJava(buf);
         return 0;
     }
-    uintptr_t page = (uintptr_t)s & ~(uintptr_t)(4096 - 1);
-    unsigned char vec = 0;
-    if (mincore((void*)page, 4096, &vec) != 0) {
+    if (!isPageReadable((uintptr_t)s)) {
         char buf[128];
-        snprintf(buf, sizeof(buf), "SAFETY: wrap_strlen: указатель %p в недоступной странице (mincore fail) — возвращаем 0", (void*)s);
+        snprintf(buf, sizeof(buf), "SAFETY: wrap_strlen: указатель %p в недоступной странице — возвращаем 0", (void*)s);
         LogToJava(buf);
         return 0;
     }
@@ -8859,11 +8871,9 @@ extern "C" char* wrap_strcpy(char* dest, const char* src) {
         if (dest) dest[0] = '\0';
         return dest;
     }
-    uintptr_t page = (uintptr_t)src & ~(uintptr_t)(4096 - 1);
-    unsigned char vec = 0;
-    if (mincore((void*)page, 4096, &vec) != 0) {
+    if (!isPageReadable((uintptr_t)src)) {
         char buf[128];
-        snprintf(buf, sizeof(buf), "SAFETY: wrap_strcpy: src %p в недоступной странице (mincore fail) — dest не тронут", (void*)src);
+        snprintf(buf, sizeof(buf), "SAFETY: wrap_strcpy: src %p в недоступной странице — dest не тронут", (void*)src);
         LogToJava(buf);
         if (dest) dest[0] = '\0';
         return dest;
@@ -8898,12 +8908,10 @@ extern "C" size_t wrap_strlcpy(char* dst, const char* src, size_t size) {
         if (dst && size > 0) dst[0] = '\0';
         return 0;
     }
-    uintptr_t page = (uintptr_t)src & ~(uintptr_t)(4096 - 1);
-    unsigned char vec = 0;
-    if (mincore((void*)page, 4096, &vec) != 0) {
+    if (!isPageReadable((uintptr_t)src)) {
         char buf[128];
         snprintf(buf, sizeof(buf),
-            "SAFETY: wrap_strlcpy: src %p в недоступной странице (mincore fail, size=%zu) — записываем пустую строку",
+            "SAFETY: wrap_strlcpy: src %p в недоступной странице — записываем пустую строку",
             (void*)src, size);
         LogToJava(buf);
         if (dst && size > 0) dst[0] = '\0';
@@ -10919,13 +10927,10 @@ static char* hle_my_CopyString_replacement(const char* src) {
         if (empty) empty[0] = '\0';
         return empty;
     }
-    // Проверка доступности страницы через mincore
-    uintptr_t page = (uintptr_t)src & ~(uintptr_t)(4095);
-    unsigned char vec = 0;
-    if (mincore((void*)page, 4096, &vec) != 0) {
+    if (!isPageReadable((uintptr_t)src)) {
         char buf[128];
         snprintf(buf, sizeof(buf),
-            "SAFETY: hle_my_CopyString: src=%p в недоступной странице (mincore fail) — возвращаем пустую строку", (void*)src);
+            "SAFETY: hle_my_CopyString: src=%p в недоступной странице — возвращаем пустую строку", (void*)src);
         LogToJava(buf);
         char* empty = (char*)malloc(1);
         if (empty) empty[0] = '\0';
