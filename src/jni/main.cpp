@@ -4075,8 +4075,16 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     }
     if (strcmp(op, "setFrame:") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
-        float x = saved_s[0], y = saved_s[1], w = saved_s[2], h = saved_s[3];
-        uint32_t ix, iy, iw, ih; memcpy(&ix, &x, 4); memcpy(&iy, &y, 4); memcpy(&iw, &w, 4); memcpy(&ih, &h, 4);
+        // CGRect передаётся в целочисленных регистрах r2,r3,stack[0],stack[1] (a1..a4),
+        // а НЕ в VFP-регистрах s0-s3. saved_s здесь всегда будет протухшим мусором.
+        uint32_t ix = (uint32_t)(uintptr_t)a1, iy = (uint32_t)(uintptr_t)a2;
+        uint32_t iw = (uint32_t)(uintptr_t)a3, ih = (uint32_t)(uintptr_t)a4;
+        float x, y, w, h;
+        memcpy(&x, &ix, 4); memcpy(&y, &iy, 4); memcpy(&w, &iw, 4); memcpy(&h, &ih, 4);
+        // Санитарная проверка: если пришли явно неверные данные — подставляем поверхность
+        if (w <= 0.0f || w > 4096.0f || h < 0.0f || h > 4096.0f) {
+            x = 0.0f; y = 0.0f; w = (float)g_surfaceWidth; h = (float)g_surfaceHeight;
+        }
         LogToJava(">>>>>>>> [SIZE-CRITICAL] setFrame: вызван для " + GetObjCClassName(self) + " <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr));
         LogToJava("  Устанавливают (FPU Floats): x=" + std::to_string(x) + " y=" + std::to_string(y) + " w=" + std::to_string(w) + " h=" + std::to_string(h));
@@ -4104,7 +4112,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     }
     if (strcmp(op, "setBounds:") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
-        float bx = saved_s[0], by = saved_s[1], bw = saved_s[2], bh = saved_s[3];
+        // CGRect передаётся в целочисленных регистрах, а не в VFP s0-s3
+        uint32_t ibx = (uint32_t)(uintptr_t)a1, iby = (uint32_t)(uintptr_t)a2;
+        uint32_t ibw = (uint32_t)(uintptr_t)a3, ibh = (uint32_t)(uintptr_t)a4;
+        float bx, by, bw, bh;
+        memcpy(&bx, &ibx, 4); memcpy(&by, &iby, 4); memcpy(&bw, &ibw, 4); memcpy(&bh, &ibh, 4);
+        if (bw <= 0.0f || bw > 4096.0f) { bw = (float)g_surfaceWidth; bh = (float)g_surfaceHeight; }
         LogToJava("[SIZE-TRACE] setBounds: вызван для " + GetObjCClassName(self) + ". Caller: " + GetModuleInfoForAddress(lr) + " | Устанавливают (FPU): x=" + std::to_string(bx) + " y=" + std::to_string(by) + " w=" + std::to_string(bw) + " h=" + std::to_string(bh));
         if (g_views[self].frame.size() >= 4) { g_views[self].frame[2] = bw; g_views[self].frame[3] = bh; }
         else g_views[self].frame = {0, 0, bw, bh};
@@ -4238,11 +4251,13 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         float x = 0.0f;
         float y = 0.0f;
         if (cName.find("UIScreen") != std::string::npos) {
-            w = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
-            h = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
-        } else if (g_views.count(self)) { 
+            // Возвращаем фактические размеры без portrait/landscape swap
+            w = (float)g_surfaceWidth;
+            h = (float)g_surfaceHeight;
+        } else if (g_views.count(self)) {
             x = g_views[self].frame[0]; y = g_views[self].frame[1];
-            w = g_views[self].frame[2]; h = g_views[self].frame[3]; 
+            float fw = g_views[self].frame[2]; float fh = g_views[self].frame[3];
+            if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) { w = fw; h = fh; }
         }
         
         float rect[4] = {x, y, w, h};
@@ -4990,8 +5005,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
         if (clsName == "UIScreenMode") {
             if (strcmp(op, "size") == 0) {
-                float w = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
-                float h = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
+                float w = (float)g_surfaceWidth;
+                float h = (float)g_surfaceHeight;
                 g_fpu_ret[0] = w; g_fpu_ret[1] = h; g_fpu_ret_flag = 1;
                 uint32_t iw, ih; memcpy(&iw, &w, 4); memcpy(&ih, &h, 4);
                 return ((uint64_t)ih << 32) | iw; 
@@ -6365,12 +6380,16 @@ uint64_t Impl_objc_msgSendSuper2(void* super_struct, const char* op, void* a1, v
         float rect[4] = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
         std::string cName = GetObjCClassName(receiver);
         if (cName.find("UIScreen") != std::string::npos) {
-            rect[2] = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
-            rect[3] = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
-        } else if (g_views.count(receiver)) { 
-            rect[0] = g_views[receiver].frame[0]; rect[1] = g_views[receiver].frame[1]; rect[2] = g_views[receiver].frame[2]; rect[3] = g_views[receiver].frame[3]; 
+            rect[2] = (float)g_surfaceWidth;
+            rect[3] = (float)g_surfaceHeight;
+        } else if (g_views.count(receiver)) {
+            float fw = g_views[receiver].frame[2]; float fh = g_views[receiver].frame[3];
+            if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) {
+                rect[0] = g_views[receiver].frame[0]; rect[1] = g_views[receiver].frame[1];
+                rect[2] = fw; rect[3] = fh;
+            }
         }
-        if (rect[2] <= 0.0f || rect[3] <= 0.0f) { rect[2] = 480.0f; rect[3] = 320.0f; }
+        if (rect[2] <= 0.0f || rect[3] <= 0.0f) { rect[2] = (float)g_surfaceWidth; rect[3] = (float)g_surfaceHeight; }
         LogToJava("[SUPER-MSG-DEBUG] Перехват " + std::string(op) + "! x=" + std::to_string(rect[0]) + " y=" + std::to_string(rect[1]) + " w=" + std::to_string(rect[2]) + " h=" + std::to_string(rect[3]));
         
         g_fpu_ret[0] = rect[0];
@@ -6427,10 +6446,12 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         float w = (float)g_surfaceWidth;
         float h = (float)g_surfaceHeight;
         if (cName.find("UIScreen") != std::string::npos) {
-            w = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
-            h = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
-        } else if (g_views.count(self)) { 
-            w = g_views[self].frame[2]; h = g_views[self].frame[3]; 
+            // Возвращаем фактический размер поверхности без portrait/landscape swap
+            w = (float)g_surfaceWidth;
+            h = (float)g_surfaceHeight;
+        } else if (g_views.count(self)) {
+            float fw = g_views[self].frame[2]; float fh = g_views[self].frame[3];
+            if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) { w = fw; h = fh; }
         }
         
         // ВНИМАНИЕ: Возвращаем нормальный CGRect: x=0, y=0, w=width, h=height
@@ -6495,12 +6516,11 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
     }
     if (strcmp(op, "applicationFrame") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
+        // Всегда возвращаем ФАКТИЧЕСКИЕ размеры поверхности без portrait/landscape swap:
+        // g_surfaceWidth=480, g_surfaceHeight=320 → отдаём {0,0,480,320}.
+        // Игры сами ориентируются под свой layout; min/max здесь только ломал ландшафтные игры.
         float w = (float)g_surfaceWidth;
         float h = (float)g_surfaceHeight;
-        if (cName.find("UIScreen") != std::string::npos) {
-            w = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
-            h = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
-        }
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET applicationFrame <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr) + " | Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: 0x" + std::to_string((uintptr_t)ret_addr));
         LogToJava("  Writing: x=0 y=0 w=" + std::to_string(w) + " h=" + std::to_string(h));
@@ -6525,8 +6545,8 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
     if (strcmp(op, "size") == 0 && cName.find("UIScreenMode") != std::string::npos) {
         if (ret_addr) {
             float* size = (float*)ret_addr;
-            size[0] = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
-            size[1] = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
+            size[0] = (float)g_surfaceWidth;
+            size[1] = (float)g_surfaceHeight;
         }
         return ret_addr;
     }
@@ -6558,16 +6578,19 @@ void* Impl_objc_msgSendSuper2_stret(void* ret_addr, void* super_struct, const ch
     if (strcmp(op, "frame") == 0 || strcmp(op, "bounds") == 0) {
         LogToJava("[SUPER-STRET-DEBUG] Перехват " + std::string(op) + "! ret_addr=0x" + std::to_string((uintptr_t)ret_addr));
         if (ret_addr) {
-            float rectData[4] = {11.0f, 22.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
+            float rectData[4] = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
             if (cName.find("UIScreen") != std::string::npos) {
-                rectData[2] = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
-                rectData[3] = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
-            } else if (g_views.count(receiver)) { 
-                rectData[0] = g_views[receiver].frame[0]; rectData[1] = g_views[receiver].frame[1]; rectData[2] = g_views[receiver].frame[2]; rectData[3] = g_views[receiver].frame[3]; 
+                rectData[2] = (float)g_surfaceWidth;
+                rectData[3] = (float)g_surfaceHeight;
+            } else if (g_views.count(receiver)) {
+                float fw = g_views[receiver].frame[2]; float fh = g_views[receiver].frame[3];
+                if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) {
+                    rectData[0] = g_views[receiver].frame[0]; rectData[1] = g_views[receiver].frame[1];
+                    rectData[2] = fw; rectData[3] = fh;
+                }
             }
             if (rectData[2] <= 0.0f || rectData[3] <= 0.0f) {
-                            LogToJava("[SUPER-STRET-DEBUG] Форсируем 480x320");
-            rectData[2] = 480.0f; rectData[3] = 320.0f;
+                rectData[2] = (float)g_surfaceWidth; rectData[3] = (float)g_surfaceHeight;
         }
         memcpy(ret_addr, rectData, 16);
         LogToJava("[SUPER-STRET-DEBUG] Записано: x=" + std::to_string(rectData[0]) + " y=" + std::to_string(rectData[1]) + " w=" + std::to_string(rectData[2]) + " h=" + std::to_string(rectData[3]));
@@ -6621,10 +6644,7 @@ void* Impl_objc_msgSendSuper2_stret(void* ret_addr, void* super_struct, const ch
     if (strcmp(op, "applicationFrame") == 0) {
         float w = (float)g_surfaceWidth;
         float h = (float)g_surfaceHeight;
-        if (cName.find("UIScreen") != std::string::npos) {
-            w = std::min((float)g_surfaceWidth, (float)g_surfaceHeight);
-            h = std::max((float)g_surfaceWidth, (float)g_surfaceHeight);
-        }
+        // Убираем portrait/landscape swap — отдаём фактический размер поверхности
         float rectData[4] = {0.0f, 0.0f, w, h};
         if (ret_addr) {
             memcpy(ret_addr, rectData, 16);
