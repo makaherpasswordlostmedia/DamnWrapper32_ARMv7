@@ -1705,14 +1705,12 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
 
     EGLBoolean res = EGL_TRUE;
     if (g_gpuOffloadMask & 1) {
-        // ФИКС ЧЁРНОГО ЭКРАНА (ES 1.1 CPU-render path):
-        // Если GPU draw (бит 16) НЕ выставлен, игра рисует через CPUExtractAndDraw в g_cpuColorBuffer.
-        // Этот буфер нужно blit'ить на экран ВСЕГДА — не только при включённом оверлее.
-        // Условие: либо оверлей есть, либо CPU-rendering (нет бита 16 → буфер не пустой).
+        // ФИКС ЧЁРНОГО ЭКРАНА (CPU render path):
+        // Если бит 16 (GPU vertex draw) НЕ выставлен — игра рисует через CPUExtractAndDraw в g_cpuColorBuffer.
+        // Нужно blit-ить этот буфер на экран ВСЕГДА, а не только при включённом оверлее.
         bool needCpuBlit = (g_onScreenDebugOverlay || g_showPerfOverlay) ||
                            (!(g_gpuOffloadMask & 16) && g_cpuColorBuffer.size() == (size_t)(g_surfaceWidth * g_surfaceHeight));
 
-        // --- GPU BLIT CPU-БУФЕРА + ОВЕРЛЕИ ---
         if (needCpuBlit) {
             static GLuint overlayTex = 0;
             static GLuint overlayProg = 0;
@@ -1741,14 +1739,10 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
             GLboolean cullFace = glIsEnabled(GL_CULL_FACE);
             
-            // Для чистого blit без оверлея — без блендинга (непрозрачный игровой кадр)
+            // Для чистого CPU-blit без оверлея: непрозрачный режим (игровой кадр не смешивается с пустым GPU-фоном)
             bool hasOverlay = (g_onScreenDebugOverlay || g_showPerfOverlay);
-            if (hasOverlay) {
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            } else {
-                glDisable(GL_BLEND);
-            }
+            if (hasOverlay) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
+            else { glDisable(GL_BLEND); }
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
             
@@ -11954,8 +11948,9 @@ void LoadMachO(const std::string& bundlePath) {
         if (dysymtab.cmdsize > 0) {
             std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); lseek(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); read(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
             for (const auto& sect : dysym_sections) {
-                uint32_t* ptr_table = (uint32_t*)sect.addr; uint32_t num_pointers = sect.size / 4;
-                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); }
+                // ФИКС: sect.addr — исходный vmaddr без слайда. Реальный адрес в памяти = sect.addr + g_appSlide.
+                uint32_t* ptr_table = (uint32_t*)(sect.addr + g_appSlide); uint32_t num_pointers = sect.size / 4;
+                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); LogToJava("DYSYM-BIND: [" + symName + "] -> 0x" + [&]{ char b[16]; snprintf(b,sizeof(b),"%X",ptr_table[i]); return std::string(b); }()); }
             }
         }
     } // end if (symtab.cmdsize > 0)
