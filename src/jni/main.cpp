@@ -1706,11 +1706,10 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
     EGLBoolean res = EGL_TRUE;
     if (g_gpuOffloadMask & 1) {
         // ФИКС ЧЁРНОГО ЭКРАНА (CPU render path):
-        // Если бит 16 (GPU vertex draw) НЕ выставлен — игра рисует через CPUExtractAndDraw в g_cpuColorBuffer.
-        // Нужно blit-ить этот буфер на экран ВСЕГДА, а не только при включённом оверлее.
+        // Если бит 16 (GPU vertex draw) НЕ выставлен — игра рисует в g_cpuColorBuffer.
+        // Blit-им его на экран ВСЕГДА, не только при включённом debug overlay.
         bool needCpuBlit = (g_onScreenDebugOverlay || g_showPerfOverlay) ||
                            (!(g_gpuOffloadMask & 16) && g_cpuColorBuffer.size() == (size_t)(g_surfaceWidth * g_surfaceHeight));
-
         if (needCpuBlit) {
             static GLuint overlayTex = 0;
             static GLuint overlayProg = 0;
@@ -1721,7 +1720,6 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                
                 const char* vs = "attribute vec4 pos; attribute vec2 uv; varying vec2 v_uv; void main() { gl_Position = pos; v_uv = uv; }";
                 const char* fs = "precision mediump float; varying vec2 v_uv; uniform sampler2D tex; void main() { gl_FragColor = texture2D(tex, v_uv); }";
                 GLuint vsh = glCreateShader(GL_VERTEX_SHADER); glShaderSource(vsh, 1, &vs, nullptr); glCompileShader(vsh);
@@ -1730,7 +1728,6 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
                 glBindAttribLocation(overlayProg, 0, "pos"); glBindAttribLocation(overlayProg, 1, "uv");
                 glLinkProgram(overlayProg);
             }
-            
             GLint oldProg; glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg);
             GLint oldTex; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex);
             GLint oldActiveTex; glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTex);
@@ -1738,38 +1735,28 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             GLboolean blendEnabled = glIsEnabled(GL_BLEND);
             GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
             GLboolean cullFace = glIsEnabled(GL_CULL_FACE);
-            
-            // Для чистого CPU-blit без оверлея: непрозрачный режим (игровой кадр не смешивается с пустым GPU-фоном)
             bool hasOverlay = (g_onScreenDebugOverlay || g_showPerfOverlay);
             if (hasOverlay) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
             else { glDisable(GL_BLEND); }
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
-            
             glUseProgram(overlayProg);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, overlayTex);
-            
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
             glUniform1i(glGetUniformLocation(overlayProg, "tex"), 0);
-            
             float verts[] = {
-                // ФИКС ПЕРЕВОРОТА: Меняем V координаты местами (1.0 -> 0.0, 0.0 -> 1.0)
-                // Так как glTexImage2D читает снизу-вверх, а наш CPU-буфер идет сверху-вниз.
-                -1.0f,  1.0f, 0.0f, 0.0f, // top left (V=0)
-                -1.0f, -1.0f, 0.0f, 1.0f, // bottom left (V=1)
-                 1.0f,  1.0f, 1.0f, 0.0f, // top right (V=0)
-                 1.0f, -1.0f, 1.0f, 1.0f  // bottom right (V=1)
+                -1.0f,  1.0f, 0.0f, 0.0f,
+                -1.0f, -1.0f, 0.0f, 1.0f,
+                 1.0f,  1.0f, 1.0f, 0.0f,
+                 1.0f, -1.0f, 1.0f, 1.0f
             };
             glBindBuffer(GL_ARRAY_BUFFER, 0);
-            glEnableVertexAttribArray(0);
-            glEnableVertexAttribArray(1);
+            glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
             glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, verts);
             glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            glDisableVertexAttribArray(0);
-            glDisableVertexAttribArray(1);
-            
+            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
             glUseProgram(oldProg);
             glActiveTexture(oldActiveTex);
             glBindTexture(GL_TEXTURE_2D, oldTex);
@@ -1778,10 +1765,7 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             if (depthTest) glEnable(GL_DEPTH_TEST);
             if (cullFace) glEnable(GL_CULL_FACE);
         }
-        
-        // Очищаем CPU-буфер для следующего кадра.
-        // При CPU-rendering (нет бита 16) — в чёрный непрозрачный (игра сама вызовет glClear).
-        // При GPU overlay режиме — прозрачный, чтобы GPU-кадр игры просвечивал.
+        // При CPU-rendering — очищаем в чёрный непрозрачный. При GPU overlay — прозрачный.
         uint32_t cpuClearVal = (g_gpuOffloadMask & 16) ? 0x00000000u : 0xFF000000u;
         std::fill(g_cpuColorBuffer.begin(), g_cpuColorBuffer.end(), cpuClearVal);
 
@@ -11948,9 +11932,21 @@ void LoadMachO(const std::string& bundlePath) {
         if (dysymtab.cmdsize > 0) {
             std::vector<uint32_t> indirectSyms(dysymtab.nindirectsyms); lseek(fd, arch_offset + dysymtab.indirectsymoff, SEEK_SET); read(fd, indirectSyms.data(), dysymtab.nindirectsyms * sizeof(uint32_t));
             for (const auto& sect : dysym_sections) {
-                // ФИКС: sect.addr — исходный vmaddr без слайда. Реальный адрес в памяти = sect.addr + g_appSlide.
-                uint32_t* ptr_table = (uint32_t*)(sect.addr + g_appSlide); uint32_t num_pointers = sect.size / 4;
-                for (uint32_t i = 0; i < num_pointers; i++) { uint32_t sym_idx = indirectSyms[sect.reserved1 + i]; if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue; std::string symName = &strTable[symTable[sym_idx].n_un.n_strx]; ptr_table[i] = (uint32_t)ResolveSymbol(symName); LogToJava("DYSYM-BIND: [" + symName + "] -> 0x" + [&]{ char b[16]; snprintf(b,sizeof(b),"%X",ptr_table[i]); return std::string(b); }()); }
+                uint32_t* ptr_table = (uint32_t*)sect.addr; uint32_t num_pointers = sect.size / 4;
+                // ФИКС КРАША: __lazy_symbol_ptr и __nl_symbol_ptr могут лежать в странице без W-бита.
+                // mprotect нужен перед записью наших стабов.
+                uintptr_t page_start = (uintptr_t)sect.addr & ~(uintptr_t)0xFFF;
+                size_t page_size = (((uintptr_t)sect.addr + sect.size + 0xFFF) & ~(uintptr_t)0xFFF) - page_start;
+                mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE);
+                for (uint32_t i = 0; i < num_pointers; i++) {
+                    uint32_t sym_idx = indirectSyms[sect.reserved1 + i];
+                    if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue;
+                    std::string symName = &strTable[symTable[sym_idx].n_un.n_strx];
+                    void* stub = ResolveSymbol(symName);
+                    ptr_table[i] = (uint32_t)stub;
+                    LogToJava("DYSYM-BIND: [" + symName + "] -> 0x" + [&]{ char b[16]; snprintf(b,sizeof(b),"%X",(uint32_t)stub); return std::string(b); }());
+                }
+                mprotect((void*)page_start, page_size, PROT_READ | PROT_EXEC);
             }
         }
     } // end if (symtab.cmdsize > 0)
