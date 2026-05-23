@@ -12107,7 +12107,10 @@ void LoadMachO(const std::string& bundlePath) {
                                                                      target_section.find("__TEXT,__const") != std::string::npos);
 
                                             if (is_code_target) {
-                                                if ((val & 1) == 0) { safe_to_rebase = false; reason = "Code: Even"; }
+                                                // val&1==1 => Thumb pointer, всегда ребейзим
+                                                // val&3==0 => ARM32 указатель (4-байт выровнен), тоже ребейзим
+                                                // val&3==2 => не выровнен по 4, не реальный указатель — пропускаем
+                                                if ((val & 1) == 0 && (val & 3) != 0) { safe_to_rebase = false; reason = "Code: Even"; }
                                                 else if (((val >> 16) & 0xFFFF) == (val & 0xFFFF)) { safe_to_rebase = false; reason = "Code: Symmetric"; }
                                             } else if (is_raw_string_target) {
                                                 if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "String: Invalid"; }
