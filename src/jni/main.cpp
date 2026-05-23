@@ -7901,11 +7901,13 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             }
 
             uint32_t vcIsa = ((uint32_t*)vc)[0];
-            if (FindMethodIMP(vcIsa, "awakeFromNib") &&
-                !g_awakeFromNibCalled.count((uintptr_t)vc)) {
-                LogToJava("HLE: Calling awakeFromNib for ViewController");
-                Stub_objc_msgSend(vc, "awakeFromNib", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-            }
+            // awakeFromNib для wolf3dViewController НЕ вызываем:
+            // wolf3d::awakeFromNib после setDisplayLink: вызывает [self.view drawFrame]
+            // напрямую по кешированному IMP, при этом self.view содержит CGRect.height
+            // (0x43A00000 = 320.0f) как id-объект → SIGSEGV в strcmp внутри objc_msgSend.
+            // initWithNibName:bundle: уже полностью инициализировал EAGLView и контекст,
+            // awakeFromNib ничего нового не даёт — он лишь дублирует эту инициализацию
+            // и пытается запустить рендер-цикл, который мы ведём сами.
 
             if (FindMethodIMP(appDelIsa, "setViewController:")) {
                 Stub_objc_msgSend(appDel, "setViewController:", vc, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
