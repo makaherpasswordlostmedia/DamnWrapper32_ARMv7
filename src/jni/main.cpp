@@ -1488,51 +1488,18 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
             s_viewport_forced = true;
         }
 
-        if (g_lastActiveFBO == 0 && (mask & GL_COLOR_BUFFER_BIT)) {
-            // ФИКС ПРОЗРАЧНОСТИ 2: Защищаем альфа-канал от затирания очисткой
+        // ES1.1: не подавляем альфа-канал при очистке (игра сама не пишет альфу через шейдер)
+        if (g_activeESVersion != 1 && g_lastActiveFBO == 0 && (mask & GL_COLOR_BUFFER_BIT)) {
+            // ФИКС ПРОЗРАЧНОСТИ 2: Защищаем альфа-канал от затирания очисткой (только ES2)
             glColorMask(g_colorMask[0], g_colorMask[1], g_colorMask[2], GL_FALSE);
             glClear(mask);
             glColorMask(g_colorMask[0], g_colorMask[1], g_colorMask[2], g_colorMask[3]);
         } else {
             glClear(mask);
         }
-    } else if (!(g_gpuOffloadMask & 2)) {
-        // GPU default path (mask=0): реальный glClear в EGL WindowSurface
-        glClear(mask);
     } else {
-        std::vector<uint32_t>* targetColorBuf = &g_cpuColorBuffer;
-        std::vector<float>* targetDepthBuf = &g_cpuDepthBuffer;
-        int targetW = g_surfaceWidth;
-        int targetH = g_surfaceHeight;
-
-        if (g_lastActiveFBO != 0 && g_fboColorTex.count(g_lastActiveFBO)) {
-            GLuint tex = g_fboColorTex[g_lastActiveFBO];
-            if (tex != 0 && g_cpuTexW.count(tex) && g_cpuTexW[tex] > 0) {
-                targetW = g_cpuTexW[tex];
-                targetH = g_cpuTexH[tex];
-                if (g_cpuTextures[tex].size() != (size_t)(targetW * targetH)) g_cpuTextures[tex].resize(targetW * targetH, 0x00000000);
-                targetColorBuf = &g_cpuTextures[tex];
-                if (g_fboDepthBuf[g_lastActiveFBO].size() != (size_t)(targetW * targetH)) g_fboDepthBuf[g_lastActiveFBO].resize(targetW * targetH, 1.0f);
-                targetDepthBuf = &g_fboDepthBuf[g_lastActiveFBO];
-            }
-        }
-
-        if (targetColorBuf->size() != (size_t)(targetW * targetH)) {
-            targetColorBuf->resize(targetW * targetH, 0xFF000000);
-            targetDepthBuf->resize(targetW * targetH, 1.0f);
-        }
-        
-        if (mask & GL_COLOR_BUFFER_BIT) {
-            uint8_t cr = (uint8_t)(g_cpuClearColor[0] * 255.0f);
-            uint8_t cg = (uint8_t)(g_cpuClearColor[1] * 255.0f);
-            uint8_t cb = (uint8_t)(g_cpuClearColor[2] * 255.0f);
-            uint8_t ca = (uint8_t)(g_cpuClearColor[3] * 255.0f);
-            uint32_t baseColor = (ca << 24) | (cb << 16) | (cg << 8) | cr;
-            std::fill(targetColorBuf->begin(), targetColorBuf->end(), baseColor);
-        }
-        if (mask & GL_DEPTH_BUFFER_BIT) {
-            std::fill(targetDepthBuf->begin(), targetDepthBuf->end(), 1.0f);
-        }
+        // GPU default path (mask=0) или CPU path
+        glClear(mask);
     }
     
     GLint err = glGetError();
@@ -1973,12 +1940,15 @@ extern "C" void Stub_glVertexAttribPointer(GLuint index, GLint size, GLenum type
 
 extern "C" void Stub_glEnableVertexAttribArray(GLuint index) {
     if (index < 16) g_vertexAttribs[index].enabled = 1;
-    if (g_gpuOffloadMask & 16) glEnableVertexAttribArray(index);
+    // В ES1-режиме UploadES1Uniforms управляет включением массивов перед каждым draw,
+    // поэтому вызывать реальный GL здесь преждевременно — glUseProgram ещё не вызван.
+    // В ES2-режиме (с шейдерами игры) вызываем сразу.
+    if ((g_gpuOffloadMask & 16) && g_activeESVersion != 1) glEnableVertexAttribArray(index);
 }
 
 extern "C" void Stub_glDisableVertexAttribArray(GLuint index) {
     if (index < 16) g_vertexAttribs[index].enabled = 0;
-    if (g_gpuOffloadMask & 16) glDisableVertexAttribArray(index);
+    if ((g_gpuOffloadMask & 16) && g_activeESVersion != 1) glDisableVertexAttribArray(index);
 }
 
 extern "C" void Stub_glBindBuffer(GLenum target, GLuint buffer) {
@@ -3360,6 +3330,12 @@ static void UploadES1Uniforms() {
     if (!g_es1FixedProg) return;
     glUseProgram(g_es1FixedProg);
 
+    // Включаем/выключаем нужные attrib arrays согласно ES1 состоянию
+    // attrib 0 = position, 1 = color, 2 = texcoord
+    if (g_vertexAttribs[0].enabled) glEnableVertexAttribArray(0); else glDisableVertexAttribArray(0);
+    if (g_vertexAttribs[1].enabled) glEnableVertexAttribArray(1); else glDisableVertexAttribArray(1);
+    if (g_vertexAttribs[2].enabled) glEnableVertexAttribArray(2); else glDisableVertexAttribArray(2);
+
     // MVP = Projection * Modelview
     if (g_es1uMVP >= 0) {
         const float* mv = g_modelViewStack.back().data();
@@ -3427,16 +3403,21 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
             }
         }
         bool needRot = (g_gameViewportH > g_gameViewportW && targetW > targetH);
-        GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
-        if (prog > 0) {
-            GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
-            if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
+        // ES1.1: нет шейдерной программы от игры — используем наш fixed-function эмулятор.
+        // Без него prog=0 и glDrawArrays рисует в пустоту (чёрный экран).
+        if (g_activeESVersion == 1 && g_es1FixedProg != 0) {
+            UploadES1Uniforms();
+            glDrawArrays(mode, first, count);
+        } else {
+            GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+            if (prog > 0) {
+                GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
+                if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
+            }
+            glDrawArrays(mode, first, count);
         }
-        glDrawArrays(mode, first, count);
     } else if (!(g_gpuOffloadMask & 2)) {
         // GPU-путь по умолчанию (mask=0): передаём draw call напрямую в реальный OpenGL ES.
-        // Wolf3D использует ES1.1 fixed pipeline — вертексные атрибуты уже настроены через
-        // wrap_glVertexPointer/wrap_glTexCoordPointer, которые вызывают реальный GL.
         UploadES1Uniforms();
         glDrawArrays(mode, first, count);
     } else {
@@ -3447,22 +3428,28 @@ extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type
     SyncLog("[GL-TRACE] glDrawElements(mode=" + std::to_string(mode) + ", count=" + std::to_string(count) + ", type=" + std::to_string(type) + ")");
     g_frameHasDraw = true;
     if (g_gpuOffloadMask & 16) {
-        int targetW = g_surfaceWidth;
-        int targetH = g_surfaceHeight;
-        if (g_lastActiveFBO != 0 && g_fboColorTex.count(g_lastActiveFBO)) {
-            GLuint tex = g_fboColorTex[g_lastActiveFBO];
-            if (tex != 0 && g_cpuTexW.count(tex) && g_cpuTexW[tex] > 0) {
-                targetW = g_cpuTexW[tex];
-                targetH = g_cpuTexH[tex];
+        // ES1.1: нет шейдерной программы от игры — используем наш fixed-function эмулятор.
+        if (g_activeESVersion == 1 && g_es1FixedProg != 0) {
+            UploadES1Uniforms();
+            glDrawElements(mode, count, type, indices);
+        } else {
+            int targetW = g_surfaceWidth;
+            int targetH = g_surfaceHeight;
+            if (g_lastActiveFBO != 0 && g_fboColorTex.count(g_lastActiveFBO)) {
+                GLuint tex = g_fboColorTex[g_lastActiveFBO];
+                if (tex != 0 && g_cpuTexW.count(tex) && g_cpuTexW[tex] > 0) {
+                    targetW = g_cpuTexW[tex];
+                    targetH = g_cpuTexH[tex];
+                }
             }
+            bool needRot = (g_gameViewportH > g_gameViewportW && targetW > targetH);
+            GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+            if (prog > 0) {
+                GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
+                if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
+            }
+            glDrawElements(mode, count, type, indices);
         }
-        bool needRot = (g_gameViewportH > g_gameViewportW && targetW > targetH);
-        GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
-        if (prog > 0) {
-            GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
-            if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
-        }
-        glDrawElements(mode, count, type, indices);
     } else if (!(g_gpuOffloadMask & 2)) {
         // GPU-путь по умолчанию (mask=0): передаём draw call в реальный OpenGL ES.
         UploadES1Uniforms();
@@ -3478,21 +3465,22 @@ extern "C" void MegaDebug_glUseProgram(GLuint program) {
 extern "C" void MegaDebug_glEnable(GLenum cap) {
     if (cap == GL_BLEND) g_blendEnabled = true;
     else if (cap == GL_DEPTH_TEST) g_depthTestEnabled = true;
-    else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = true;
+    else if (cap == GL_TEXTURE_2D) { g_texture2DEnabled = true; return; } // ES2 не поддерживает GL_TEXTURE_2D как enable
     else if (cap == 0x0B44) g_cullFaceEnabled = true; // GL_CULL_FACE
-    else if (cap == 0x8840) g_matrixPaletteEnabled = true; // GL_MATRIX_PALETTE_OES
-    else if (cap == 0x0B60) g_fogEnabled = true;
-    // ФИКС: Всегда вызываем реальный glEnable (mask&32 было гейтом только для CPU-mode)
+    else if (cap == 0x8840) { g_matrixPaletteEnabled = true; return; } // GL_MATRIX_PALETTE_OES — только ES1
+    else if (cap == 0x0B60) { g_fogEnabled = true; return; } // GL_FOG — только ES1
+    else if (cap == 0x0BC0) return; // GL_ALPHA_TEST — только ES1
     if (g_gpuOffloadMask & 32) glEnable(cap);
     else if (!(g_gpuOffloadMask & 2)) glEnable(cap); // GPU default path (mask=0)
 }
 extern "C" void MegaDebug_glDisable(GLenum cap) {
     if (cap == GL_BLEND) g_blendEnabled = false;
     else if (cap == GL_DEPTH_TEST) g_depthTestEnabled = false;
-    else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = false;
+    else if (cap == GL_TEXTURE_2D) { g_texture2DEnabled = false; return; } // ES2 не поддерживает GL_TEXTURE_2D как enable
     else if (cap == 0x0B44) g_cullFaceEnabled = false;
-    else if (cap == 0x8840) g_matrixPaletteEnabled = false;
-    else if (cap == 0x0B60) g_fogEnabled = false;
+    else if (cap == 0x8840) { g_matrixPaletteEnabled = false; return; } // GL_MATRIX_PALETTE_OES — только ES1
+    else if (cap == 0x0B60) { g_fogEnabled = false; return; } // GL_FOG — только ES1
+    else if (cap == 0x0BC0) return; // GL_ALPHA_TEST — только ES1
     if (g_gpuOffloadMask & 32) glDisable(cap);
     else if (!(g_gpuOffloadMask & 2)) glDisable(cap); // GPU default path (mask=0)
 }
