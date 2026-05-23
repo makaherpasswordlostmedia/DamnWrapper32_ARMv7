@@ -2288,7 +2288,8 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
     } else if (pixels != nullptr) {
         // Всегда копируем в свой буфер — MTK требует выровненную память
         size_t totalBytes = SafeGetGLTextureSize(width, height, format, type);
-        if (totalBytes > 0) {
+        // Защита: не копируем если размер подозрительно велик (>= 32MB) или нулевой
+        if (totalBytes > 0 && totalBytes <= 0x2000000u) {
             converted_buf.resize(totalBytes);
             memcpy(converted_buf.data(), pixels, totalBytes);
             safe_pixels = converted_buf.data();
@@ -12012,7 +12013,10 @@ void LoadMachO(const std::string& bundlePath) {
                                                 uint32_t slid_max = max_vmaddr + g_appSlide;
                                                 bool already_rebased = (val >= slid_min && val < slid_max);
                                                 
-                                                if (!already_rebased && val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
+                                                // Нижняя граница — адрес начала самой секции (sect.addr).
+                                                // Значения ниже (напр. GL enum 0x8034 < __text start 0x2E38)
+                                                // не могут быть указателями на функции и не ребейзятся.
+                                                if (!already_rebased && val >= sect.addr && val < max_vmaddr) {
                                                     // Защита от двойного ребейза: пропускаем уже обработанные слоты
                                                     if (g_rebasedSlots.find(shifted_literal) == g_rebasedSlots.end()) {
                                                         val += g_appSlide;
