@@ -4743,7 +4743,19 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
         }
         if (clsName == "CADisplayLink" && strcmp(op, "displayLinkWithTarget:selector:") == 0) {
-            g_displayLinkTarget = a1; g_displayLinkSelector = (const char*)a2;
+            // ФИКС: Валидируем target перед сохранением — float-значения (например, 320.0f = 0x43a00000)
+            // не являются валидными указателями на ObjC-объект и вызывают SIGSEGV в main loop.
+            uint32_t probe_isa = 0;
+            if (a1 && (uintptr_t)a1 > 0x10000 && (uintptr_t)a1 < 0xFF000000 &&
+                SafeRead32((uintptr_t)a1, &probe_isa) && probe_isa > 0x1000) {
+                g_displayLinkTarget = a1;
+                g_displayLinkSelector = (const char*)a2;
+                LogToJava("[CADisplayLink displayLinkWithTarget:selector:] target=0x" + 
+                          std::to_string((uintptr_t)a1) + " sel=" + std::string((const char*)a2));
+            } else {
+                LogToJava("[CADisplayLink displayLinkWithTarget:selector:] WARN: невалидный target=0x" + 
+                          std::to_string((uintptr_t)a1) + " — игнорируем");
+            }
             uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; return (uint64_t)(uintptr_t)inst;
         }
 
@@ -5064,7 +5076,18 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
         if (clsName == "UIScreen") {
             if (strcmp(op, "displayLinkWithTarget:selector:") == 0) {
-                g_displayLinkTarget = a1; g_displayLinkSelector = (const char*)a2;
+                // ФИКС: Валидируем target перед сохранением
+                uint32_t probe_isa = 0;
+                if (a1 && (uintptr_t)a1 > 0x10000 && (uintptr_t)a1 < 0xFF000000 &&
+                    SafeRead32((uintptr_t)a1, &probe_isa) && probe_isa > 0x1000) {
+                    g_displayLinkTarget = a1;
+                    g_displayLinkSelector = (const char*)a2;
+                    LogToJava("[UIScreen displayLinkWithTarget:selector:] target=0x" +
+                              std::to_string((uintptr_t)a1) + " sel=" + std::string((const char*)a2));
+                } else {
+                    LogToJava("[UIScreen displayLinkWithTarget:selector:] WARN: невалидный target=0x" +
+                              std::to_string((uintptr_t)a1) + " — игнорируем");
+                }
                 uint32_t* inst = (uint32_t*)calloc(1, 32); 
                 inst[0] = g_hleClasses.count("CADisplayLink") ? (uint32_t)g_hleClasses["CADisplayLink"] : 0xDEADBEEF;
                 return (uint64_t)(uintptr_t)inst;
@@ -6285,6 +6308,13 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
         
         if (strcmp(op, "view") == 0) {
+            // ФИКС: Сначала возвращаем уже сохранённый EAGLView (установленный через setView:).
+            // Без этого нативный wolf3dViewController::drawFrame вызывал loadView заново,
+            // создавал пустой UIView вместо EAGLView, и crash chain продолжался.
+            if (g_viewControllersViews.find(self) != g_viewControllersViews.end() &&
+                g_viewControllersViews[self] != nullptr) {
+                return (uint64_t)(uintptr_t)g_viewControllersViews[self];
+            }
             if (g_viewControllersViews.find(self) == g_viewControllersViews.end()) {
                 LogToJava("HLE: Calling loadView for " + cName);
                 void* imp = FindMethodIMP(isa, "loadView");
@@ -7860,6 +7890,20 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         }
 
         if (g_renderingStarted && g_displayLinkTarget && g_displayLinkSelector) {
+            // ФИКС: Проверяем, что g_displayLinkTarget — валидный ObjC-объект.
+            // Float-значения (0x43a00000 = 320.0f) могут попасть сюда при некорректной
+            // передаче аргументов в displayLinkWithTarget:selector: нативным кодом.
+            uint32_t probe_isa = 0;
+            if (!SafeRead32((uintptr_t)g_displayLinkTarget, &probe_isa) || probe_isa < 0x1000) {
+                LogToJava("[MAIN-LOOP] FATAL: g_displayLinkTarget=0x" +
+                          std::to_string((uintptr_t)g_displayLinkTarget) +
+                          " невалиден (isa=0x" + std::to_string(probe_isa) +
+                          "), сбрасываем g_renderingStarted!");
+                g_displayLinkTarget = nullptr;
+                g_renderingStarted = false;
+                usleep(16000);
+                continue;
+            }
             static int dl_ticks = 0;
             if (dl_ticks++ % 60 == 0) LogToJava("[MAIN-LOOP] Вызов DisplayLink: target=" + GetObjCClassName(g_displayLinkTarget) + " sel=" + std::string(g_displayLinkSelector));
             Stub_objc_msgSend(g_displayLinkTarget, g_displayLinkSelector, realFakeLink, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
