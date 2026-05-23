@@ -2103,6 +2103,29 @@ GLuint g_cpuActiveTexture = 0;
 extern int g_clientActiveTexture;
 
 // Вспомогательная функция для вычисления точного размера текстуры в байтах
+// Снимает ложный ребейз с GL enum-значений (type, format, internalformat).
+//
+// Проблема: эвристический ребейз __data видит слово 0x00008034 (GL_UNSIGNED_SHORT_5_5_5_1)
+// и добавляет к нему g_appSlide (0x10000000), получая 0x10008034 — адрес внутри __TEXT.
+// Когда игра читает это поле из структуры и передаёт в glTexImage2D,
+// драйвер MTK/Mali получает невалидный type → SIGSEGV.
+//
+// Решение: если значение попало в диапазон [g_appSlide, g_appSlide+image_size)
+// И нижние биты (= значение до ребейза) лежат в типичном диапазоне GL-констант [0x1400, 0x9000),
+// снимаем slide обратно. GL-константы никогда не бывают настоящими указателями в образе.
+static inline GLenum SanitizeGLEnum(GLenum val) {
+    if (g_appSlide == 0) return val;
+    uint32_t v = (uint32_t)val;
+    if (v >= g_appSlide && v < g_appSlide + 0x1000000u) {
+        uint32_t unslid = v - g_appSlide;
+        // GL enum-ы для type/format живут в диапазоне 0x1400–0x8FFF
+        if (unslid >= 0x1400u && unslid < 0x9000u) {
+            return (GLenum)unslid;
+        }
+    }
+    return val;
+}
+
 static inline size_t SafeGetGLTextureSize(GLsizei width, GLsizei height, GLenum format, GLenum type) {
     size_t bpp = 4;
     if (format == GL_RGB && type == 0x8363) bpp = 2; // GL_UNSIGNED_SHORT_5_6_5
@@ -2127,6 +2150,13 @@ extern "C" void Stub_glBindTexture(GLenum target, GLuint texture) {
 }
 
 extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
+    // Снимаем ложный ребейз с GL enum-аргументов.
+    // Эвристика __data может добавить g_appSlide к константам вроде 0x8034,
+    // превратив их в адреса внутри __TEXT. Драйвер MTK крашит на таких значениях.
+    type           = SanitizeGLEnum(type);
+    format         = SanitizeGLEnum(format);
+    internalformat = (GLint)SanitizeGLEnum((GLenum)internalformat);
+
     // Лог с hex-значениями для диагностики
     char logbuf[256];
     snprintf(logbuf, sizeof(logbuf), "[GL-TEX] glTexImage2D: tex=%u w=%d h=%d intFmt=0x%X fmt=0x%X type=0x%X pixels=%d",
@@ -2304,6 +2334,8 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
 }
 
 extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
+    type   = SanitizeGLEnum(type);
+    format = SanitizeGLEnum(format);
     if (target == GL_TEXTURE_2D && level == 0 && pixels && g_cpuTextures.count(g_cpuActiveTexture)) {
         std::vector<uint32_t>& texBuf = g_cpuTextures[g_cpuActiveTexture];
         int texW = g_cpuTexW[g_cpuActiveTexture];
