@@ -8139,6 +8139,74 @@ extern "C" void wrap_CGImageRelease(void* image) {
     }
 }
 
+// HLE_CGDataProvider: обёртка вокруг HLE_CGImage для эмуляции CoreGraphics DataProvider
+struct HLE_CGDataProvider {
+    void* data;      // указатель на пиксельные данные
+    size_t length;   // размер в байтах
+    bool ownData;    // true = мы сами выделили, надо free()
+};
+
+// CGImageGetDataProvider — возвращает провайдер данных изображения
+// Wolf3D использует это чтобы добраться до сырых пикселей PNG-текстур
+extern "C" void* wrap_CGImageGetDataProvider(void* image) {
+    if (!image) return nullptr;
+    HLE_CGImage* img = (HLE_CGImage*)image;
+    if (!img->data) return nullptr;
+    HLE_CGDataProvider* dp = new HLE_CGDataProvider();
+    dp->data    = img->data;
+    dp->length  = (size_t)img->width * img->height * (img->bpp / 8);
+    dp->ownData = false; // данные принадлежат HLE_CGImage
+    LogToJava("HLE: CGImageGetDataProvider img=" + std::to_string((uintptr_t)image)
+              + " dp=" + std::to_string((uintptr_t)dp)
+              + " len=" + std::to_string(dp->length));
+    return dp;
+}
+
+// CGDataProviderCopyData — копирует пиксели из провайдера в CFData-совместимый буфер
+// Возвращаем указатель на CFData-like struct: [length:4][data:N]
+// Wolf3D читает данные через CFDataGetBytePtr / прямой указатель
+extern "C" void* wrap_CGDataProviderCopyData(void* provider) {
+    if (!provider) return nullptr;
+    HLE_CGDataProvider* dp = (HLE_CGDataProvider*)provider;
+    if (!dp->data || dp->length == 0) return nullptr;
+    // Выделяем буфер: 4 байта длины + сами данные (имитация CFDataRef)
+    uint8_t* buf = (uint8_t*)malloc(sizeof(uint32_t) + dp->length);
+    if (!buf) return nullptr;
+    *(uint32_t*)buf = (uint32_t)dp->length;
+    memcpy(buf + sizeof(uint32_t), dp->data, dp->length);
+    LogToJava("HLE: CGDataProviderCopyData dp=" + std::to_string((uintptr_t)provider)
+              + " len=" + std::to_string(dp->length));
+    return buf; // caller получает CFDataRef-like; первые 4 байта = длина, дальше пиксели
+}
+
+// CGImageGetBitsPerPixel — возвращает глубину цвета (32 для RGBA8888)
+extern "C" size_t wrap_CGImageGetBitsPerPixel(void* image) {
+    if (!image) return 0;
+    HLE_CGImage* img = (HLE_CGImage*)image;
+    // bpp в HLE_CGImage хранится как "бит на компонент", умножаем на 4 канала
+    size_t bpp = (size_t)img->bpp * 4;
+    LogToJava("HLE: CGImageGetBitsPerPixel=" + std::to_string(bpp));
+    return bpp;
+}
+
+// CGImageGetColorSpace — возвращает цветовое пространство изображения (DeviceRGB)
+extern "C" void* wrap_CGImageGetColorSpace(void* image) {
+    // Возвращаем тот же singleton DeviceRGB что и CGColorSpaceCreateDeviceRGB
+    static void* s_deviceRGB = nullptr;
+    if (!s_deviceRGB) s_deviceRGB = wrap_CGColorSpaceCreateDeviceRGB();
+    LogToJava("HLE: CGImageGetColorSpace -> DeviceRGB " + std::to_string((uintptr_t)s_deviceRGB));
+    return s_deviceRGB;
+}
+
+// __exit — аварийный выход процесса; Wolf3D вызывает его при критических ошибках
+// Мы перехватываем и логируем вместо реального завершения
+extern "C" void wrap___exit(int code) {
+    uint32_t lr = (uint32_t)__builtin_return_address(0);
+    LogToJava("HLE: __exit(" + std::to_string(code) + ") перехвачен. Caller: "
+              + GetModuleInfoForAddress(lr));
+    // Не убиваем процесс — игра сама восстановится или зависнет, но экран останется
+}
+
 extern "C" void wrap_CGContextDrawImage(void* c, CGRect rect, void* image) {
     if (!c || !image) return;
     HLE_CGContext* ctx = (HLE_CGContext*)c;
@@ -10730,7 +10798,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(alBufferi), STB_W(alBuffer3i), STB_W(alBuffer3f), STB_W(alBufferiv), STB_W(alBufferfv),
     STB_W(alGetBufferi), STB_W(alGetBuffer3i), STB_W(alGetBufferf), STB_W(alGetBuffer3f), STB_W(alGetBufferfv), STB_W(alGetBufferiv),
     STB_W(alIsSource), STB_W(alIsBuffer),
-    STB_W(alSourceUnqueueBuffers), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
+    STB_W(alSourceUnqueueBuffers), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(CGImageGetDataProvider), STB_W(CGDataProviderCopyData), STB_W(CGImageGetBitsPerPixel), STB_W(CGImageGetColorSpace), {"___exit", (void*)wrap___exit}, STB_W(NSClassFromString), STB_W(NSSelectorFromString),
     {"_SCNetworkReachabilityScheduleWithRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }}, {"_SCNetworkReachabilitySetCallback", (void*)+[](void* target, void* callout, void* context) -> bool { return true; }}, {"_SCNetworkReachabilityUnscheduleFromRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }},
     {"__Block_object_assign", (void*)wrap_Block_object_assign}, {"__Block_copy", (void*)wrap_Block_copy}, {"__Block_release", (void*)wrap_Block_release},
 
