@@ -164,6 +164,13 @@ int g_gameViewportW = 0;
 int g_gameViewportH = 0;
 bool g_isFakeViewport = false;
 int g_activeESVersion = 2;
+// ES1.1 фиксированный pipeline: шейдерная программа для эмуляции в ES2.0 контексте
+static GLuint g_es1FixedProg = 0;
+// ES1.1 uniform locations
+static GLint  g_es1uMVP = -1, g_es1uModelview = -1, g_es1uProjection = -1;
+static GLint  g_es1uTexEnabled = -1, g_es1uAlphaTest = -1, g_es1uAlphaRef = -1;
+static GLint  g_es1uFogEnabled = -1, g_es1uFogColor = -1, g_es1uFogStart = -1, g_es1uFogEnd = -1;
+static GLint  g_es1uColor = -1, g_es1uSampler = -1;
 int g_debugHeartbeat = 0;
 int g_lastActiveFBO = 0;
 std::map<GLuint, GLuint> g_fboColorTex;
@@ -233,6 +240,9 @@ GLenum g_depthFunc = 0x0201; // GL_LESS
 GLenum g_blendSrc = GL_ONE;
 GLenum g_blendDst = GL_ZERO;
 bool g_depthTestEnabled = false;
+bool g_fogEnabled = false;
+float g_fogStart = 0.0f, g_fogEnd = 1.0f;
+float g_fogColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 bool g_depthMask = true;
 bool g_colorMask[4] = {true, true, true, true};
 bool g_texture2DEnabled = false;
@@ -1447,10 +1457,8 @@ void ForceSafeGLState() {
 
 extern "C" void Stub_glClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha) {
     g_cpuClearColor[0] = red; g_cpuClearColor[1] = green; g_cpuClearColor[2] = blue; g_cpuClearColor[3] = alpha;
-    if (g_gpuOffloadMask & 2) {
-        // ФИКС ПРОЗРАЧНОСТИ: Принудительно альфа = 1.0, чтобы сквозь игру не просвечивал рабочий стол телефона
-        glClearColor(red, green, blue, 1.0f);
-    }
+    // Принудительно альфа = 1.0, чтобы сквозь игру не просвечивал рабочий стол телефона
+    glClearColor(red, green, blue, 1.0f);
 }
 
 extern "C" void MegaDebug_glClear(GLbitfield mask) {
@@ -1488,9 +1496,10 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
         } else {
             glClear(mask);
         }
+    } else if (!(g_gpuOffloadMask & 2)) {
+        // GPU default path (mask=0): реальный glClear в EGL WindowSurface
+        glClear(mask);
     } else {
-        SyncLog("[RENDER] Выполняем очистку буфера...");
-        std::vector<uint32_t>* targetColorBuf = &g_cpuColorBuffer;
         std::vector<float>* targetDepthBuf = &g_cpuDepthBuffer;
         int targetW = g_surfaceWidth;
         int targetH = g_surfaceHeight;
@@ -1771,6 +1780,11 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
 
         SyncLog("[RENDER] Отправка буфера на экран (GPU eglSwapBuffers)...");
         res = eglSwapBuffers(g_eglDisplay, g_eglSurface);
+    } else if (g_eglSurface != EGL_NO_SURFACE && !(g_gpuOffloadMask & 2)) {
+        // GPU default path (mask=0): рендер идёт через реальный OpenGL ES в EGL WindowSurface.
+        // Просто делаем eglSwapBuffers — кадр уже нарисован game's GL calls.
+        SyncLog("[RENDER] GPU default path: eglSwapBuffers (mask=0, EGL WindowSurface)...");
+        res = eglSwapBuffers(g_eglDisplay, g_eglSurface);
     } else if (g_nativeWindow) {
         SyncLog("[RENDER] Отправка буфера на экран (ANativeWindow)...");
         ANativeWindow_Buffer buffer;
@@ -1803,19 +1817,17 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
 // ==========================================
 extern "C" void Stub_glBindFramebuffer(GLenum target, GLuint framebuffer) { 
     g_lastActiveFBO = framebuffer;
-    if (g_gpuOffloadMask & 64) {
-        if (framebuffer == 1) glBindFramebuffer(target, 0); else glBindFramebuffer(target, framebuffer); 
-    }
+    // ФИКС: Всегда вызываем реальный glBindFramebuffer (не только при mask&64).
+    // iOS FBO=1 — это EAGLView renderbuffer; в Android EGL это FBO=0 (default window surface).
+    if (framebuffer == 1) glBindFramebuffer(target, 0); else glBindFramebuffer(target, framebuffer); 
 }
 extern "C" void Stub_glBindRenderbuffer(GLenum target, GLuint renderbuffer) { 
-    if (g_gpuOffloadMask & 64) {
-        if (renderbuffer == 1 || renderbuffer == 2) glBindRenderbuffer(target, 0); else glBindRenderbuffer(target, renderbuffer); 
-    }
+    // iOS renderbuffer 1/2 — фейковые iOS IDs; в Android просто биндим 0 (default RBO)
+    if (renderbuffer == 1 || renderbuffer == 2) glBindRenderbuffer(target, 0); else glBindRenderbuffer(target, renderbuffer); 
 }
 extern "C" void Stub_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) { 
-    if (g_gpuOffloadMask & 64) {
-        if (renderbuffer == 1 || renderbuffer == 2) return; glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer); 
-    }
+    if (renderbuffer == 1 || renderbuffer == 2) return; // iOS fake RBO — пропускаем, уже в default FBO
+    glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer); 
 }
 extern "C" void Stub_glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) { 
     GLint bound_rbo = 0; glGetIntegerv(GL_RENDERBUFFER_BINDING, &bound_rbo); if (bound_rbo == 0) return; 
@@ -1870,7 +1882,8 @@ extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
     }
     g_gameViewportW = width; 
     g_gameViewportH = height;
-    if (g_gpuOffloadMask & 64) {
+    // Для FBO=0/1 всегда используем реальный размер surface
+    auto doViewport = [&]() {
         if (g_lastActiveFBO == 0 || g_lastActiveFBO == 1) {
             EGLint realW = g_surfaceWidth, realH = g_surfaceHeight;
             EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
@@ -1881,8 +1894,10 @@ extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
             glViewport(0, 0, realW, realH); 
         } else {
             glViewport(x, y, width, height); 
-        } 
-    }
+        }
+    };
+    if (g_gpuOffloadMask & 64) { doViewport(); }
+    else if (!(g_gpuOffloadMask & 2)) { doViewport(); } // GPU default path (mask=0)
 }
 
 std::map<GLenum, GLuint> g_boundBuffers;
@@ -2137,6 +2152,7 @@ static inline size_t SafeGetGLTextureSize(GLsizei width, GLsizei height, GLenum 
 extern "C" void Stub_glBindTexture(GLenum target, GLuint texture) {
     if (target == GL_TEXTURE_2D) g_cpuActiveTexture = texture;
     if (g_gpuOffloadMask & 8) glBindTexture(target, texture);
+    else if (!(g_gpuOffloadMask & 2)) glBindTexture(target, texture); // GPU default path (mask=0)
 }
 
 extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
@@ -2308,6 +2324,11 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
         }
     }
     if (g_gpuOffloadMask & 8) glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    else if (!(g_gpuOffloadMask & 2)) {
+        // GPU default path (mask=0): загружаем текстуру в реальный GPU.
+        // Используем нормализованный hw_format и safe_pixels (уже подготовлены выше).
+        glTexImage2D(target, level, hw_internalformat, width, height, border, hw_format, type, safe_pixels);
+    }
 }
 
 extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
@@ -3332,6 +3353,65 @@ void CPUExtractAndDraw(GLenum drawMode, GLint first, GLsizei count, const GLvoid
 }
 
 
+// Загружает матрицы и состояние ES1.1 в шейдер g_es1FixedProg перед каждым draw call.
+// Вызывается из MegaDebug_glDrawArrays и MegaDebug_glDrawElements в GPU default path (mask=0).
+static void UploadES1Uniforms() {
+    if (!g_es1FixedProg) return;
+    glUseProgram(g_es1FixedProg);
+
+    // MVP = Projection * Modelview
+    if (g_es1uMVP >= 0) {
+        const float* mv = g_modelViewStack.back().data();
+        const float* pr = g_projectionStack.back().data();
+        float mvp[16];
+        // Column-major multiply: mvp = pr * mv
+        for (int col = 0; col < 4; col++)
+            for (int row = 0; row < 4; row++) {
+                float s = 0.0f;
+                for (int k = 0; k < 4; k++) s += pr[k*4+row] * mv[col*4+k];
+                mvp[col*4+row] = s;
+            }
+        glUniformMatrix4fv(g_es1uMVP, 1, GL_FALSE, mvp);
+    }
+
+    // Texture enabled/disabled
+    if (g_es1uTexEnabled >= 0)
+        glUniform1i(g_es1uTexEnabled, g_texture2DEnabled ? 1 : 0);
+
+    // Alpha test
+    if (g_es1uAlphaTest >= 0)
+        glUniform1i(g_es1uAlphaTest,
+            (g_alphaFunc != GL_ALWAYS && g_alphaFunc != GL_NEVER) ? 1 : 0);
+    if (g_es1uAlphaRef >= 0)
+        glUniform1f(g_es1uAlphaRef, g_alphaRef);
+
+    // Fog
+    if (g_es1uFogEnabled >= 0)
+        glUniform1i(g_es1uFogEnabled, g_fogEnabled ? 1 : 0);
+    if (g_fogEnabled) {
+        if (g_es1uFogColor >= 0)
+            glUniform4fv(g_es1uFogColor, 1, g_fogColor);
+        if (g_es1uFogStart >= 0) glUniform1f(g_es1uFogStart, g_fogStart);
+        if (g_es1uFogEnd   >= 0) glUniform1f(g_es1uFogEnd,   g_fogEnd);
+    }
+
+    // Blend state
+    if (g_blendEnabled) {
+        glEnable(GL_BLEND);
+        glBlendFunc(g_blendSrc, g_blendDst);
+    } else {
+        glDisable(GL_BLEND);
+    }
+
+    // Depth test
+    if (g_depthTestEnabled) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(g_depthFunc);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
+}
+
 extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     SyncLog("[GL-TRACE] glDrawArrays(mode=" + std::to_string(mode) + ", first=" + std::to_string(first) + ", count=" + std::to_string(count) + ")");
     g_frameHasDraw = true;
@@ -3351,6 +3431,12 @@ extern "C" void MegaDebug_glDrawArrays(GLenum mode, GLint first, GLsizei count) 
             GLint rotLoc = glGetUniformLocation(prog, "u_damn_rot");
             if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
         }
+        glDrawArrays(mode, first, count);
+    } else if (!(g_gpuOffloadMask & 2)) {
+        // GPU-путь по умолчанию (mask=0): передаём draw call напрямую в реальный OpenGL ES.
+        // Wolf3D использует ES1.1 fixed pipeline — вертексные атрибуты уже настроены через
+        // wrap_glVertexPointer/wrap_glTexCoordPointer, которые вызывают реальный GL.
+        UploadES1Uniforms();
         glDrawArrays(mode, first, count);
     } else {
         CPUExtractAndDraw(mode, first, count, nullptr, 0);
@@ -3376,6 +3462,10 @@ extern "C" void MegaDebug_glDrawElements(GLenum mode, GLsizei count, GLenum type
             if (rotLoc != -1) glUniform1f(rotLoc, needRot ? 1.0f : 0.0f);
         }
         glDrawElements(mode, count, type, indices);
+    } else if (!(g_gpuOffloadMask & 2)) {
+        // GPU-путь по умолчанию (mask=0): передаём draw call в реальный OpenGL ES.
+        UploadES1Uniforms();
+        glDrawElements(mode, count, type, indices);
     } else {
         CPUExtractAndDraw(mode, 0, count, indices, type);
     }
@@ -3390,7 +3480,10 @@ extern "C" void MegaDebug_glEnable(GLenum cap) {
     else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = true;
     else if (cap == 0x0B44) g_cullFaceEnabled = true; // GL_CULL_FACE
     else if (cap == 0x8840) g_matrixPaletteEnabled = true; // GL_MATRIX_PALETTE_OES
+    else if (cap == GL_FOG) g_fogEnabled = true;
+    // ФИКС: Всегда вызываем реальный glEnable (mask&32 было гейтом только для CPU-mode)
     if (g_gpuOffloadMask & 32) glEnable(cap);
+    else if (!(g_gpuOffloadMask & 2)) glEnable(cap); // GPU default path (mask=0)
 }
 extern "C" void MegaDebug_glDisable(GLenum cap) {
     if (cap == GL_BLEND) g_blendEnabled = false;
@@ -3398,10 +3491,12 @@ extern "C" void MegaDebug_glDisable(GLenum cap) {
     else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = false;
     else if (cap == 0x0B44) g_cullFaceEnabled = false;
     else if (cap == 0x8840) g_matrixPaletteEnabled = false;
+    else if (cap == GL_FOG) g_fogEnabled = false;
     if (g_gpuOffloadMask & 32) glDisable(cap);
+    else if (!(g_gpuOffloadMask & 2)) glDisable(cap); // GPU default path (mask=0)
 }
-extern "C" void MegaDebug_glCullFace(GLenum mode) { g_cullFaceMode = mode; if (g_gpuOffloadMask & 32) glCullFace(mode); }
-extern "C" void MegaDebug_glFrontFace(GLenum mode) { g_frontFace = mode; if (g_gpuOffloadMask & 32) glFrontFace(mode); }
+extern "C" void MegaDebug_glCullFace(GLenum mode) { g_cullFaceMode = mode; if (g_gpuOffloadMask & 32) glCullFace(mode); else if (!(g_gpuOffloadMask & 2)) glCullFace(mode); }
+extern "C" void MegaDebug_glFrontFace(GLenum mode) { g_frontFace = mode; if (g_gpuOffloadMask & 32) glFrontFace(mode); else if (!(g_gpuOffloadMask & 2)) glFrontFace(mode); }
 extern "C" void MegaDebug_glBlendFunc(GLenum sfactor, GLenum dfactor) {
     g_blendSrc = sfactor; g_blendDst = dfactor;
     if (g_gpuOffloadMask & 32) glBlendFunc(sfactor, dfactor);
@@ -8782,8 +8877,16 @@ extern "C" {
     }
     void wrap_glClipPlanef(GLenum p, const GLfloat *eqn) {}
     void wrap_glDiscardFramebufferEXT(GLenum target, GLsizei numAttachments, const GLenum *attachments) {}
-    void wrap_glFogf(GLenum pname, GLfloat param) {}
-    void wrap_glFogfv(GLenum pname, const GLfloat *params) {}
+    void wrap_glFogf(GLenum pname, GLfloat param) {
+        if (pname == GL_FOG_START) g_fogStart = param;
+        else if (pname == GL_FOG_END) g_fogEnd = param;
+    }
+    void wrap_glFogfv(GLenum pname, const GLfloat *params) {
+        if (!params) return;
+        if (pname == GL_FOG_COLOR) { g_fogColor[0]=params[0]; g_fogColor[1]=params[1]; g_fogColor[2]=params[2]; g_fogColor[3]=params[3]; }
+        else if (pname == GL_FOG_START) g_fogStart = params[0];
+        else if (pname == GL_FOG_END)   g_fogEnd   = params[0];
+    }
     void wrap_glLightModelf(GLenum pname, GLfloat param) {}
     void wrap_glLightModelfv(GLenum pname, const GLfloat *params) {}
     void wrap_glLightf(GLenum light, GLenum pname, GLfloat param) {}
@@ -10985,6 +11088,37 @@ static char* hle_my_CopyString_replacement(const char* src) {
     return buf;
 }
 
+// =============================================================================
+// ПАТЧ: -[EAGLView presentFramebuffer]
+// Wolf3D вызывает этот метод через прямой IMP-указатель изнутри нативного кода,
+// поэтому перехват через Stub_objc_msgSend не срабатывает.
+// Патчим IMP напрямую — трамплин на эту функцию.
+// Сигнатура iOS: - (BOOL)presentFramebuffer  (self, _cmd) → r0=1
+// =============================================================================
+extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface);
+extern "C" void RenderHLEUI();
+extern "C" EGLDisplay g_eglDisplay;
+extern "C" EGLSurface g_eglSurface;
+
+static uint32_t __attribute__((pcs("aapcs"))) hle_presentFramebuffer_replacement(void* self, void* _cmd) {
+    LogToJava("PATCH-HIT: -[EAGLView presentFramebuffer] intercepted via IMP patch -> eglSwapBuffers");
+    RenderHLEUI();
+    MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface);
+    return 1; // YES
+}
+
+// =============================================================================
+// ПАТЧ: -[EAGLView setFramebuffer]
+// Wolf3D вызывает setFramebuffer перед каждым кадром. Внутри он делает
+// glBindFramebufferOES(1, fbo) — и наш Stub_glBindFramebuffer с mask=0 это игнорирует.
+// Патчим: всегда биндим FBO 0 (главный буфер окна) вместо iOS-шного FBO 1.
+// Это гарантирует, что draw calls идут в реальный window surface.
+// =============================================================================
+static void __attribute__((pcs("aapcs"))) hle_setFramebuffer_replacement(void* self, void* _cmd) {
+    // Биндим FBO 0 — стандартный default framebuffer EGL WindowSurface
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 // Записывает Thumb-трамплин по адресу target_thumb_addr (бит 0 снят, адрес чётный).
 // Трамплин: LDR PC, [PC, #0] (4 байта Thumb-2) + слово с целевым адресом (4 байта).
 // Итого 8 байт — перекрывает первые 2 Thumb-инструкции _my_CopyString.
@@ -11043,6 +11177,64 @@ static void ApplyMyCopyStringPatch() {
         }
     }
     LogToJava("PATCH-WARN: _my_CopyString не найдена ни в symtab, ни по статическому offset — патч не применён");
+}
+
+// Патчит IMP метода selName у класса с именем className напрямую через ObjC runtime структуры.
+// Работает для любых нативных классов (EAGLView, wolf3dViewController и т.д.).
+static void PatchMethodIMP(const char* className, const char* selName, void* replacement) {
+    // Ищем класс в g_appSymbols по имени _OBJC_CLASS_$_<className>
+    std::string sym = std::string("_OBJC_CLASS_$_") + className;
+    auto it = g_appSymbols.find(sym);
+    if (it == g_appSymbols.end() || it->second < 0x1000) {
+        LogToJava(std::string("PATCH-WARN: класс ") + className + " не найден в symtab");
+        return;
+    }
+    uint32_t class_ptr = it->second;
+    uint32_t* cls = (uint32_t*)class_ptr;
+    uint32_t data_ptr = cls[4] & ~3u;
+    if (!data_ptr || data_ptr < 0x1000) {
+        LogToJava(std::string("PATCH-WARN: data_ptr=0 для ") + className);
+        return;
+    }
+    uint32_t* ro = (uint32_t*)data_ptr;
+    uint32_t methodList_ptr = ro[5];
+    if (!methodList_ptr || methodList_ptr < 0x1000) {
+        LogToJava(std::string("PATCH-WARN: method_list=0 для ") + className);
+        return;
+    }
+    uint32_t* mlist = (uint32_t*)methodList_ptr;
+    uint32_t count = mlist[1];
+    if (count >= 10000) return;
+    uint32_t* methods = mlist + 2;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t m_name_ptr = methods[i*3 + 0];
+        uint32_t* m_imp_ptr = &methods[i*3 + 2];
+        if (isValidString((const char*)m_name_ptr) && strcmp((const char*)m_name_ptr, selName) == 0) {
+            // Patch the IMP slot directly (it's already in writable memory after mmap MAP_PRIVATE)
+            uint32_t imp_addr = *m_imp_ptr;
+            // Use trampoline patch on the function itself
+            PatchThumbFunctionToReplacement(imp_addr | 1u, replacement);
+            char log[256];
+            snprintf(log, sizeof(log), "PATCH: -[%s %s] IMP @ 0x%08X -> replacement @ 0x%08X",
+                className, selName, imp_addr, (uint32_t)(uintptr_t)replacement);
+            LogToJava(log);
+            return;
+        }
+    }
+    LogToJava(std::string("PATCH-WARN: метод ") + selName + " не найден в " + className);
+}
+
+static void ApplyGamePatches() {
+    // ФИКС ЧЕРНОГО ЭКРАНА #1: перехватываем -[EAGLView presentFramebuffer] на уровне IMP.
+    // Wolf3D вызывает этот метод через прямой указатель из нативного кода (drawFrame),
+    // поэтому Stub_objc_msgSend его не видит. Патчим IMP трамплином.
+    PatchMethodIMP("EAGLView", "presentFramebuffer",
+                   (void*)hle_presentFramebuffer_replacement);
+
+    // ФИКС ЧЕРНОГО ЭКРАНА #2: перехватываем -[EAGLView setFramebuffer] на уровне IMP.
+    // iOS FBO=1 не существует в Android EGL — биндим всегда FBO=0 (default window surface).
+    PatchMethodIMP("EAGLView", "setFramebuffer",
+                   (void*)hle_setFramebuffer_replacement);
 }
 
 void LoadMachO(const std::string& bundlePath) {
@@ -12014,6 +12206,8 @@ void LoadMachO(const std::string& bundlePath) {
 
     // Патчим _my_CopyString до установки g_machOLoaded, пока сегменты ещё W+X
     ApplyMyCopyStringPatch();
+    // Патчим presentFramebuffer и setFramebuffer напрямую через IMP (ФИКС ЧЕРНОГО ЭКРАНА)
+    ApplyGamePatches();
 
     g_machOLoaded = true; // С этого момента любые новые функции пишутся в лог мгновенно
     
@@ -12037,6 +12231,111 @@ void* NativeExecutionThread(void* arg) {
     // --------------------------------------------------------------------
 
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL);
+
+    // -------------------------------------------------------------------
+    // ИНИЦИАЛИЗАЦИЯ ES1.1 FIXED-FUNCTION ЭМУЛЯЦИИ (Wolf3D, Quake, etc.)
+    // ES2.0 контекст не поддерживает ES1.1 fixed pipeline напрямую.
+    // Компилируем шейдер, который эмулирует: матрицы, текстуры, alpha test, туман.
+    // Вершинные атрибуты: 0=position, 1=color, 2=texcoord0
+    // -------------------------------------------------------------------
+    if (g_activeESVersion == 1 && g_es1FixedProg == 0) {
+        const char* vs = R"(
+attribute vec4 a_position;
+attribute vec4 a_color;
+attribute vec2 a_texcoord;
+uniform mat4 u_mvp;
+varying vec2 v_texcoord;
+varying vec4 v_color;
+varying float v_fogFactor;
+uniform bool  u_fogEnabled;
+uniform float u_fogStart;
+uniform float u_fogEnd;
+void main() {
+    gl_Position = u_mvp * a_position;
+    v_texcoord  = a_texcoord;
+    v_color     = a_color;
+    if (u_fogEnabled) {
+        float d = abs(gl_Position.z / gl_Position.w);
+        v_fogFactor = clamp((u_fogEnd - d) / (u_fogEnd - u_fogStart), 0.0, 1.0);
+    } else {
+        v_fogFactor = 1.0;
+    }
+}
+)";
+        const char* fs = R"(
+precision mediump float;
+varying vec2 v_texcoord;
+varying vec4 v_color;
+varying float v_fogFactor;
+uniform sampler2D u_sampler;
+uniform bool  u_texEnabled;
+uniform bool  u_alphaTest;
+uniform float u_alphaRef;
+uniform bool  u_fogEnabled;
+uniform vec4  u_fogColor;
+void main() {
+    vec4 c = v_color;
+    if (u_texEnabled) c *= texture2D(u_sampler, v_texcoord);
+    if (u_alphaTest && c.a < u_alphaRef) discard;
+    if (u_fogEnabled) c.rgb = mix(u_fogColor.rgb, c.rgb, v_fogFactor);
+    gl_FragColor = c;
+}
+)";
+        auto compileShader = [](GLenum type, const char* src) -> GLuint {
+            GLuint sh = glCreateShader(type);
+            glShaderSource(sh, 1, &src, nullptr);
+            glCompileShader(sh);
+            GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+            if (!ok) {
+                char buf[512]; glGetShaderInfoLog(sh, sizeof(buf), nullptr, buf);
+                LogToJava(std::string("ES1-SHADER compile error: ") + buf);
+                glDeleteShader(sh); return 0;
+            }
+            return sh;
+        };
+        GLuint vsh = compileShader(GL_VERTEX_SHADER, vs);
+        GLuint fsh = compileShader(GL_FRAGMENT_SHADER, fs);
+        if (vsh && fsh) {
+            g_es1FixedProg = glCreateProgram();
+            glAttachShader(g_es1FixedProg, vsh);
+            glAttachShader(g_es1FixedProg, fsh);
+            glBindAttribLocation(g_es1FixedProg, 0, "a_position");
+            glBindAttribLocation(g_es1FixedProg, 1, "a_color");
+            glBindAttribLocation(g_es1FixedProg, 2, "a_texcoord");
+            glLinkProgram(g_es1FixedProg);
+            GLint ok = 0; glGetProgramiv(g_es1FixedProg, GL_LINK_STATUS, &ok);
+            if (!ok) {
+                char buf[512]; glGetProgramInfoLog(g_es1FixedProg, sizeof(buf), nullptr, buf);
+                LogToJava(std::string("ES1-SHADER link error: ") + buf);
+                glDeleteProgram(g_es1FixedProg); g_es1FixedProg = 0;
+            } else {
+                g_es1uMVP        = glGetUniformLocation(g_es1FixedProg, "u_mvp");
+                g_es1uModelview  = glGetUniformLocation(g_es1FixedProg, "u_modelview");
+                g_es1uProjection = glGetUniformLocation(g_es1FixedProg, "u_projection");
+                g_es1uTexEnabled = glGetUniformLocation(g_es1FixedProg, "u_texEnabled");
+                g_es1uAlphaTest  = glGetUniformLocation(g_es1FixedProg, "u_alphaTest");
+                g_es1uAlphaRef   = glGetUniformLocation(g_es1FixedProg, "u_alphaRef");
+                g_es1uFogEnabled = glGetUniformLocation(g_es1FixedProg, "u_fogEnabled");
+                g_es1uFogColor   = glGetUniformLocation(g_es1FixedProg, "u_fogColor");
+                g_es1uFogStart   = glGetUniformLocation(g_es1FixedProg, "u_fogStart");
+                g_es1uFogEnd     = glGetUniformLocation(g_es1FixedProg, "u_fogEnd");
+                g_es1uColor      = glGetUniformLocation(g_es1FixedProg, "a_color");
+                g_es1uSampler    = glGetUniformLocation(g_es1FixedProg, "u_sampler");
+                // Устанавливаем дефолтный белый цвет для аттриба color
+                glUseProgram(g_es1FixedProg);
+                glVertexAttrib4f(1, 1.0f, 1.0f, 1.0f, 1.0f); // default white color
+                glUniform1i(g_es1uSampler, 0);
+                glUniform1i(g_es1uTexEnabled, 1);
+                glUniform1i(g_es1uAlphaTest, 0);
+                glUniform1f(g_es1uAlphaRef, 0.0f);
+                glUniform1i(g_es1uFogEnabled, 0);
+                LogToJava("ES1-SHADER: Компиляция успешна, fixed-function pipeline готов.");
+            }
+        }
+        if (vsh) glDeleteShader(vsh);
+        if (fsh) glDeleteShader(fsh);
+    }
+    // -------------------------------------------------------------------
     
     if (g_entryPoint == 0) { 
         LogToJava("КРИТИЧЕСКАЯ ОШИБКА: g_entryPoint равен 0!"); 
@@ -13358,11 +13657,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
 
     // ФИКС ЧЁРНОГО ЭКРАНА (ES 1.1): GPU-biты 2+32+64 нужны для glClear/glEnable/FBO.
     // Добавляем их всегда для ES 1.1, независимо от бита 1 (swap), который Java уже могла выставить.
+    // ФИКС 2: Добавляем бит 8 (текстуры) и бит 16 (draw calls) — без них GPU-буфер пустой.
     if (g_activeESVersion == 1) {
         int prev = g_gpuOffloadMask;
-        g_gpuOffloadMask |= (1 | 2 | 32 | 64);
+        g_gpuOffloadMask |= (1 | 2 | 8 | 16 | 32 | 64);
         if (g_gpuOffloadMask != prev) {
-            LogToJava("onSurfaceCreated: ES 1.1 — принудительно включён GPU-режим (gpuOffloadMask=0x" +
+            LogToJava("onSurfaceCreated: ES 1.1 — принудительно включён полный GPU-режим (gpuOffloadMask=0x" +
                       [&]{ char buf[16]; snprintf(buf, sizeof(buf), "%X", g_gpuOffloadMask); return std::string(buf); }() + ")");
         }
     }
