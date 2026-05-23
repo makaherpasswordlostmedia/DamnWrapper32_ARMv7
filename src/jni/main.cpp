@@ -6424,30 +6424,38 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
 
         if (strcmp(op, "class") == 0) return (uint64_t)isa;
 
-        // Перехватываем setDisplayLink: до нативного форварда.
-        // Wolf3d нативный setDisplayLink: сохраняет переданный CADisplayLink*, а потом
-        // немедленно читает displayLink->_target (offset 4) и displayLink->_selector (offset 8)
-        // чтобы вызвать первый кадр. Наш realFakeLink должен иметь правильные target/selector.
-        // Кроме того, если wolf3d позже вызывает [displayLink.target drawFrame] напрямую через IMP,
-        // обходя objc_msgSend — перехватывать нечем, поэтому нам не нужен нативный форвард вообще.
+        // Перехватываем setDisplayLink: ПОЛНОСТЬЮ — нативный IMP не вызываем.
+        //
+        // Нативный wolf3d setDisplayLink: сохраняет CADisplayLink* в своём ivar
+        // и НЕМЕДЛЕННО читает из него _target по какому-то offset (судя по крашу —
+        // offset 12, т.е. inst[3]) и вызывает [target drawFrame] через objc_msgSend.
+        // Наш поддельный CADisplayLink-объект (inst от calloc(32)) содержит по этому
+        // offset либо 0, либо мусор (напр. 0x43a00000 = 320.0f из CGRect на стеке),
+        // что приводит к SIGSEGV внутри нативного setDisplayLink:.
+        //
+        // Нам нативный setDisplayLink: не нужен — render loop мы ведём сами
+        // через main-loop в Stub_UIApplicationMain (Stub_objc_msgSend(g_displayLinkTarget, ...)).
+        // Просто подтверждаем что displayLink установлен и возвращаем 0.
         if (strcmp(op, "setDisplayLink:") == 0) {
-            LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " setDisplayLink:] -> HLE intercept");
-            // a1 — это наш realFakeLink (CADisplayLink*).
-            // Убеждаемся что _target и _selector заполнены актуальными значениями.
-            if (a1 && g_displayLinkTarget) {
+            LogToJava("HLE: [" + cName + " setDisplayLink:] -> перехвачен полностью (нативный IMP не вызывается)");
+            // Дополнительно: если g_displayLinkTarget ещё не установлен и в a1 содержится
+            // валидный CADisplayLink — попробуем вытащить target из него по всем возможным
+            // offset'ам (wolf3d мог записать target сам перед передачей нам).
+            if (!g_displayLinkTarget && a1) {
                 uint32_t* dl = (uint32_t*)a1;
-                dl[1] = (uint32_t)(uintptr_t)g_displayLinkTarget;
-                dl[2] = (uint32_t)(uintptr_t)g_displayLinkSelector;
-                LogToJava("[setDisplayLink] Синхронизировали realFakeLink: target=0x" +
-                          std::to_string((uintptr_t)g_displayLinkTarget) +
-                          " sel=0x" + std::to_string((uintptr_t)g_displayLinkSelector));
-            }
-            // Передаём в нативный код как обычно — wolf3d сохраняет displayLink в своём ivar.
-            // (нативный setDisplayLink: сохраняет объект, но не вызывает drawFrame напрямую)
-            void* imp_sdl = FindMethodIMP(isa, op);
-            if (imp_sdl) {
-                typedef uint64_t (*MethodType)(void*, const char*, void*, void*, void*, void*, void*, void*, void*, void*);
-                return ((MethodType)imp_sdl)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
+                // Проверяем offsets 4, 8, 12 — ищем первый похожий на heap-pointer (>= 0x70000000)
+                for (int i = 1; i <= 3; i++) {
+                    uintptr_t candidate = (uintptr_t)dl[i];
+                    uint32_t probe = 0;
+                    if (candidate >= 0x70000000u && candidate < 0xFF000000u &&
+                        SafeRead32(candidate, &probe) && probe > 0x1000u) {
+                        // Выглядит как валидный ObjC-объект — это может быть target
+                        g_displayLinkTarget = (void*)candidate;
+                        LogToJava("[setDisplayLink] Извлекли target из dl[" + std::to_string(i) + "]=0x" +
+                                  std::to_string(candidate));
+                        break;
+                    }
+                }
             }
             return 0;
         }
