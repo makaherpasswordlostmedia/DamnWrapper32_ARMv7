@@ -1500,6 +1500,7 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
         // GPU default path (mask=0): реальный glClear в EGL WindowSurface
         glClear(mask);
     } else {
+        std::vector<uint32_t>* targetColorBuf = &g_cpuColorBuffer;
         std::vector<float>* targetDepthBuf = &g_cpuDepthBuffer;
         int targetW = g_surfaceWidth;
         int targetH = g_surfaceHeight;
@@ -3480,7 +3481,7 @@ extern "C" void MegaDebug_glEnable(GLenum cap) {
     else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = true;
     else if (cap == 0x0B44) g_cullFaceEnabled = true; // GL_CULL_FACE
     else if (cap == 0x8840) g_matrixPaletteEnabled = true; // GL_MATRIX_PALETTE_OES
-    else if (cap == GL_FOG) g_fogEnabled = true;
+    else if (cap == 0x0B60) g_fogEnabled = true;
     // ФИКС: Всегда вызываем реальный glEnable (mask&32 было гейтом только для CPU-mode)
     if (g_gpuOffloadMask & 32) glEnable(cap);
     else if (!(g_gpuOffloadMask & 2)) glEnable(cap); // GPU default path (mask=0)
@@ -3491,7 +3492,7 @@ extern "C" void MegaDebug_glDisable(GLenum cap) {
     else if (cap == GL_TEXTURE_2D) g_texture2DEnabled = false;
     else if (cap == 0x0B44) g_cullFaceEnabled = false;
     else if (cap == 0x8840) g_matrixPaletteEnabled = false;
-    else if (cap == GL_FOG) g_fogEnabled = false;
+    else if (cap == 0x0B60) g_fogEnabled = false;
     if (g_gpuOffloadMask & 32) glDisable(cap);
     else if (!(g_gpuOffloadMask & 2)) glDisable(cap); // GPU default path (mask=0)
 }
@@ -8878,14 +8879,14 @@ extern "C" {
     void wrap_glClipPlanef(GLenum p, const GLfloat *eqn) {}
     void wrap_glDiscardFramebufferEXT(GLenum target, GLsizei numAttachments, const GLenum *attachments) {}
     void wrap_glFogf(GLenum pname, GLfloat param) {
-        if (pname == GL_FOG_START) g_fogStart = param;
-        else if (pname == GL_FOG_END) g_fogEnd = param;
+        if (pname == 0x0B63) g_fogStart = param;
+        else if (pname == 0x0B64) g_fogEnd = param;
     }
     void wrap_glFogfv(GLenum pname, const GLfloat *params) {
         if (!params) return;
-        if (pname == GL_FOG_COLOR) { g_fogColor[0]=params[0]; g_fogColor[1]=params[1]; g_fogColor[2]=params[2]; g_fogColor[3]=params[3]; }
-        else if (pname == GL_FOG_START) g_fogStart = params[0];
-        else if (pname == GL_FOG_END)   g_fogEnd   = params[0];
+        if (pname == 0x0B66) { g_fogColor[0]=params[0]; g_fogColor[1]=params[1]; g_fogColor[2]=params[2]; g_fogColor[3]=params[3]; }
+        else if (pname == 0x0B63) g_fogStart = params[0];
+        else if (pname == 0x0B64)   g_fogEnd   = params[0];
     }
     void wrap_glLightModelf(GLenum pname, GLfloat param) {}
     void wrap_glLightModelfv(GLenum pname, const GLfloat *params) {}
@@ -11095,10 +11096,11 @@ static char* hle_my_CopyString_replacement(const char* src) {
 // Патчим IMP напрямую — трамплин на эту функцию.
 // Сигнатура iOS: - (BOOL)presentFramebuffer  (self, _cmd) → r0=1
 // =============================================================================
-extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface);
-extern "C" void RenderHLEUI();
-extern "C" EGLDisplay g_eglDisplay;
-extern "C" EGLSurface g_eglSurface;
+// Forward declarations (plain C++ — no extern "C")
+EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface);
+void RenderHLEUI();
+extern EGLDisplay g_eglDisplay;
+extern EGLSurface g_eglSurface;
 
 static uint32_t __attribute__((pcs("aapcs"))) hle_presentFramebuffer_replacement(void* self, void* _cmd) {
     LogToJava("PATCH-HIT: -[EAGLView presentFramebuffer] intercepted via IMP patch -> eglSwapBuffers");
