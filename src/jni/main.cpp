@@ -4743,18 +4743,27 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
         }
         if (clsName == "CADisplayLink" && strcmp(op, "displayLinkWithTarget:selector:") == 0) {
-            // ФИКС: Валидируем target перед сохранением — float-значения (например, 320.0f = 0x43a00000)
-            // не являются валидными указателями на ObjC-объект и вызывают SIGSEGV в main loop.
+            // Валидируем target перед сохранением.
+            // КРИТИЧНО: float-значения (320.0f=0x43a00000, 480.0f=0x43f00000) попадают сюда
+            // когда wolf3d передаёт CGRect через регистры и стек — значение h=320.0f оказывается
+            // в R2 вместо self при некорректном вызове. Их адрес < 0x70000000 (ниже heap Android).
+            // Android scudo heap: 0x90000000-0xFF000000; app binary: 0x10000000-0x20000000.
+            // Любой валидный ObjC-объект на Android ARM32 >= 0x70000000.
+            uintptr_t target_addr = (uintptr_t)a1;
             uint32_t probe_isa = 0;
-            if (a1 && (uintptr_t)a1 > 0x10000 && (uintptr_t)a1 < 0xFF000000 &&
-                SafeRead32((uintptr_t)a1, &probe_isa) && probe_isa > 0x1000) {
-                g_displayLinkTarget = a1;
+            bool target_ok = (target_addr >= 0x70000000u) &&   // выше диапазона float-значений
+                             (target_addr <  0xFF000000u) &&   // ниже kernel space
+                             SafeRead32(target_addr, &probe_isa) &&
+                             (probe_isa > 0x1000u);
+            if (target_ok) {
+                g_displayLinkTarget   = a1;
                 g_displayLinkSelector = (const char*)a2;
-                LogToJava("[CADisplayLink displayLinkWithTarget:selector:] target=0x" + 
-                          std::to_string((uintptr_t)a1) + " sel=" + std::string((const char*)a2));
+                LogToJava("[CADisplayLink displayLinkWithTarget:selector:] target=0x" +
+                          std::to_string(target_addr) + " sel=" + std::string((const char*)a2));
             } else {
-                LogToJava("[CADisplayLink displayLinkWithTarget:selector:] WARN: невалидный target=0x" + 
-                          std::to_string((uintptr_t)a1) + " — игнорируем");
+                LogToJava("[CADisplayLink displayLinkWithTarget:selector:] WARN: невалидный target=0x" +
+                          std::to_string(target_addr) + " (probe_isa=0x" + std::to_string(probe_isa) +
+                          ") — игнорируем (float-значение или мусор)");
             }
             uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; return (uint64_t)(uintptr_t)inst;
         }
@@ -5076,17 +5085,22 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
         if (clsName == "UIScreen") {
             if (strcmp(op, "displayLinkWithTarget:selector:") == 0) {
-                // ФИКС: Валидируем target перед сохранением
+                // Та же строгая проверка — float-значения < 0x70000000 не являются ObjC-объектами.
+                uintptr_t target_addr = (uintptr_t)a1;
                 uint32_t probe_isa = 0;
-                if (a1 && (uintptr_t)a1 > 0x10000 && (uintptr_t)a1 < 0xFF000000 &&
-                    SafeRead32((uintptr_t)a1, &probe_isa) && probe_isa > 0x1000) {
-                    g_displayLinkTarget = a1;
+                bool target_ok = (target_addr >= 0x70000000u) &&
+                                 (target_addr <  0xFF000000u) &&
+                                 SafeRead32(target_addr, &probe_isa) &&
+                                 (probe_isa > 0x1000u);
+                if (target_ok) {
+                    g_displayLinkTarget   = a1;
                     g_displayLinkSelector = (const char*)a2;
                     LogToJava("[UIScreen displayLinkWithTarget:selector:] target=0x" +
-                              std::to_string((uintptr_t)a1) + " sel=" + std::string((const char*)a2));
+                              std::to_string(target_addr) + " sel=" + std::string((const char*)a2));
                 } else {
                     LogToJava("[UIScreen displayLinkWithTarget:selector:] WARN: невалидный target=0x" +
-                              std::to_string((uintptr_t)a1) + " — игнорируем");
+                              std::to_string(target_addr) + " (probe_isa=0x" + std::to_string(probe_isa) +
+                              ") — игнорируем (float-значение или мусор)");
                 }
                 uint32_t* inst = (uint32_t*)calloc(1, 32); 
                 inst[0] = g_hleClasses.count("CADisplayLink") ? (uint32_t)g_hleClasses["CADisplayLink"] : 0xDEADBEEF;
@@ -6409,6 +6423,34 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
 
         if (strcmp(op, "class") == 0) return (uint64_t)isa;
+
+        // Перехватываем setDisplayLink: до нативного форварда.
+        // Wolf3d нативный setDisplayLink: сохраняет переданный CADisplayLink*, а потом
+        // немедленно читает displayLink->_target (offset 4) и displayLink->_selector (offset 8)
+        // чтобы вызвать первый кадр. Наш realFakeLink должен иметь правильные target/selector.
+        // Кроме того, если wolf3d позже вызывает [displayLink.target drawFrame] напрямую через IMP,
+        // обходя objc_msgSend — перехватывать нечем, поэтому нам не нужен нативный форвард вообще.
+        if (strcmp(op, "setDisplayLink:") == 0) {
+            LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " setDisplayLink:] -> HLE intercept");
+            // a1 — это наш realFakeLink (CADisplayLink*).
+            // Убеждаемся что _target и _selector заполнены актуальными значениями.
+            if (a1 && g_displayLinkTarget) {
+                uint32_t* dl = (uint32_t*)a1;
+                dl[1] = (uint32_t)(uintptr_t)g_displayLinkTarget;
+                dl[2] = (uint32_t)(uintptr_t)g_displayLinkSelector;
+                LogToJava("[setDisplayLink] Синхронизировали realFakeLink: target=0x" +
+                          std::to_string((uintptr_t)g_displayLinkTarget) +
+                          " sel=0x" + std::to_string((uintptr_t)g_displayLinkSelector));
+            }
+            // Передаём в нативный код как обычно — wolf3d сохраняет displayLink в своём ivar.
+            // (нативный setDisplayLink: сохраняет объект, но не вызывает drawFrame напрямую)
+            void* imp_sdl = FindMethodIMP(isa, op);
+            if (imp_sdl) {
+                typedef uint64_t (*MethodType)(void*, const char*, void*, void*, void*, void*, void*, void*, void*, void*);
+                return ((MethodType)imp_sdl)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
+            }
+            return 0;
+        }
 
         // ФИКС ЧЁРНОГО ЭКРАНА: Wolf3D вызывает [EAGLView presentFramebuffer] для показа кадра.
         // Нативный IMP этого метода внутри вызывает [context presentRenderbuffer:] напрямую
@@ -7848,7 +7890,21 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             }
         }
     }
-    uint32_t* realFakeLink = (uint32_t*)calloc(1, 32); realFakeLink[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_CADisplayLink");
+    // Создаём фейковый CADisplayLink с правильной iOS-структурой:
+    // offset 0:  isa       (class pointer)
+    // offset 4:  _target   (id)  — wolf3d нативный код читает это поле напрямую
+    // offset 8:  _selector (SEL) — wolf3d нативный код читает это поле напрямую
+    // Если _target = 0 → wolf3d вызывает [0 drawFrame] → crash.
+    // Если _target = h=320.0f (мусор со стека) → crash с R0=0x43a00000 как в логе.
+    // Заполняем _target и _selector из уже установленных g_displayLinkTarget/Selector.
+    uint32_t* realFakeLink = (uint32_t*)calloc(1, 64);
+    realFakeLink[0] = (uint32_t)ResolveSymbol("OBJC_CLASS_$_CADisplayLink");
+    // _target и _selector будут выставлены сразу после этой строки, ниже в коде.
+    // Принудительно подтягиваем уже известные значения (установлены в initWithNibName):
+    if (g_displayLinkTarget) {
+        realFakeLink[1] = (uint32_t)(uintptr_t)g_displayLinkTarget;
+        realFakeLink[2] = (uint32_t)(uintptr_t)g_displayLinkSelector;
+    }
     while (true) {
         // ПОТОКОБЕЗОПАСНАЯ ОБРАБОТКА ИВЕНТОВ ВИДЕО
         pthread_mutex_lock(&g_videoMutex);
@@ -7890,13 +7946,16 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         }
 
         if (g_renderingStarted && g_displayLinkTarget && g_displayLinkSelector) {
-            // ФИКС: Проверяем, что g_displayLinkTarget — валидный ObjC-объект.
-            // Float-значения (0x43a00000 = 320.0f) могут попасть сюда при некорректной
-            // передаче аргументов в displayLinkWithTarget:selector: нативным кодом.
+            // Двойная проверка перед каждым drawFrame:
+            // 1. Адрес >= 0x70000000 (float-значения типа 320.0f=0x43a00000 ниже этой границы)
+            // 2. SafeRead32 + isa > 0x1000 (страница readable и выглядит как ObjC-объект)
+            uintptr_t tgt_addr = (uintptr_t)g_displayLinkTarget;
             uint32_t probe_isa = 0;
-            if (!SafeRead32((uintptr_t)g_displayLinkTarget, &probe_isa) || probe_isa < 0x1000) {
+            if (tgt_addr < 0x70000000u ||
+                !SafeRead32(tgt_addr, &probe_isa) ||
+                probe_isa < 0x1000u) {
                 LogToJava("[MAIN-LOOP] FATAL: g_displayLinkTarget=0x" +
-                          std::to_string((uintptr_t)g_displayLinkTarget) +
+                          std::to_string(tgt_addr) +
                           " невалиден (isa=0x" + std::to_string(probe_isa) +
                           "), сбрасываем g_renderingStarted!");
                 g_displayLinkTarget = nullptr;
@@ -7904,6 +7963,11 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
                 usleep(16000);
                 continue;
             }
+            // Синхронизируем поля realFakeLink с актуальными target/selector перед вызовом.
+            // Нативный код wolf3d в drawFrame/setDisplayLink читает _target и _selector
+            // напрямую из CADisplayLink-объекта (offset 4 и 8).
+            realFakeLink[1] = (uint32_t)tgt_addr;
+            realFakeLink[2] = (uint32_t)(uintptr_t)g_displayLinkSelector;
             static int dl_ticks = 0;
             if (dl_ticks++ % 60 == 0) LogToJava("[MAIN-LOOP] Вызов DisplayLink: target=" + GetObjCClassName(g_displayLinkTarget) + " sel=" + std::string(g_displayLinkSelector));
             Stub_objc_msgSend(g_displayLinkTarget, g_displayLinkSelector, realFakeLink, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
