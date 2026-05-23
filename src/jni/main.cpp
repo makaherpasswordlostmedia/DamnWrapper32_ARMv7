@@ -144,6 +144,11 @@ bool g_onScreenDebugOverlay = false;
 bool g_showPerfOverlay = false;
 int g_esModeOption = 2;
 
+// Множество объектов, которым уже был послан awakeFromNib через нативный objc_msgSend.
+// Нужно чтобы не вызывать awakeFromNib повторно из HLE (wolf3dViewController сохраняет
+// CGRect frame в ivar, и при повторном awakeFromNib читает этот float как id-объект → crash).
+std::unordered_set<uintptr_t> g_awakeFromNibCalled;
+
 // Variables for FPS calculation
 uint64_t g_fpsLastTimeMs = 0;
 int g_fpsFrameCount = 0;
@@ -2103,29 +2108,6 @@ GLuint g_cpuActiveTexture = 0;
 extern int g_clientActiveTexture;
 
 // Вспомогательная функция для вычисления точного размера текстуры в байтах
-// Снимает ложный ребейз с GL enum-значений (type, format, internalformat).
-//
-// Проблема: эвристический ребейз __data видит слово 0x00008034 (GL_UNSIGNED_SHORT_5_5_5_1)
-// и добавляет к нему g_appSlide (0x10000000), получая 0x10008034 — адрес внутри __TEXT.
-// Когда игра читает это поле из структуры и передаёт в glTexImage2D,
-// драйвер MTK/Mali получает невалидный type → SIGSEGV.
-//
-// Решение: если значение попало в диапазон [g_appSlide, g_appSlide+image_size)
-// И нижние биты (= значение до ребейза) лежат в типичном диапазоне GL-констант [0x1400, 0x9000),
-// снимаем slide обратно. GL-константы никогда не бывают настоящими указателями в образе.
-static inline GLenum SanitizeGLEnum(GLenum val) {
-    if (g_appSlide == 0) return val;
-    uint32_t v = (uint32_t)val;
-    if (v >= g_appSlide && v < g_appSlide + 0x1000000u) {
-        uint32_t unslid = v - g_appSlide;
-        // GL enum-ы для type/format живут в диапазоне 0x1400–0x8FFF
-        if (unslid >= 0x1400u && unslid < 0x9000u) {
-            return (GLenum)unslid;
-        }
-    }
-    return val;
-}
-
 static inline size_t SafeGetGLTextureSize(GLsizei width, GLsizei height, GLenum format, GLenum type) {
     size_t bpp = 4;
     if (format == GL_RGB && type == 0x8363) bpp = 2; // GL_UNSIGNED_SHORT_5_6_5
@@ -2150,13 +2132,6 @@ extern "C" void Stub_glBindTexture(GLenum target, GLuint texture) {
 }
 
 extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
-    // Снимаем ложный ребейз с GL enum-аргументов.
-    // Эвристика __data может добавить g_appSlide к константам вроде 0x8034,
-    // превратив их в адреса внутри __TEXT. Драйвер MTK крашит на таких значениях.
-    type           = SanitizeGLEnum(type);
-    format         = SanitizeGLEnum(format);
-    internalformat = (GLint)SanitizeGLEnum((GLenum)internalformat);
-
     // Лог с hex-значениями для диагностики
     char logbuf[256];
     snprintf(logbuf, sizeof(logbuf), "[GL-TEX] glTexImage2D: tex=%u w=%d h=%d intFmt=0x%X fmt=0x%X type=0x%X pixels=%d",
@@ -2334,8 +2309,6 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
 }
 
 extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) {
-    type   = SanitizeGLEnum(type);
-    format = SanitizeGLEnum(format);
     if (target == GL_TEXTURE_2D && level == 0 && pixels && g_cpuTextures.count(g_cpuActiveTexture)) {
         std::vector<uint32_t>& texBuf = g_cpuTextures[g_cpuActiveTexture];
         int texW = g_cpuTexW[g_cpuActiveTexture];
@@ -6406,7 +6379,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                             } else {
                                 view = (void*)Stub_objc_msgSend(view, "initWithFrame:", (void*)(uintptr_t)px, (void*)(uintptr_t)py, (void*)(uintptr_t)pw, (void*)(uintptr_t)ph, nullptr, nullptr, nullptr, nullptr);
                             }
-                            if (FindMethodIMP(viewClassAddr, "awakeFromNib")) {
+                            if (FindMethodIMP(viewClassAddr, "awakeFromNib") &&
+                                !g_awakeFromNibCalled.count((uintptr_t)view)) {
                                 LogToJava("HLE: Calling awakeFromNib for EAGLView");
                                 Stub_objc_msgSend(view, "awakeFromNib", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                             }
@@ -6518,6 +6492,13 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
 #endif
             typedef uint64_t (*MethodType)(void*, const char*, void*, void*, void*, void*, void*, void*, void*, void*);
             uint64_t ret = ((MethodType)imp)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
+
+            // Запоминаем что этот объект уже получил awakeFromNib от нативного кода.
+            // HLE не должен вызывать его повторно — wolf3dViewController при повторном
+            // awakeFromNib читает CGRect.height (0x43A00000 = 320.0f) как id → crash.
+            if (strcmp(op, "awakeFromNib") == 0) {
+                g_awakeFromNibCalled.insert((uintptr_t)self);
+            }
 
             // ФИКС ЧЁРНОГО ЭКРАНА: Wolf3D вызывает presentFramebuffer через кешированный
             // IMP-указатель внутри drawFrame, минуя objc_msgSend и наш трамплин.
@@ -7849,7 +7830,8 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         
         uint32_t appDelIsa = ((uint32_t*)appDel)[0];
 
-        if (FindMethodIMP(appDelIsa, "awakeFromNib")) {
+        if (FindMethodIMP(appDelIsa, "awakeFromNib") &&
+            !g_awakeFromNibCalled.count((uintptr_t)appDel)) {
             LogToJava("HLE: Calling awakeFromNib for AppDelegate");
             Stub_objc_msgSend(appDel, "awakeFromNib", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         }
@@ -7888,7 +7870,8 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             }
 
             uint32_t vcIsa = ((uint32_t*)vc)[0];
-            if (FindMethodIMP(vcIsa, "awakeFromNib")) {
+            if (FindMethodIMP(vcIsa, "awakeFromNib") &&
+                !g_awakeFromNibCalled.count((uintptr_t)vc)) {
                 LogToJava("HLE: Calling awakeFromNib for ViewController");
                 Stub_objc_msgSend(vc, "awakeFromNib", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
             }
