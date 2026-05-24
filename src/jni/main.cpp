@@ -125,6 +125,7 @@ std::string SimpleHTTP(const std::string& method) {
 
 JavaVM* g_jvm = nullptr; jobject g_mainActivity = nullptr; std::string g_workDir;
 char g_crashLogPath[1024] = {0}; volatile int g_crash_counter = 0;
+EGLConfig  g_eglConfig  = nullptr;
 EGLDisplay g_eglDisplay = EGL_NO_DISPLAY; EGLContext g_eglContext = EGL_NO_CONTEXT; EGLSurface g_eglSurface = EGL_NO_SURFACE;
 void* g_currentEAGLContext = nullptr;
 int g_surfaceWidth = 480; int g_surfaceHeight = 320;
@@ -1529,9 +1530,17 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
     {
         EGLContext curCtx  = eglGetCurrentContext();
         EGLSurface curSurf = eglGetCurrentSurface(EGL_DRAW);
-        if (curCtx != g_eglContext || curSurf != g_eglSurface) {
+        bool needRebind = (curCtx != g_eglContext || curSurf != g_eglSurface);
+        // Если surface была сброшена onSurfaceCreated — пересоздаём прямо здесь
+        if (g_eglSurface == EGL_NO_SURFACE && g_nativeWindow && g_eglConfig) {
+            g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
+            SyncLog("[EGL] g_eglSurface пересоздана превентивно: " +
+                    std::to_string(g_eglSurface != EGL_NO_SURFACE ? 1 : 0));
+            needRebind = true;
+        }
+        if (needRebind && g_eglSurface != EGL_NO_SURFACE) {
             eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
-            eglGetError(); // сбросить возможную ошибку после смены
+            eglGetError();
             SyncLog("[EGL] Контекст/surface перепривязан перед swap. ctx_match=" +
                     std::to_string(curCtx == g_eglContext) +
                     " surf_match=" + std::to_string(curSurf == g_eglSurface));
@@ -1795,9 +1804,38 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
     }
     
     EGLint err = eglGetError();
-    static int swap_err_cnt = 0; swap_err_cnt++;
-    if (err != EGL_SUCCESS || !isSpamOn || swap_err_cnt <= 30 || swap_err_cnt % 120 == 0) {
-        SyncLog("POST eglSwapBuffers Error: 0x" + std::to_string(err));
+    // ФИКС EGL_BAD_SURFACE: ANativeWindow под surface мог быть рассоединён Android'ом
+    // (reconnect цикл SurfaceView при старте, orientation change, etc.).
+    // Пересоздаём surface прямо здесь на game-потоке и сразу повторяем swap.
+    if ((err == EGL_BAD_SURFACE || err == EGL_BAD_CURRENT_SURFACE || res == EGL_FALSE) &&
+        g_nativeWindow && g_eglConfig && g_eglDisplay != EGL_NO_DISPLAY) {
+        SyncLog("[EGL] EGL_BAD_SURFACE — пересоздаём surface на game-потоке...");
+        // Отвязываем старую surface
+        eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (g_eglSurface != EGL_NO_SURFACE) {
+            eglDestroySurface(g_eglDisplay, g_eglSurface);
+            g_eglSurface = EGL_NO_SURFACE;
+        }
+        // Создаём новую WindowSurface с тем же ANativeWindow и config
+        g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
+        if (g_eglSurface != EGL_NO_SURFACE) {
+            eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
+            eglGetError(); // сбросить
+            EGLint nw = 0, nh = 0;
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &nw);
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &nh);
+            SyncLog("[EGL] Surface пересоздана: " + std::to_string(nw) + "x" + std::to_string(nh) + " — повтор swap");
+            res = eglSwapBuffers(g_eglDisplay, g_eglSurface);
+            eglGetError();
+        } else {
+            SyncLog("[EGL] ОШИБКА: не удалось пересоздать surface! err=0x" +
+                    std::to_string(eglGetError()));
+        }
+    } else {
+        static int swap_err_cnt = 0; swap_err_cnt++;
+        if (err != EGL_SUCCESS || !isSpamOn || swap_err_cnt <= 30 || swap_err_cnt % 120 == 0) {
+            SyncLog("POST eglSwapBuffers Error: 0x" + std::to_string(err));
+        }
     }
     return res;
 }
@@ -13933,40 +13971,20 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
         // старая EGL WindowSurface становится невалидной — eglSwapBuffers падает с EGL_BAD_SURFACE.
         // Раньше мы блокировали повторный вызов, оставляя g_eglSurface протухшей.
         // Теперь пересоздаём только поверхность, не трогая контекст и не перезапуская игру.
-        LogToJava("onSurfaceCreated: Поверхность пересоздана — обновляем EGL surface без перезапуска.");
+        // ФИКС: Только обновляем ANativeWindow. Game-поток сам обнаружит EGL_BAD_SURFACE
+        // и пересоздаст surface через механизм в MegaDebug_eglSwapBuffers.
+        // НЕ вызываем eglMakeCurrent(NO_SURFACE) — это убьёт контекст на game-потоке!
+        LogToJava("onSurfaceCreated: Поверхность пересоздана — обновляем ANativeWindow.");
         ANativeWindow* newWindow = ANativeWindow_fromSurface(env, surface);
         if (newWindow) {
-            // Отвязываем старую surface от контекста перед удалением
-            eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            if (g_nativeWindow) ANativeWindow_release(g_nativeWindow);
+            g_nativeWindow = newWindow;
+            // Старую EGL surface помечаем невалидной — game-поток пересоздаст на следующем кадре
             if (g_eglSurface != EGL_NO_SURFACE) {
                 eglDestroySurface(g_eglDisplay, g_eglSurface);
                 g_eglSurface = EGL_NO_SURFACE;
             }
-            if (g_nativeWindow) ANativeWindow_release(g_nativeWindow);
-            g_nativeWindow = newWindow;
-            // Пересоздаём WindowSurface с новым ANativeWindow
-            EGLint numConfigs;
-            const EGLint attribs[] = {
-                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-                EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
-                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-                EGL_DEPTH_SIZE, 16, EGL_STENCIL_SIZE, 8,
-                EGL_NONE
-            };
-            EGLConfig config;
-            eglChooseConfig(g_eglDisplay, attribs, &config, 1, &numConfigs);
-            g_eglSurface = eglCreateWindowSurface(g_eglDisplay, config, g_nativeWindow, nullptr);
-            if (g_eglSurface != EGL_NO_SURFACE) {
-                // Перепривязываем контекст к новой surface на game thread не получится отсюда —
-                // ставим флаг, MegaDebug_eglSwapBuffers подхватит при следующем кадре.
-                EGLint w = 0, h = 0;
-                eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &w);
-                eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &h);
-                LogToJava("onSurfaceCreated: EGL surface пересоздана. Новый размер: " +
-                          std::to_string(w) + "x" + std::to_string(h));
-            } else {
-                LogToJava("onSurfaceCreated: ОШИБКА — не удалось пересоздать EGL surface!");
-            }
+            LogToJava("onSurfaceCreated: ANativeWindow обновлён, game-поток пересоздаст EGL surface.");
         }
         return;
     }
@@ -13995,6 +14013,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
         EGL_NONE 
     };
     EGLConfig config; EGLint numConfigs; eglChooseConfig(g_eglDisplay, attribs, &config, 1, &numConfigs);
+    g_eglConfig = config;
     const EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE }; g_eglContext = eglCreateContext(g_eglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
 
     // ФИКС ЧЁРНОГО ЭКРАНА (ES 1.1): GPU-biты 2+32+64 нужны для glClear/glEnable/FBO.
