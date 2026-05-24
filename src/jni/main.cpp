@@ -141,6 +141,7 @@ std::map<std::string, HLEClass*> g_hleClasses;
 
 void* g_displayLinkTarget = nullptr; const char* g_displayLinkSelector = nullptr; bool g_renderingStarted = false;
 bool g_frameHasDraw = false;
+bool g_swappedThisFrame = false; // Защита от двойного eglSwapBuffers за один кадр
 bool g_onScreenDebugOverlay = false;
 bool g_showPerfOverlay = false;
 int g_esModeOption = 2;
@@ -1517,6 +1518,12 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
 }
 
 extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+    // Защита от двойного swap за один кадр (presentFramebuffer + drawFrame fallback)
+    if (g_swappedThisFrame) {
+        SyncLog("[EGL] SKIP: eglSwapBuffers уже вызван в этом кадре (двойной вызов предотвращён)");
+        return EGL_TRUE;
+    }
+    g_swappedThisFrame = true;
     bool isSpamOn = (g_spamFiltersMask & (1 << 5)) != 0;
     static int swap_cnt = 0; swap_cnt++;
     if (!isSpamOn || swap_cnt <= 30 || swap_cnt % 120 == 0) {
@@ -1772,17 +1779,8 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             if (depthTest) glEnable(GL_DEPTH_TEST);
             if (cullFace) glEnable(GL_CULL_FACE);
         }
-        // Режим очистки CPU-буфера:
-        // - (mask & 16): GPU vertex draw — буфер уже перезаписан glReadPixels выше, очищаем прозрачным
-        // - (mask & 1) && !(mask & 16): GPU рендер, CPU буфер — ТОЛЬКО оверлей (прозрачный фон!)
-        //   Если очищать непрозрачным чёрным, blit покроет всё, что нарисовала игра → чёрный экран.
-        // - CPU rasterizer (!mask & 1): непрозрачный чёрный (игра рисует в g_cpuColorBuffer)
-        uint32_t cpuClearVal;
-        if ((g_gpuOffloadMask & 16) || (g_gpuOffloadMask & 1)) {
-            cpuClearVal = 0x00000000u; // прозрачный — оверлей поверх GPU-рендера
-        } else {
-            cpuClearVal = 0xFF000000u; // непрозрачный чёрный — CPU rasterizer
-        }
+        // При CPU-rendering — очищаем в чёрный непрозрачный. При GPU overlay — прозрачный.
+        uint32_t cpuClearVal = (g_gpuOffloadMask & 16) ? 0x00000000u : 0xFF000000u;
         std::fill(g_cpuColorBuffer.begin(), g_cpuColorBuffer.end(), cpuClearVal);
 
         SyncLog("[RENDER] Отправка буфера на экран (GPU eglSwapBuffers)...");
@@ -1909,17 +1907,16 @@ extern "C" void Stub_glFramebufferTexture2D(GLenum target, GLenum attachment, GL
 
 extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) { 
     LogToJava("[GL-TRACE] glViewport(" + std::to_string(x) + ", " + std::to_string(y) + ", " + std::to_string(width) + ", " + std::to_string(height) + ")");
-    bool wasFakeRequest = (width == 0 && height == 0);
-    if (wasFakeRequest) {
+    if (width == 0 && height == 0) {
         g_isFakeViewport = true;
-        g_gameViewportW = 480;
-        g_gameViewportH = 320;
+        width = 480;
+        height = 320;
     } else {
         g_isFakeViewport = false;
-        g_gameViewportW = width;
-        g_gameViewportH = height;
     }
-    // Для FBO=0/1 всегда используем реальный размер surface, чтобы заполнить экран
+    g_gameViewportW = width; 
+    g_gameViewportH = height;
+    // Для FBO=0/1 всегда используем реальный размер surface
     auto doViewport = [&]() {
         if (g_lastActiveFBO == 0 || g_lastActiveFBO == 1) {
             EGLint realW = g_surfaceWidth, realH = g_surfaceHeight;
@@ -1928,13 +1925,14 @@ extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
                 eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &realW);
                 eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &realH);
             }
-            // Передаём GPU реальный размер поверхности — игра растянется на весь экран.
-            // g_gameViewportW/H НЕ трогаем — в оверлее отображается логический размер игры.
+            // Если запрос реального размера успешен — сбрасываем флаг «фейкового» viewport:
+            // игра получает правильный viewport, экран рендерится корректно.
             if (realW > 0 && realH > 0) {
-                glViewport(0, 0, realW, realH);
-            } else {
-                glViewport(x, y, wasFakeRequest ? 480 : width, wasFakeRequest ? 320 : height);
+                g_isFakeViewport = false;
+                g_gameViewportW = realW;
+                g_gameViewportH = realH;
             }
+            glViewport(0, 0, realW, realH); 
         } else {
             glViewport(x, y, width, height); 
         }
@@ -6639,10 +6637,16 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 g_awakeFromNibCalled.insert((uintptr_t)self);
             }
 
-            // ФИКС ЧЁРНОГО ЭКРАНА: Wolf3D вызывает presentFramebuffer через кешированный
-            // IMP-указатель внутри drawFrame, минуя objc_msgSend и наш трамплин.
-            // Форсируем eglSwapBuffers после каждого drawFrame как гарантированный fallback.
+            // NOTE: НЕ вызываем MegaDebug_eglSwapBuffers здесь!
+            // Wolf3D's drawFrame вызывает presentFramebuffer (перехвачен выше),
+            // который уже сделал eglSwapBuffers. Второй вызов → EGL_BAD_SURFACE на след. кадр.
+            // Если presentFramebuffer был вызван через кешированный IMP (минуя msgSend),
+            // то PATCH на строке 392 ("[EAGLView presentFramebuffer] -> replacement") уже поймает его.
             if (strcmp(op, "drawFrame") == 0) {
+                // Если presentFramebuffer не был перехвачен через msgSend (cached IMP),
+                // то PATCH (hle_presentFramebuffer_replacement) уже вызвал swap.
+                // g_swappedThisFrame защитит от двойного swap.
+                // Fallback на случай если ни PATCH ни msgSend не сработали:
                 RenderHLEUI();
                 MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface);
             }
@@ -8135,6 +8139,8 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             realFakeLink[2] = (uint32_t)(uintptr_t)g_displayLinkSelector;
             static int dl_ticks = 0;
             if (dl_ticks++ % 60 == 0) LogToJava("[MAIN-LOOP] Вызов DisplayLink: target=" + GetObjCClassName(g_displayLinkTarget) + " sel=" + std::string(g_displayLinkSelector));
+            g_swappedThisFrame = false; // Новый кадр — разрешаем один swap
+            g_frameHasDraw = false;
             Stub_objc_msgSend(g_displayLinkTarget, g_displayLinkSelector, realFakeLink, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         } else {
             static int idle_ticks = 0;
