@@ -1780,9 +1780,18 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
     }
     
     EGLint err = eglGetError();
-    static int swap_err_cnt = 0; swap_err_cnt++;
-    if (err != 0 || !isSpamOn || swap_err_cnt <= 30 || swap_err_cnt % 120 == 0) {
-        SyncLog("POST eglSwapBuffers Error: 0x" + std::to_string(err));
+    // ФИКС EGL_BAD_SURFACE: если surface инвалидна — пробуем переподключить контекст.
+    // Это случается после ANativeWindow_setBuffersGeometry или orientation change.
+    if (err == EGL_BAD_SURFACE || err == EGL_BAD_CURRENT_SURFACE) {
+        LogToJava("POST eglSwapBuffers: EGL_BAD_SURFACE — пробуем пересвязать контекст...");
+        eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
+        eglGetError(); // сбросить ошибку после recovery
+    } else {
+        static int swap_err_cnt = 0; swap_err_cnt++;
+        if (err != EGL_SUCCESS || !isSpamOn || swap_err_cnt <= 30 || swap_err_cnt % 120 == 0) {
+            SyncLog("POST eglSwapBuffers Error: 0x" + std::to_string(err));
+        }
     }
     return res;
 }
@@ -11382,20 +11391,20 @@ static uint32_t __attribute__((pcs("aapcs"))) hle_presentFramebuffer_replacement
 static void __attribute__((pcs("aapcs"))) hle_setFramebuffer_replacement(void* self, void* _cmd) {
     // Биндим FBO 0 — стандартный default framebuffer EGL WindowSurface
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    // ФИКС ЧЁРНОГО ЭКРАНА: запрашиваем РЕАЛЬНЫЙ размер EGL-поверхности для viewport,
-    // а не логическое g_surfaceWidth/Height (которое = 480x320, тогда как поверхность
-    // может быть нативного разрешения устройства после исправления setBuffersGeometry).
-    GLsizei vpW = g_surfaceWidth, vpH = g_surfaceHeight; // fallback
+    // ФИКС VIEWPORT: Используем реальный размер EGL-поверхности чтобы игра
+    // рисовала на весь экран, а не в 480x320 уголок 1620x1080 буфера.
+    // EGL WindowSurface = native resolution, игра должна покрыть весь буфер.
+    EGLint vpW = 0, vpH = 0;
     EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
     if (surf != EGL_NO_SURFACE) {
-        EGLint ew = 0, eh = 0;
-        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &ew);
-        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &eh);
-        if (ew > 0 && eh > 0) { vpW = ew; vpH = eh; }
+        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &vpW);
+        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &vpH);
     }
-    if (vpW > 0 && vpH > 0) {
-        glViewport(0, 0, vpW, vpH);
+    if (vpW <= 0 || vpH <= 0) {
+        vpW = g_surfaceWidth;
+        vpH = g_surfaceHeight;
     }
+    glViewport(0, 0, vpW, vpH);
 }
 
 // Записывает Thumb-трамплин по адресу target_thumb_addr (бит 0 снят, адрес чётный).
@@ -13964,9 +13973,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
             snprintf(errBuf, sizeof(errBuf), "КРИТИЧЕСКАЯ ОШИБКА: eglCreateWindowSurface вернул EGL_NO_SURFACE! eglError=0x%X", surfErr);
             LogToJava(errBuf);
         } else {
-            // Теперь безопасно выставляем геометрию буферов: EGL-поверхность уже захватила окно,
-            // и переконфигурация ANativeWindow не сломает дескриптор поверхности.
-            ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, WINDOW_FORMAT_RGBA_8888);
             EGLint realW = 0, realH = 0;
             eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &realW);
             eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &realH);
