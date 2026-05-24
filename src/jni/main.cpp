@@ -197,6 +197,7 @@ struct UITextCache {
 
 // --- RENDERER STATE ---
 ANativeWindow* g_nativeWindow = nullptr;
+int g_workingWindowFormat = 0; // Рабочий формат ANativeWindow (определяется автоматически при первом успешном swap)
 std::vector<uint32_t> g_cpuColorBuffer;
 std::vector<float> g_cpuDepthBuffer;
 float g_cpuClearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -1545,8 +1546,9 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         bool needRebind = (curCtx != g_eglContext || curSurf != g_eglSurface);
         // Если surface была сброшена onSurfaceCreated — пересоздаём прямо здесь
         if (g_eglSurface == EGL_NO_SURFACE && g_nativeWindow && g_eglConfig) {
-            // ФИКС EGL_BAD_MATCH: выставляем формат буфера перед пересозданием
-            { EGLint fmt = 0; eglGetConfigAttrib(g_eglDisplay, g_eglConfig, EGL_NATIVE_VISUAL_ID, &fmt); ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt ? fmt : 1); }
+            // ФИКС EGL_BAD_ALLOC/EGL_BAD_MATCH: release+acquire сбрасывает драйверный ref, затем выставляем формат
+            ANativeWindow_release(g_nativeWindow); ANativeWindow_acquire(g_nativeWindow);
+            { int fmt = g_workingWindowFormat ? g_workingWindowFormat : 4; ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt); eglGetError(); }
             g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
             SyncLog("[EGL] g_eglSurface пересоздана превентивно: " +
                     std::to_string(g_eglSurface != EGL_NO_SURFACE ? 1 : 0));
@@ -1834,10 +1836,22 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         if (g_eglSurface != EGL_NO_SURFACE) {
             eglDestroySurface(g_eglDisplay, g_eglSurface);
             g_eglSurface = EGL_NO_SURFACE;
+            eglGetError();
+        }
+        // ФИКС EGL_BAD_ALLOC (PowerVR): после eglDestroySurface драйвер держит ref на ANativeWindow.
+        // release + acquire сбрасывает внутреннее состояние и позволяет новому attach-у работать.
+        if (g_nativeWindow) {
+            ANativeWindow_release(g_nativeWindow);
+            ANativeWindow_acquire(g_nativeWindow);
         }
         // Создаём новую WindowSurface с тем же ANativeWindow и config
-        // ФИКС EGL_BAD_MATCH: выставляем формат буфера перед пересозданием
-        { EGLint fmt = 0; eglGetConfigAttrib(g_eglDisplay, g_eglConfig, EGL_NATIVE_VISUAL_ID, &fmt); ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt ? fmt : 1); }
+        // ФИКС EGL_BAD_MATCH: используем ранее определённый рабочий формат (g_workingWindowFormat).
+        // Если он не определён — пробуем форматы как при первом запуске.
+        {
+            int fmt = g_workingWindowFormat ? g_workingWindowFormat : 4; // 4=RGB_565 (Wolf3D native)
+            ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt);
+            eglGetError();
+        }
         g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
         if (g_eglSurface != EGL_NO_SURFACE) {
             eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
@@ -12631,25 +12645,58 @@ void* NativeExecutionThread(void* arg) {
     // На многих Android драйверах (PowerVR, Adreno) surface инвалидируется если создана
     // на Java-потоке (onSurfaceCreated) а привязана на game-потоке.
     if ((g_gpuOffloadMask & 1) && g_eglSurface == EGL_NO_SURFACE && g_nativeWindow && g_eglConfig) {
-        // ФИКС EGL_BAD_MATCH (PowerVR SGX): eglSwapBuffers падает если формат ANativeWindow
-        // не совпадает с native visual ID конфига. Обязательно выставляем формат ДО создания surface.
+        // ФИКС EGL_BAD_MATCH (PowerVR SGX): eglSwapBuffers молча падает если формат ANativeWindow
+        // не совпадает с ожидаемым. EGL_NATIVE_VISUAL_ID может вернуть 0 на старых драйверах.
+        // Перебираем форматы: RGB_565(4), RGBA_8888(1), RGBX_8888(2), BGRA_8888(5).
+        // Wolf3D использует kEAGLColorFormatRGB565, поэтому RGB_565 пробуем первым.
         EGLint nativeVisualId = 0;
         eglGetConfigAttrib(g_eglDisplay, g_eglConfig, EGL_NATIVE_VISUAL_ID, &nativeVisualId);
-        if (nativeVisualId != 0) {
-            ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, nativeVisualId);
-            char buf2[128]; snprintf(buf2, sizeof(buf2), "NativeExecutionThread: ANativeWindow format set to %d (EGL_NATIVE_VISUAL_ID)", nativeVisualId);
-            LogToJava(buf2);
+        eglGetError(); // сбросить возможную ошибку
+
+        // Список форматов для перебора: нативный (если не 0), затем RGB_565, RGBA_8888, RGBX_8888, BGRA_8888
+        int formats[6] = {0, 4, 1, 2, 5, 1}; // slot 0 заполним ниже
+        int nFormats = 5;
+        if (nativeVisualId != 0 && nativeVisualId != 4 && nativeVisualId != 1) {
+            formats[0] = nativeVisualId; // добавляем нативный как первый, если он уникален
         } else {
-            // Fallback: WINDOW_FORMAT_RGBA_8888 = 1
-            ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, 1);
-            LogToJava("NativeExecutionThread: ANativeWindow format set to 1 (RGBA_8888 fallback)");
+            formats[0] = 4; nFormats = 4; // убираем дубль
         }
-        g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
-        EGLint surfErr = eglGetError();
+
+        for (int fi = 0; fi < nFormats && g_eglSurface == EGL_NO_SURFACE; fi++) {
+            int fmt = formats[fi];
+            if (fmt == 0) continue;
+            ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt);
+            eglGetError();
+            g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
+            eglGetError();
+            if (g_eglSurface != EGL_NO_SURFACE) {
+                // Проверяем что этот format реально работает: пробуем eglMakeCurrent + swap
+                if (eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext)) {
+                    EGLBoolean swapOk = eglSwapBuffers(g_eglDisplay, g_eglSurface);
+                    EGLint swapErr = eglGetError();
+                    if (swapOk || swapErr == EGL_SUCCESS) {
+                        g_workingWindowFormat = fmt;
+                        char buf[128]; snprintf(buf, sizeof(buf),
+                            "NativeExecutionThread: WindowSurface OK, format=%d, swap=%d", fmt, (int)swapOk);
+                        LogToJava(buf);
+                        break; // формат найден
+                    }
+                }
+                // Этот format не работает — уничтожаем surface и пробуем следующий
+                eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                eglDestroySurface(g_eglDisplay, g_eglSurface);
+                g_eglSurface = EGL_NO_SURFACE;
+                eglGetError();
+                char buf[128]; snprintf(buf, sizeof(buf),
+                    "NativeExecutionThread: format=%d swap failed, trying next", fmt);
+                LogToJava(buf);
+            }
+        }
+
         if (g_eglSurface == EGL_NO_SURFACE) {
-            char buf[128]; snprintf(buf, sizeof(buf), "NativeExecutionThread: ОШИБКА eglCreateWindowSurface: 0x%X", surfErr);
-            LogToJava(buf);
-        } else {
+            LogToJava("NativeExecutionThread: ОШИБКА — ни один формат ANativeWindow не работает!");
+        } else if (g_workingWindowFormat == 0) {
+            // surface создана но swap-тест не проводился (не должно случиться, но на всякий случай)
             EGLint realW = 0, realH = 0;
             eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &realW);
             eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &realH);
