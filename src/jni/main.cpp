@@ -4941,7 +4941,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                           std::to_string(target_addr) + " (probe_isa=0x" + std::to_string(probe_isa) +
                           ") — игнорируем (float-значение или мусор)");
             }
-            uint32_t* inst = (uint32_t*)calloc(1, 64); inst[0] = (uint32_t)self; if (target_ok) { inst[1] = (uint32_t)(uintptr_t)a1; inst[2] = (uint32_t)(uintptr_t)a2; } return (uint64_t)(uintptr_t)inst;
+            uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; return (uint64_t)(uintptr_t)inst;
         }
 
         // --- HLE CLASS METHODS FIX ---
@@ -6576,7 +6576,25 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
 
         if (strcmp(op, "setView:") == 0) {
-            g_viewControllersViews[self] = a1; if (cName == "MainViewController") g_mainView = a1; return 0;
+            g_viewControllersViews[self] = a1;
+            if (cName == "MainViewController") g_mainView = a1;
+            // ФИКС ЧЁРНОГО ЭКРАНА: Wolf3D в drawFrame читает self->_view как ivar напрямую.
+            // UIViewController._view в iOS 5 ARM32 лежит по offset 12 (uint32_t[3]).
+            // Дополнительно сканируем объект — если [3] уже занят другим указателем,
+            // ищем первый nil-слот в диапазоне [3..7] и пишем туда.
+            if (self && a1) {
+                uint32_t* vcObj = (uint32_t*)self;
+                uint32_t eaglVal = (uint32_t)(uintptr_t)a1;
+                // Пишем в [3] (стандартный UIViewController._view offset=12)
+                vcObj[3] = eaglVal;
+                LogToJava("HLE: setView: записали EAGLView 0x" + std::to_string((uintptr_t)a1)
+                          + " в " + cName + " ivar[3] (offset=12)."
+                          + " obj[0..5]=" + std::to_string(vcObj[0]) + ","
+                          + std::to_string(vcObj[1]) + "," + std::to_string(vcObj[2]) + ","
+                          + std::to_string(vcObj[3]) + "," + std::to_string(vcObj[4]) + ","
+                          + std::to_string(vcObj[5]));
+            }
+            return 0;
         }
                 if (strcmp(op, "presentModalViewController:animated:") == 0) {
             void* modalVC = a1;
@@ -6658,23 +6676,21 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             // offset'ам (wolf3d мог записать target сам перед передачей нам).
             if (!g_displayLinkTarget && a1) {
                 uint32_t* dl = (uint32_t*)a1;
-                // offset 1 (_target) — мы сами записали его в displayLinkWithTarget:selector:
-                uintptr_t candidate = (uintptr_t)dl[1];
-                uint32_t probe = 0;
-                if (candidate >= 0x70000000u && candidate < 0xFF000000u &&
-                    SafeRead32(candidate, &probe) && probe > 0x1000u) {
-                    g_displayLinkTarget = (void*)candidate;
-                    g_displayLinkSelector = (const char*)(uintptr_t)dl[2];
-                    LogToJava("[setDisplayLink] Извлекли target из dl[1]=0x" +
-                              std::to_string(candidate));
+                // Проверяем offsets 4, 8, 12 — ищем первый похожий на heap-pointer (>= 0x70000000)
+                for (int i = 1; i <= 3; i++) {
+                    uintptr_t candidate = (uintptr_t)dl[i];
+                    uint32_t probe = 0;
+                    if (candidate >= 0x70000000u && candidate < 0xFF000000u &&
+                        SafeRead32(candidate, &probe) && probe > 0x1000u) {
+                        // Выглядит как валидный ObjC-объект — это может быть target
+                        g_displayLinkTarget = (void*)candidate;
+                        LogToJava("[setDisplayLink] Извлекли target из dl[" + std::to_string(i) + "]=0x" +
+                                  std::to_string(candidate));
+                        break;
+                    }
                 }
             }
-            // Разрешаем нативный setDisplayLink: — Wolf3D должен сохранить EAGLView
-            // в своём ivar (self->eaglView = ...). Без этого drawFrame не вызывает
-            // setFramebuffer/presentFramebuffer и GL-рендер не происходит.
-            // CADisplayLink instance уже содержит валидные _target/_selector (fix выше),
-            // поэтому нативный код не прочитает float 0x43A00000 как target.
-            // Нативный IMP выполнится через FindMethodIMP ниже.
+            return 0;
         }
 
         // ФИКС ЧЁРНОГО ЭКРАНА: Wolf3D вызывает [EAGLView presentFramebuffer] для показа кадра.
