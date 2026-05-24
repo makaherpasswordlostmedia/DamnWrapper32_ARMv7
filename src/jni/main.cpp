@@ -1772,8 +1772,17 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             if (depthTest) glEnable(GL_DEPTH_TEST);
             if (cullFace) glEnable(GL_CULL_FACE);
         }
-        // При CPU-rendering — очищаем в чёрный непрозрачный. При GPU overlay — прозрачный.
-        uint32_t cpuClearVal = (g_gpuOffloadMask & 16) ? 0x00000000u : 0xFF000000u;
+        // Режим очистки CPU-буфера:
+        // - (mask & 16): GPU vertex draw — буфер уже перезаписан glReadPixels выше, очищаем прозрачным
+        // - (mask & 1) && !(mask & 16): GPU рендер, CPU буфер — ТОЛЬКО оверлей (прозрачный фон!)
+        //   Если очищать непрозрачным чёрным, blit покроет всё, что нарисовала игра → чёрный экран.
+        // - CPU rasterizer (!mask & 1): непрозрачный чёрный (игра рисует в g_cpuColorBuffer)
+        uint32_t cpuClearVal;
+        if ((g_gpuOffloadMask & 16) || (g_gpuOffloadMask & 1)) {
+            cpuClearVal = 0x00000000u; // прозрачный — оверлей поверх GPU-рендера
+        } else {
+            cpuClearVal = 0xFF000000u; // непрозрачный чёрный — CPU rasterizer
+        }
         std::fill(g_cpuColorBuffer.begin(), g_cpuColorBuffer.end(), cpuClearVal);
 
         SyncLog("[RENDER] Отправка буфера на экран (GPU eglSwapBuffers)...");
@@ -1900,16 +1909,17 @@ extern "C" void Stub_glFramebufferTexture2D(GLenum target, GLenum attachment, GL
 
 extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) { 
     LogToJava("[GL-TRACE] glViewport(" + std::to_string(x) + ", " + std::to_string(y) + ", " + std::to_string(width) + ", " + std::to_string(height) + ")");
-    if (width == 0 && height == 0) {
+    bool wasFakeRequest = (width == 0 && height == 0);
+    if (wasFakeRequest) {
         g_isFakeViewport = true;
-        width = 480;
-        height = 320;
+        g_gameViewportW = 480;
+        g_gameViewportH = 320;
     } else {
         g_isFakeViewport = false;
+        g_gameViewportW = width;
+        g_gameViewportH = height;
     }
-    g_gameViewportW = width; 
-    g_gameViewportH = height;
-    // Для FBO=0/1 всегда используем реальный размер surface
+    // Для FBO=0/1 всегда используем реальный размер surface, чтобы заполнить экран
     auto doViewport = [&]() {
         if (g_lastActiveFBO == 0 || g_lastActiveFBO == 1) {
             EGLint realW = g_surfaceWidth, realH = g_surfaceHeight;
@@ -1918,14 +1928,13 @@ extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
                 eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &realW);
                 eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &realH);
             }
-            // Если запрос реального размера успешен — сбрасываем флаг «фейкового» viewport:
-            // игра получает правильный viewport, экран рендерится корректно.
+            // Передаём GPU реальный размер поверхности — игра растянется на весь экран.
+            // g_gameViewportW/H НЕ трогаем — в оверлее отображается логический размер игры.
             if (realW > 0 && realH > 0) {
-                g_isFakeViewport = false;
-                g_gameViewportW = realW;
-                g_gameViewportH = realH;
+                glViewport(0, 0, realW, realH);
+            } else {
+                glViewport(x, y, wasFakeRequest ? 480 : width, wasFakeRequest ? 320 : height);
             }
-            glViewport(0, 0, realW, realH); 
         } else {
             glViewport(x, y, width, height); 
         }
