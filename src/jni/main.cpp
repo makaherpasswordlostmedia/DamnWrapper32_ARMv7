@@ -1728,73 +1728,126 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
 
     EGLBoolean res = EGL_TRUE;
     if (g_gpuOffloadMask & 1) {
-        // ФИКС ЧЁРНОГО ЭКРАНА (CPU render path):
-        // Если бит 16 (GPU vertex draw) НЕ выставлен — игра рисует в g_cpuColorBuffer.
-        // Blit-им его на экран ВСЕГДА, не только при включённом debug overlay.
-        bool needCpuBlit = (g_onScreenDebugOverlay || g_showPerfOverlay) ||
-                           (!(g_gpuOffloadMask & 16) && g_cpuColorBuffer.size() == (size_t)(g_surfaceWidth * g_surfaceHeight));
-        if (needCpuBlit) {
+        // ФИКС ЧЁРНОГО ЭКРАНА:
+        // Если бит 16 выставлен — wolf3d рисует через GPU в WindowSurface.
+        // g_cpuColorBuffer при GPU-режиме = прозрачный фон + текст HUD (только пиксели overlay).
+        // НЕ рисуем CPU-буфер поверх GPU-кадра без blending — это даст чёрный экран.
+        // Рисуем только если overlay действительно нужен (и с SRC_ALPHA blending).
+        //
+        // Если бит 16 не выставлен — wolf3d рисует в CPU-буфер, его нужно blit-нуть на экран.
+        bool gpuDrawsActive = (g_gpuOffloadMask & 16) != 0;
+        bool hasCpuContent  = (g_cpuColorBuffer.size() == (size_t)(g_surfaceWidth * g_surfaceHeight));
+        // needCpuBlit: нужен blit только если CPU-буфер является основным источником пикселей
+        bool needCpuBlit = !gpuDrawsActive && hasCpuContent;
+        // needOverlayOnGpu: overlay поверх GPU-кадра (blending включён, фон прозрачный)
+        bool needOverlayOnGpu = gpuDrawsActive && hasCpuContent && (g_onScreenDebugOverlay || g_showPerfOverlay);
+        if (needCpuBlit || needOverlayOnGpu) {
+            // ФИКС ЧЁРНОГО ЭКРАНА: используем ES 1.1 fixed-function pipeline вместо ES2 шейдеров.
+            // Wolf3d работает в ES 1.1 контексте — glCreateShader/glUseProgram/glVertexAttribPointer
+            // это ES2 API, которые в ES1.1 контексте возвращают ошибки и оставляют GL
+            // в undefined state, что приводит к EGL_BAD_SURFACE при следующем eglSwapBuffers.
+            //
+            // ES 1.1 fixed-function blit: биндим текстуру, включаем GL_TEXTURE_2D,
+            // рисуем full-screen quad через glTexCoordPointer + glVertexPointer + glDrawArrays.
+
             static GLuint overlayTex = 0;
-            static GLuint overlayProg = 0;
             if (overlayTex == 0) {
                 glGenTextures(1, &overlayTex);
                 glBindTexture(GL_TEXTURE_2D, overlayTex);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                const char* vs = "attribute vec4 pos; attribute vec2 uv; varying vec2 v_uv; void main() { gl_Position = pos; v_uv = uv; }";
-                const char* fs = "precision mediump float; varying vec2 v_uv; uniform sampler2D tex; void main() { gl_FragColor = texture2D(tex, v_uv); }";
-                GLuint vsh = glCreateShader(GL_VERTEX_SHADER); glShaderSource(vsh, 1, &vs, nullptr); glCompileShader(vsh);
-                GLuint fsh = glCreateShader(GL_FRAGMENT_SHADER); glShaderSource(fsh, 1, &fs, nullptr); glCompileShader(fsh);
-                overlayProg = glCreateProgram(); glAttachShader(overlayProg, vsh); glAttachShader(overlayProg, fsh);
-                glBindAttribLocation(overlayProg, 0, "pos"); glBindAttribLocation(overlayProg, 1, "uv");
-                glLinkProgram(overlayProg);
             }
-            GLint oldProg; glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg);
-            GLint oldTex; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex);
-            GLint oldActiveTex; glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTex);
-            GLint oldArrayBuf; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &oldArrayBuf);
-            GLboolean blendEnabled = glIsEnabled(GL_BLEND);
-            GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
-            GLboolean cullFace = glIsEnabled(GL_CULL_FACE);
-            GLint oldViewport[4]; glGetIntegerv(GL_VIEWPORT, oldViewport);
+
+            // Сохраняем state
+            GLint oldTex = 0;       glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex);
+            GLboolean blendEnabled  = glIsEnabled(GL_BLEND);
+            GLboolean depthTest     = glIsEnabled(GL_DEPTH_TEST);
+            GLboolean cullFace      = glIsEnabled(GL_CULL_FACE);
+            GLboolean tex2d         = glIsEnabled(GL_TEXTURE_2D);
+            GLboolean litEnabled    = glIsEnabled(GL_LIGHTING);
+            GLboolean alphaTest     = glIsEnabled(GL_ALPHA_TEST);
+            GLint oldMatMode        = GL_MODELVIEW;  glGetIntegerv(GL_MATRIX_MODE, &oldMatMode);
+            GLint oldViewport[4];   glGetIntegerv(GL_VIEWPORT, oldViewport);
+
+            // Размер реальной surface
             EGLint blitW = g_surfaceWidth, blitH = g_surfaceHeight;
-            { EGLSurface s = eglGetCurrentSurface(EGL_DRAW); if (s != EGL_NO_SURFACE) { eglQuerySurface(eglGetCurrentDisplay(), s, EGL_WIDTH, &blitW); eglQuerySurface(eglGetCurrentDisplay(), s, EGL_HEIGHT, &blitH); } }
+            {
+                EGLSurface s = eglGetCurrentSurface(EGL_DRAW);
+                if (s != EGL_NO_SURFACE) {
+                    eglQuerySurface(eglGetCurrentDisplay(), s, EGL_WIDTH,  &blitW);
+                    eglQuerySurface(eglGetCurrentDisplay(), s, EGL_HEIGHT, &blitH);
+                }
+            }
+
+            // Настраиваем state для blit
             glViewport(0, 0, blitW, blitH);
-            bool hasOverlay = (g_onScreenDebugOverlay || g_showPerfOverlay);
-            if (hasOverlay) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
-            else { glDisable(GL_BLEND); }
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
-            glUseProgram(overlayProg);
-            glActiveTexture(GL_TEXTURE0);
+            glDisable(GL_LIGHTING);
+            glDisable(GL_ALPHA_TEST);
+            glEnable(GL_TEXTURE_2D);
+
+            // При overlay поверх GPU-кадра — blending включён (прозрачный фон CPU-буфера).
+            // При чистом CPU-blit (GPU draws неактивны) — blending выключен.
+            if (needOverlayOnGpu) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
+            else                   { glDisable(GL_BLEND); }
+
+            // Ортогональная матрица: NDC [-1,1] через identity (texCoords напрямую)
+            glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+            glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
+            glMatrixMode(GL_TEXTURE);    glPushMatrix(); glLoadIdentity();
+
+            // Загружаем CPU-буфер в текстуру (RGBA, 480x320)
             glBindTexture(GL_TEXTURE_2D, overlayTex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
-            glUniform1i(glGetUniformLocation(overlayProg, "tex"), 0);
-            float verts[] = {
-                -1.0f,  1.0f, 0.0f, 0.0f,
-                -1.0f, -1.0f, 0.0f, 1.0f,
-                 1.0f,  1.0f, 1.0f, 0.0f,
-                 1.0f, -1.0f, 1.0f, 1.0f
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                         g_surfaceWidth, g_surfaceHeight, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE,
+                         g_cpuColorBuffer.data());
+            glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+            // Full-screen quad: позиции NDC, UV [0,1]
+            // ES1.1: glVertexPointer + glTexCoordPointer (НЕ glVertexAttribPointer — это ES2!)
+            static const float quadVerts[] = {
+                -1.0f,  1.0f,   // top-left     UV(0,0) — y инвертирован: верх текстуры = верх экрана
+                -1.0f, -1.0f,   // bottom-left  UV(0,1)
+                 1.0f,  1.0f,   // top-right    UV(1,0)
+                 1.0f, -1.0f,   // bottom-right UV(1,1)
             };
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
-            glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, verts);
-            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
+            static const float quadUVs[] = {
+                0.0f, 0.0f,
+                0.0f, 1.0f,
+                1.0f, 0.0f,
+                1.0f, 1.0f,
+            };
+            glEnableClientState(GL_VERTEX_ARRAY);
+            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+            glDisableClientState(GL_COLOR_ARRAY);
+            glDisableClientState(GL_NORMAL_ARRAY);
+            glVertexPointer  (2, GL_FLOAT, 0, quadVerts);
+            glTexCoordPointer(2, GL_FLOAT, 0, quadUVs);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
-            glUseProgram(oldProg);
-            glActiveTexture(oldActiveTex);
+            glDisableClientState(GL_VERTEX_ARRAY);
+            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+
+            // Восстанавливаем state
+            glMatrixMode(GL_TEXTURE);    glPopMatrix();
+            glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+            glMatrixMode(GL_PROJECTION); glPopMatrix();
+            glMatrixMode(oldMatMode);
+
             glBindTexture(GL_TEXTURE_2D, oldTex);
-            glBindBuffer(GL_ARRAY_BUFFER, oldArrayBuf);
             glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
-            if (blendEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-            if (depthTest) glEnable(GL_DEPTH_TEST);
-            if (cullFace) glEnable(GL_CULL_FACE);
+            if (blendEnabled) glEnable(GL_BLEND);    else glDisable(GL_BLEND);
+            if (depthTest)    glEnable(GL_DEPTH_TEST);
+            if (cullFace)     glEnable(GL_CULL_FACE);
+            if (litEnabled)   glEnable(GL_LIGHTING);
+            if (alphaTest)    glEnable(GL_ALPHA_TEST);
+            if (!tex2d)       glDisable(GL_TEXTURE_2D);
         }
-        // При CPU-rendering — очищаем в чёрный непрозрачный. При GPU overlay — прозрачный.
-        uint32_t cpuClearVal = (g_gpuOffloadMask & 16) ? 0x00000000u : 0xFF000000u;
+        // При CPU-rendering — очищаем в чёрный непрозрачный. При GPU overlay — прозрачный (alpha=0).
+        uint32_t cpuClearVal = gpuDrawsActive ? 0x00000000u : 0xFF000000u;
         std::fill(g_cpuColorBuffer.begin(), g_cpuColorBuffer.end(), cpuClearVal);
 
         SyncLog("[RENDER] Отправка буфера на экран (GPU eglSwapBuffers)...");
@@ -1825,12 +1878,14 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
     }
     
     EGLint err = eglGetError();
-    // ФИКС EGL_BAD_SURFACE: ANativeWindow под surface мог быть рассоединён Android'ом
-    // (reconnect цикл SurfaceView при старте, orientation change, etc.).
-    // Пересоздаём surface прямо здесь на game-потоке и сразу повторяем swap.
-    if ((err == EGL_BAD_SURFACE || err == EGL_BAD_CURRENT_SURFACE || res == EGL_FALSE) &&
-        g_nativeWindow && g_eglConfig && g_eglDisplay != EGL_NO_DISPLAY) {
-        SyncLog("[EGL] EGL_BAD_SURFACE — пересоздаём surface на game-потоке...");
+    // ФИКС: Пересоздаём surface ТОЛЬКО при реальных EGL ошибках поверхности.
+    // res==EGL_FALSE при err==EGL_SUCCESS — это quirk PowerVR/Adreno на первом кадре
+    // (драйвер ещё не готов, но ошибку не выставляет). Пересоздание surface в этом случае
+    // приводит к EGL_BAD_ALLOC (0x3003) и потере контекста. Просто пропускаем такой кадр.
+    bool realSurfaceError = (err == EGL_BAD_SURFACE || err == EGL_BAD_CURRENT_SURFACE ||
+                             err == EGL_BAD_NATIVE_WINDOW);
+    if (realSurfaceError && g_nativeWindow && g_eglConfig && g_eglDisplay != EGL_NO_DISPLAY) {
+        SyncLog("[EGL] EGL_BAD_SURFACE (err=0x" + std::to_string(err) + ") — пересоздаём surface на game-потоке...");
         // Отвязываем старую surface
         eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (g_eglSurface != EGL_NO_SURFACE) {
@@ -1845,17 +1900,15 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             ANativeWindow_acquire(g_nativeWindow);
         }
         // Создаём новую WindowSurface с тем же ANativeWindow и config
-        // ФИКС EGL_BAD_MATCH: используем ранее определённый рабочий формат (g_workingWindowFormat).
-        // Если он не определён — пробуем форматы как при первом запуске.
         {
-            int fmt = g_workingWindowFormat ? g_workingWindowFormat : 4; // 4=RGB_565 (Wolf3D native)
+            int fmt = g_workingWindowFormat ? g_workingWindowFormat : 4;
             ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt);
             eglGetError();
         }
         g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
         if (g_eglSurface != EGL_NO_SURFACE) {
             eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
-            eglGetError(); // сбросить
+            eglGetError();
             EGLint nw = 0, nh = 0;
             eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &nw);
             eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &nh);
@@ -1866,6 +1919,10 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             SyncLog("[EGL] ОШИБКА: не удалось пересоздать surface! err=0x" +
                     std::to_string(eglGetError()));
         }
+    } else if (res == EGL_FALSE && err == EGL_SUCCESS) {
+        // PowerVR quirk: первый кадр swap падает без ошибки. Просто логируем и продолжаем.
+        static int silentFail = 0;
+        if (silentFail++ < 5) SyncLog("[EGL] swap вернул FALSE без ошибки (кадр " + std::to_string(silentFail) + ") — пропускаем");
     } else {
         static int swap_err_cnt = 0; swap_err_cnt++;
         if (err != EGL_SUCCESS || !isSpamOn || swap_err_cnt <= 30 || swap_err_cnt % 120 == 0) {
