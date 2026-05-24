@@ -1523,6 +1523,18 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         DumpGLState("BEFORE eglSwapBuffers");
     }
 
+    // ФИКС EGL_BAD_SURFACE (главная причина чёрного экрана):
+    // NativeExecutionThread делает eglMakeCurrent на своём потоке при старте.
+    // Но drawFrame и eglSwapBuffers вызываются на ДРУГОМ потоке (render/main loop).
+    // EGL требует, чтобы eglSwapBuffers вызывался с того потока, где контекст current.
+    // Решение: перед каждым swap проверяем — если контекст не привязан к этому потоку,
+    // привязываем его здесь. eglMakeCurrent автоматически отвязывает с предыдущего потока.
+    if (eglGetCurrentContext() != g_eglContext) {
+        eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
+        eglGetError(); // сбросить возможную ошибку после смены потока
+        SyncLog("[EGL] Контекст перепривязан к потоку рендера перед swap.");
+    }
+
     // ФИКС ЧЕРНОГО ЭКРАНА: Если GPU Draw (16) включен, а GPU Swap (1) выключен,
     // кадр остался в видеопамяти! Нужно вытянуть его в CPU, чтобы оверлей и ANativeWindow отработали.
     if ((g_gpuOffloadMask & 16) && !(g_gpuOffloadMask & 1)) {
@@ -1780,18 +1792,9 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
     }
     
     EGLint err = eglGetError();
-    // ФИКС EGL_BAD_SURFACE: если surface инвалидна — пробуем переподключить контекст.
-    // Это случается после ANativeWindow_setBuffersGeometry или orientation change.
-    if (err == EGL_BAD_SURFACE || err == EGL_BAD_CURRENT_SURFACE) {
-        LogToJava("POST eglSwapBuffers: EGL_BAD_SURFACE — пробуем пересвязать контекст...");
-        eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
-        eglGetError(); // сбросить ошибку после recovery
-    } else {
-        static int swap_err_cnt = 0; swap_err_cnt++;
-        if (err != EGL_SUCCESS || !isSpamOn || swap_err_cnt <= 30 || swap_err_cnt % 120 == 0) {
-            SyncLog("POST eglSwapBuffers Error: 0x" + std::to_string(err));
-        }
+    static int swap_err_cnt = 0; swap_err_cnt++;
+    if (err != EGL_SUCCESS || !isSpamOn || swap_err_cnt <= 30 || swap_err_cnt % 120 == 0) {
+        SyncLog("POST eglSwapBuffers Error: 0x" + std::to_string(err));
     }
     return res;
 }
