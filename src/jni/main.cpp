@@ -1742,15 +1742,17 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         // needOverlayOnGpu: overlay поверх GPU-кадра (blending включён, фон прозрачный)
         bool needOverlayOnGpu = gpuDrawsActive && hasCpuContent && (g_onScreenDebugOverlay || g_showPerfOverlay);
         if (needCpuBlit || needOverlayOnGpu) {
-            // ФИКС ЧЁРНОГО ЭКРАНА: используем ES 1.1 fixed-function pipeline вместо ES2 шейдеров.
-            // Wolf3d работает в ES 1.1 контексте — glCreateShader/glUseProgram/glVertexAttribPointer
-            // это ES2 API, которые в ES1.1 контексте возвращают ошибки и оставляют GL
-            // в undefined state, что приводит к EGL_BAD_SURFACE при следующем eglSwapBuffers.
-            //
-            // ES 1.1 fixed-function blit: биндим текстуру, включаем GL_TEXTURE_2D,
-            // рисуем full-screen quad через glTexCoordPointer + glVertexPointer + glDrawArrays.
+            // ES2 shader blit CPU-буфера на экран.
+            // Шейдеры и программа создаются один раз и хранятся статически.
+            // При каждом вызове проверяем что программа валидна (glIsProgram).
+            static GLuint overlayTex  = 0;
+            static GLuint overlayProg = 0;
+            static GLuint overlayVSh  = 0;
+            static GLuint overlayFSh  = 0;
+            static GLint  uTex        = -1;
+            static GLint  aPos        = -1;
+            static GLint  aUV         = -1;
 
-            static GLuint overlayTex = 0;
             if (overlayTex == 0) {
                 glGenTextures(1, &overlayTex);
                 glBindTexture(GL_TEXTURE_2D, overlayTex);
@@ -1760,91 +1762,121 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             }
 
-            // Сохраняем state
-            GLint oldTex = 0;       glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex);
-            GLboolean blendEnabled  = glIsEnabled(GL_BLEND);
-            GLboolean depthTest     = glIsEnabled(GL_DEPTH_TEST);
-            GLboolean cullFace      = glIsEnabled(GL_CULL_FACE);
-            GLboolean tex2d         = glIsEnabled(GL_TEXTURE_2D);
-            GLboolean litEnabled    = glIsEnabled(GL_LIGHTING);
-            GLboolean alphaTest     = glIsEnabled(GL_ALPHA_TEST);
-            GLint oldMatMode        = GL_MODELVIEW;  glGetIntegerv(GL_MATRIX_MODE, &oldMatMode);
-            GLint oldViewport[4];   glGetIntegerv(GL_VIEWPORT, oldViewport);
+            if (!glIsProgram(overlayProg)) {
+                // (пере)создаём шейдерную программу
+                if (overlayVSh) { glDeleteShader(overlayVSh); overlayVSh = 0; }
+                if (overlayFSh) { glDeleteShader(overlayFSh); overlayFSh = 0; }
+                if (overlayProg){ glDeleteProgram(overlayProg); overlayProg = 0; }
 
-            // Размер реальной surface
-            EGLint blitW = g_surfaceWidth, blitH = g_surfaceHeight;
-            {
-                EGLSurface s = eglGetCurrentSurface(EGL_DRAW);
-                if (s != EGL_NO_SURFACE) {
-                    eglQuerySurface(eglGetCurrentDisplay(), s, EGL_WIDTH,  &blitW);
-                    eglQuerySurface(eglGetCurrentDisplay(), s, EGL_HEIGHT, &blitH);
+                const char* vs =
+                    "attribute vec2 aPos;\n"
+                    "attribute vec2 aUV;\n"
+                    "varying vec2 vUV;\n"
+                    "void main() {\n"
+                    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+                    "    vUV = aUV;\n"
+                    "}\n";
+                const char* fs =
+                    "precision mediump float;\n"
+                    "varying vec2 vUV;\n"
+                    "uniform sampler2D uTex;\n"
+                    "void main() {\n"
+                    "    gl_FragColor = texture2D(uTex, vUV);\n"
+                    "}\n";
+
+                overlayVSh = glCreateShader(GL_VERTEX_SHADER);
+                glShaderSource(overlayVSh, 1, &vs, nullptr);
+                glCompileShader(overlayVSh);
+                GLint vsOk = 0; glGetShaderiv(overlayVSh, GL_COMPILE_STATUS, &vsOk);
+
+                overlayFSh = glCreateShader(GL_FRAGMENT_SHADER);
+                glShaderSource(overlayFSh, 1, &fs, nullptr);
+                glCompileShader(overlayFSh);
+                GLint fsOk = 0; glGetShaderiv(overlayFSh, GL_COMPILE_STATUS, &fsOk);
+
+                if (vsOk && fsOk) {
+                    overlayProg = glCreateProgram();
+                    glAttachShader(overlayProg, overlayVSh);
+                    glAttachShader(overlayProg, overlayFSh);
+                    glBindAttribLocation(overlayProg, 0, "aPos");
+                    glBindAttribLocation(overlayProg, 1, "aUV");
+                    glLinkProgram(overlayProg);
+                    GLint linkOk = 0; glGetProgramiv(overlayProg, GL_LINK_STATUS, &linkOk);
+                    if (linkOk) {
+                        uTex = glGetUniformLocation(overlayProg, "uTex");
+                        aPos = 0;
+                        aUV  = 1;
+                    } else {
+                        glDeleteProgram(overlayProg); overlayProg = 0;
+                    }
                 }
+                glGetError(); // сбросить ошибки компиляции
             }
 
-            // Настраиваем state для blit
-            glViewport(0, 0, blitW, blitH);
-            glDisable(GL_DEPTH_TEST);
-            glDisable(GL_CULL_FACE);
-            glDisable(GL_LIGHTING);
-            glDisable(GL_ALPHA_TEST);
-            glEnable(GL_TEXTURE_2D);
+            if (glIsProgram(overlayProg)) {
+                // Сохраняем минимальный ES2 state
+                GLint oldProg   = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &oldProg);
+                GLint oldTex    = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTex);
+                GLint oldVP[4];      glGetIntegerv(GL_VIEWPORT, oldVP);
+                GLboolean blend  = glIsEnabled(GL_BLEND);
+                GLboolean depth  = glIsEnabled(GL_DEPTH_TEST);
+                GLboolean cull   = glIsEnabled(GL_CULL_FACE);
+                // Атрибуты 0 и 1 — сохраняем enabled-флаги
+                GLint a0en = 0, a1en = 0;
+                glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &a0en);
+                glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &a1en);
 
-            // При overlay поверх GPU-кадра — blending включён (прозрачный фон CPU-буфера).
-            // При чистом CPU-blit (GPU draws неактивны) — blending выключен.
-            if (needOverlayOnGpu) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
-            else                   { glDisable(GL_BLEND); }
+                // Реальный размер surface
+                EGLint blitW = g_surfaceWidth, blitH = g_surfaceHeight;
+                {
+                    EGLSurface s = eglGetCurrentSurface(EGL_DRAW);
+                    if (s != EGL_NO_SURFACE) {
+                        eglQuerySurface(eglGetCurrentDisplay(), s, EGL_WIDTH,  &blitW);
+                        eglQuerySurface(eglGetCurrentDisplay(), s, EGL_HEIGHT, &blitH);
+                    }
+                }
 
-            // Ортогональная матрица: NDC [-1,1] через identity (texCoords напрямую)
-            glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
-            glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
-            glMatrixMode(GL_TEXTURE);    glPushMatrix(); glLoadIdentity();
+                glViewport(0, 0, blitW, blitH);
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_CULL_FACE);
+                if (needOverlayOnGpu) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
+                else                   { glDisable(GL_BLEND); }
 
-            // Загружаем CPU-буфер в текстуру (RGBA, 480x320)
-            glBindTexture(GL_TEXTURE_2D, overlayTex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
-                         g_surfaceWidth, g_surfaceHeight, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE,
-                         g_cpuColorBuffer.data());
-            glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+                glUseProgram(overlayProg);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, overlayTex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                             g_surfaceWidth, g_surfaceHeight, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE,
+                             g_cpuColorBuffer.data());
+                glUniform1i(uTex, 0);
 
-            // Full-screen quad: позиции NDC, UV [0,1]
-            // ES1.1: glVertexPointer + glTexCoordPointer (НЕ glVertexAttribPointer — это ES2!)
-            static const float quadVerts[] = {
-                -1.0f,  1.0f,   // top-left     UV(0,0) — y инвертирован: верх текстуры = верх экрана
-                -1.0f, -1.0f,   // bottom-left  UV(0,1)
-                 1.0f,  1.0f,   // top-right    UV(1,0)
-                 1.0f, -1.0f,   // bottom-right UV(1,1)
-            };
-            static const float quadUVs[] = {
-                0.0f, 0.0f,
-                0.0f, 1.0f,
-                1.0f, 0.0f,
-                1.0f, 1.0f,
-            };
-            glEnableClientState(GL_VERTEX_ARRAY);
-            glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-            glDisableClientState(GL_COLOR_ARRAY);
-            glDisableClientState(GL_NORMAL_ARRAY);
-            glVertexPointer  (2, GL_FLOAT, 0, quadVerts);
-            glTexCoordPointer(2, GL_FLOAT, 0, quadUVs);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            glDisableClientState(GL_VERTEX_ARRAY);
-            glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+                // interleaved: x, y, u, v
+                static const float quad[] = {
+                    -1.0f,  1.0f,  0.0f, 0.0f,
+                    -1.0f, -1.0f,  0.0f, 1.0f,
+                     1.0f,  1.0f,  1.0f, 0.0f,
+                     1.0f, -1.0f,  1.0f, 1.0f,
+                };
+                glEnableVertexAttribArray(0);
+                glEnableVertexAttribArray(1);
+                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, quad);
+                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, quad + 2);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-            // Восстанавливаем state
-            glMatrixMode(GL_TEXTURE);    glPopMatrix();
-            glMatrixMode(GL_MODELVIEW);  glPopMatrix();
-            glMatrixMode(GL_PROJECTION); glPopMatrix();
-            glMatrixMode(oldMatMode);
-
-            glBindTexture(GL_TEXTURE_2D, oldTex);
-            glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
-            if (blendEnabled) glEnable(GL_BLEND);    else glDisable(GL_BLEND);
-            if (depthTest)    glEnable(GL_DEPTH_TEST);
-            if (cullFace)     glEnable(GL_CULL_FACE);
-            if (litEnabled)   glEnable(GL_LIGHTING);
-            if (alphaTest)    glEnable(GL_ALPHA_TEST);
-            if (!tex2d)       glDisable(GL_TEXTURE_2D);
+                // Восстанавливаем state
+                if (!a0en) glDisableVertexAttribArray(0);
+                if (!a1en) glDisableVertexAttribArray(1);
+                // Восстанавливаем программу только если она была валидна (не 0)
+                if (oldProg != 0 && glIsProgram(oldProg)) glUseProgram(oldProg);
+                else glUseProgram(0);
+                glBindTexture(GL_TEXTURE_2D, oldTex);
+                glViewport(oldVP[0], oldVP[1], oldVP[2], oldVP[3]);
+                if (blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+                if (depth) glEnable(GL_DEPTH_TEST);
+                if (cull)  glEnable(GL_CULL_FACE);
+                glGetError(); // сбросить любые ошибки от blit
+            }
         }
         // При CPU-rendering — очищаем в чёрный непрозрачный. При GPU overlay — прозрачный (alpha=0).
         uint32_t cpuClearVal = gpuDrawsActive ? 0x00000000u : 0xFF000000u;
