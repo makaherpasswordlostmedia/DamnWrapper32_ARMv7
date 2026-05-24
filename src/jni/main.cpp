@@ -1763,58 +1763,32 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             { EGLSurface s = eglGetCurrentSurface(EGL_DRAW); if (s != EGL_NO_SURFACE) { eglQuerySurface(eglGetCurrentDisplay(), s, EGL_WIDTH, &blitW); eglQuerySurface(eglGetCurrentDisplay(), s, EGL_HEIGHT, &blitH); } }
             glViewport(0, 0, blitW, blitH);
             bool hasOverlay = (g_onScreenDebugOverlay || g_showPerfOverlay);
-            // ФИКС ЧЁРНОГО ЭКРАНА: если GPU draw включён (бит 16), Wolf3D уже нарисовал кадр
-            // через OpenGL. CPU-буфер при этом пустой (чёрный). Загружать его как текстуру нельзя
-            // — он перекроет GPU кадр Wolf3D. Грузим CPU-буфер ТОЛЬКО в CPU-rendering режиме
-            // (бит 16 выключен). В GPU режиме рисуем только overlay через GL_BLEND поверх кадра.
-            bool gpuDrawActive = (g_gpuOffloadMask & 16) != 0;
-            if (!gpuDrawActive) {
-                // CPU-rendering: заливаем весь экран из CPU-буфера
-                glDisable(GL_BLEND);
-                glDisable(GL_DEPTH_TEST);
-                glDisable(GL_CULL_FACE);
-                glUseProgram(overlayProg);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, overlayTex);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
-                glUniform1i(glGetUniformLocation(overlayProg, "tex"), 0);
-                float verts[] = { -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f, 1.0f };
-                glBindBuffer(GL_ARRAY_BUFFER, 0);
-                glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
-                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, verts);
-                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
-                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-                glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
-            } else if (hasOverlay) {
-                // GPU-rendering + overlay: рисуем только overlay-пиксели поверх GPU кадра через BLEND.
-                // CPU-буфер содержит только overlay (остальное прозрачное 0x00000000).
-                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                glDisable(GL_DEPTH_TEST);
-                glDisable(GL_CULL_FACE);
-                glUseProgram(overlayProg);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, overlayTex);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
-                glUniform1i(glGetUniformLocation(overlayProg, "tex"), 0);
-                float verts[] = { -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f, 1.0f };
-                glBindBuffer(GL_ARRAY_BUFFER, 0);
-                glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
-                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, verts);
-                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
-                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-                glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
-            }
+            if (hasOverlay) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
+            else { glDisable(GL_BLEND); }
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glUseProgram(overlayProg);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, overlayTex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
+            glUniform1i(glGetUniformLocation(overlayProg, "tex"), 0);
+            float verts[] = {
+                -1.0f,  1.0f, 0.0f, 0.0f,
+                -1.0f, -1.0f, 0.0f, 1.0f,
+                 1.0f,  1.0f, 1.0f, 0.0f,
+                 1.0f, -1.0f, 1.0f, 1.0f
+            };
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, verts);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
             glUseProgram(oldProg);
             glActiveTexture(oldActiveTex);
             glBindTexture(GL_TEXTURE_2D, oldTex);
             glBindBuffer(GL_ARRAY_BUFFER, oldArrayBuf);
-            // ФИКС: восстанавливаем viewport игры, но если он был 0x0 (начальный мусор) —
-            // выставляем реальный размер поверхности чтобы Wolf3D не рисовал в 0x0.
-            if (oldViewport[2] > 0 && oldViewport[3] > 0) {
-                glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
-            } else {
-                glViewport(0, 0, blitW, blitH);
-            }
+            glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
             if (blendEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
             if (depthTest) glEnable(GL_DEPTH_TEST);
             if (cullFace) glEnable(GL_CULL_FACE);
@@ -4967,7 +4941,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                           std::to_string(target_addr) + " (probe_isa=0x" + std::to_string(probe_isa) +
                           ") — игнорируем (float-значение или мусор)");
             }
-            uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; return (uint64_t)(uintptr_t)inst;
+            uint32_t* inst = (uint32_t*)calloc(1, 64); inst[0] = (uint32_t)self; if (target_ok) { inst[1] = (uint32_t)(uintptr_t)a1; inst[2] = (uint32_t)(uintptr_t)a2; } return (uint64_t)(uintptr_t)inst;
         }
 
         // --- HLE CLASS METHODS FIX ---
@@ -6684,21 +6658,23 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             // offset'ам (wolf3d мог записать target сам перед передачей нам).
             if (!g_displayLinkTarget && a1) {
                 uint32_t* dl = (uint32_t*)a1;
-                // Проверяем offsets 4, 8, 12 — ищем первый похожий на heap-pointer (>= 0x70000000)
-                for (int i = 1; i <= 3; i++) {
-                    uintptr_t candidate = (uintptr_t)dl[i];
-                    uint32_t probe = 0;
-                    if (candidate >= 0x70000000u && candidate < 0xFF000000u &&
-                        SafeRead32(candidate, &probe) && probe > 0x1000u) {
-                        // Выглядит как валидный ObjC-объект — это может быть target
-                        g_displayLinkTarget = (void*)candidate;
-                        LogToJava("[setDisplayLink] Извлекли target из dl[" + std::to_string(i) + "]=0x" +
-                                  std::to_string(candidate));
-                        break;
-                    }
+                // offset 1 (_target) — мы сами записали его в displayLinkWithTarget:selector:
+                uintptr_t candidate = (uintptr_t)dl[1];
+                uint32_t probe = 0;
+                if (candidate >= 0x70000000u && candidate < 0xFF000000u &&
+                    SafeRead32(candidate, &probe) && probe > 0x1000u) {
+                    g_displayLinkTarget = (void*)candidate;
+                    g_displayLinkSelector = (const char*)(uintptr_t)dl[2];
+                    LogToJava("[setDisplayLink] Извлекли target из dl[1]=0x" +
+                              std::to_string(candidate));
                 }
             }
-            return 0;
+            // Разрешаем нативный setDisplayLink: — Wolf3D должен сохранить EAGLView
+            // в своём ivar (self->eaglView = ...). Без этого drawFrame не вызывает
+            // setFramebuffer/presentFramebuffer и GL-рендер не происходит.
+            // CADisplayLink instance уже содержит валидные _target/_selector (fix выше),
+            // поэтому нативный код не прочитает float 0x43A00000 как target.
+            // Нативный IMP выполнится через FindMethodIMP ниже.
         }
 
         // ФИКС ЧЁРНОГО ЭКРАНА: Wolf3D вызывает [EAGLView presentFramebuffer] для показа кадра.
