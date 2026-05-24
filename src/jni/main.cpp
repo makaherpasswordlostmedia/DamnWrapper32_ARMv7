@@ -1749,16 +1749,9 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             GLboolean blendEnabled = glIsEnabled(GL_BLEND);
             GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
             GLboolean cullFace = glIsEnabled(GL_CULL_FACE);
-            // ФИКС МАЛЕНЬКОГО КАДРА: сохраняем текущий viewport и выставляем полный размер surface.
-            // Без этого blit происходит в игровом viewport (480x320) внутри surface (1620x1080).
-            GLint oldViewport[4];
-            glGetIntegerv(GL_VIEWPORT, oldViewport);
+            GLint oldViewport[4]; glGetIntegerv(GL_VIEWPORT, oldViewport);
             EGLint blitW = g_surfaceWidth, blitH = g_surfaceHeight;
-            EGLSurface blitSurf = eglGetCurrentSurface(EGL_DRAW);
-            if (blitSurf != EGL_NO_SURFACE) {
-                eglQuerySurface(eglGetCurrentDisplay(), blitSurf, EGL_WIDTH, &blitW);
-                eglQuerySurface(eglGetCurrentDisplay(), blitSurf, EGL_HEIGHT, &blitH);
-            }
+            { EGLSurface s = eglGetCurrentSurface(EGL_DRAW); if (s != EGL_NO_SURFACE) { eglQuerySurface(eglGetCurrentDisplay(), s, EGL_WIDTH, &blitW); eglQuerySurface(eglGetCurrentDisplay(), s, EGL_HEIGHT, &blitH); } }
             glViewport(0, 0, blitW, blitH);
             bool hasOverlay = (g_onScreenDebugOverlay || g_showPerfOverlay);
             if (hasOverlay) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
@@ -12581,6 +12574,25 @@ void LoadMachO(const std::string& bundlePath) {
 
 void* NativeExecutionThread(void* arg) {
     LogToJava("NativeExecutionThread: Поток запущен, настраиваем EGL...");
+
+    // ФИКС EGL_BAD_SURFACE: создаём WindowSurface здесь, на том же потоке что и eglMakeCurrent.
+    // На многих Android драйверах (PowerVR, Adreno) surface инвалидируется если создана
+    // на Java-потоке (onSurfaceCreated) а привязана на game-потоке.
+    if ((g_gpuOffloadMask & 1) && g_eglSurface == EGL_NO_SURFACE && g_nativeWindow && g_eglConfig) {
+        g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
+        EGLint surfErr = eglGetError();
+        if (g_eglSurface == EGL_NO_SURFACE) {
+            char buf[128]; snprintf(buf, sizeof(buf), "NativeExecutionThread: ОШИБКА eglCreateWindowSurface: 0x%X", surfErr);
+            LogToJava(buf);
+        } else {
+            EGLint realW = 0, realH = 0;
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &realW);
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &realH);
+            char buf[128]; snprintf(buf, sizeof(buf), "NativeExecutionThread: WindowSurface создана: %dx%d", realW, realH);
+            LogToJava(buf);
+        }
+    }
+
     if (!eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext)) { LogToJava("КРИТИЧЕСКАЯ ОШИБКА: eglMakeCurrent не сработал!"); return nullptr; }
     
     // --- MEGA DEBUG: ПРОВЕРКА СОСТОЯНИЯ EGL СРАЗУ ПОСЛЕ ИНИЦИАЛИЗАЦИИ ---
@@ -14018,9 +14030,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     g_gameThreadStarted = true;
 
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
-    // ФИКС EGL_BAD_NATIVE_WINDOW: ANativeWindow_fromSurface даёт refcount=1.
-    // Без явного acquire Java SurfaceView может освободить буфер до первого eglSwapBuffers.
-    ANativeWindow_acquire(window);
+    ANativeWindow_acquire(window); // удерживаем refcount пока не вызовем release
     g_nativeWindow = window;
 
     // ФИКС ЧЁРНОГО ЭКРАНА: НЕ вызываем ANativeWindow_setBuffersGeometry до eglCreateWindowSurface.
@@ -14059,20 +14069,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     }
 
     if (g_gpuOffloadMask & 1) {
-        g_eglSurface = eglCreateWindowSurface(g_eglDisplay, config, g_nativeWindow, nullptr);
-        EGLint surfErr = eglGetError();
-        if (g_eglSurface == EGL_NO_SURFACE) {
-            char errBuf[128];
-            snprintf(errBuf, sizeof(errBuf), "КРИТИЧЕСКАЯ ОШИБКА: eglCreateWindowSurface вернул EGL_NO_SURFACE! eglError=0x%X", surfErr);
-            LogToJava(errBuf);
-        } else {
-            EGLint realW = 0, realH = 0;
-            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &realW);
-            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &realH);
-            char surfBuf[128];
-            snprintf(surfBuf, sizeof(surfBuf), "onSurfaceCreated: Создана WindowSurface для прямого GPU-рендера. Реальный размер: %dx%d", realW, realH);
-            LogToJava(surfBuf);
-        }
+        // ФИКС EGL_BAD_SURFACE: eglCreateWindowSurface должна вызываться на том же потоке
+        // что и eglMakeCurrent. Если создать на Java-потоке (onSurfaceCreated) и привязать
+        // на game-потоке (NativeExecutionThread) — Android инвалидирует surface через ~1-2 сек.
+        // Откладываем создание WindowSurface до NativeExecutionThread (g_eglSurface = NO_SURFACE).
+        g_eglSurface = EGL_NO_SURFACE;
+        LogToJava("onSurfaceCreated: WindowSurface будет создана в NativeExecutionThread (same-thread fix).");
     } else {
         // ФИКС СПЛЮСНУТОГО ЭКРАНА: Создаем PBuffer в размер экрана игры, а не 64x64
         const EGLint pbufferAttribs[] = { EGL_WIDTH, g_surfaceWidth, EGL_HEIGHT, g_surfaceHeight, EGL_NONE };
