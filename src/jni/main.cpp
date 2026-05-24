@@ -148,6 +148,7 @@ int g_esModeOption = 2;
 // Нужно чтобы не вызывать awakeFromNib повторно из HLE (wolf3dViewController сохраняет
 // CGRect frame в ivar, и при повторном awakeFromNib читает этот float как id-объект → crash).
 std::unordered_set<uintptr_t> g_awakeFromNibCalled;
+std::unordered_set<uintptr_t> g_vcNativeInitDone; // wolf3dViewController экземпляры, у которых нативный initWithNibName: уже прошёл
 
 // Variables for FPS calculation
 uint64_t g_fpsLastTimeMs = 0;
@@ -6461,6 +6462,44 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
 
         if (strcmp(op, "class") == 0) return (uint64_t)isa;
+
+        // ФИКС: Нативный initWithNibName:bundle: wolf3dViewController при повторном вызове
+        // (portrait→landscape смена) читает CGRect.height (0x43A00000 = 320.0f) как id
+        // и вызывает [320.0f drawFrame] → SIGSEGV внутри strcmp в Impl_objc_msgSend.
+        //
+        // Защита двухуровневая:
+        // 1. Per-instance: если этот конкретный экземпляр уже прошёл нативный init — пропустить.
+        // 2. Global: если рендер уже запущен (g_renderingStarted) — нативный init второго VC
+        //    гарантированно вызовет краш (race с EGL-контекстом на exec-треде). Пропускаем,
+        //    сразу вызываем только viewDidLoad/awakeFromNib через наш безопасный путь.
+        if (strcmp(op, "initWithNibName:bundle:") == 0) {
+            bool already_done = g_vcNativeInitDone.count((uintptr_t)self) > 0;
+            bool render_running = g_renderingStarted;
+            if (already_done || render_running) {
+                LogToJava("HLE: [" + cName + " initWithNibName:bundle:] на 0x" +
+                          std::to_string((uintptr_t)self) +
+                          (already_done ? " — повторный вызов" : " — рендер уже запущен") +
+                          ", пропускаем нативный IMP (защита от CGRect→id краша)");
+                // Если view ещё не установлен — вернём уже существующий из первого VC
+                if (g_viewControllersViews.find(self) == g_viewControllersViews.end()) {
+                    // Копируем view от первого инициализированного VC
+                    for (auto& pair : g_viewControllersViews) {
+                        if (pair.second && (uintptr_t)pair.second > 0x1000) {
+                            g_viewControllersViews[self] = pair.second;
+                            LogToJava("HLE: [initWithNibName:] скопировали view 0x" +
+                                      std::to_string((uintptr_t)pair.second) + " от первого VC");
+                            break;
+                        }
+                    }
+                }
+                g_vcNativeInitDone.insert((uintptr_t)self);
+                return (uint64_t)(uintptr_t)self;
+            }
+            // Первый вызов, рендер ещё не запущен: помечаем и разрешаем нативный IMP выполниться.
+            g_vcNativeInitDone.insert((uintptr_t)self);
+            LogToJava("HLE: [" + cName + " initWithNibName:bundle:] первый вызов на 0x" +
+                      std::to_string((uintptr_t)self) + " — передаём в нативный IMP");
+        }
 
         // Перехватываем setDisplayLink: ПОЛНОСТЬЮ — нативный IMP не вызываем.
         //
