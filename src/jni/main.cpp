@@ -1545,6 +1545,8 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         bool needRebind = (curCtx != g_eglContext || curSurf != g_eglSurface);
         // Если surface была сброшена onSurfaceCreated — пересоздаём прямо здесь
         if (g_eglSurface == EGL_NO_SURFACE && g_nativeWindow && g_eglConfig) {
+            // ФИКС EGL_BAD_MATCH: выставляем формат буфера перед пересозданием
+            { EGLint fmt = 0; eglGetConfigAttrib(g_eglDisplay, g_eglConfig, EGL_NATIVE_VISUAL_ID, &fmt); ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt ? fmt : 1); }
             g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
             SyncLog("[EGL] g_eglSurface пересоздана превентивно: " +
                     std::to_string(g_eglSurface != EGL_NO_SURFACE ? 1 : 0));
@@ -1834,6 +1836,8 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             g_eglSurface = EGL_NO_SURFACE;
         }
         // Создаём новую WindowSurface с тем же ANativeWindow и config
+        // ФИКС EGL_BAD_MATCH: выставляем формат буфера перед пересозданием
+        { EGLint fmt = 0; eglGetConfigAttrib(g_eglDisplay, g_eglConfig, EGL_NATIVE_VISUAL_ID, &fmt); ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt ? fmt : 1); }
         g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
         if (g_eglSurface != EGL_NO_SURFACE) {
             eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
@@ -12627,6 +12631,19 @@ void* NativeExecutionThread(void* arg) {
     // На многих Android драйверах (PowerVR, Adreno) surface инвалидируется если создана
     // на Java-потоке (onSurfaceCreated) а привязана на game-потоке.
     if ((g_gpuOffloadMask & 1) && g_eglSurface == EGL_NO_SURFACE && g_nativeWindow && g_eglConfig) {
+        // ФИКС EGL_BAD_MATCH (PowerVR SGX): eglSwapBuffers падает если формат ANativeWindow
+        // не совпадает с native visual ID конфига. Обязательно выставляем формат ДО создания surface.
+        EGLint nativeVisualId = 0;
+        eglGetConfigAttrib(g_eglDisplay, g_eglConfig, EGL_NATIVE_VISUAL_ID, &nativeVisualId);
+        if (nativeVisualId != 0) {
+            ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, nativeVisualId);
+            char buf2[128]; snprintf(buf2, sizeof(buf2), "NativeExecutionThread: ANativeWindow format set to %d (EGL_NATIVE_VISUAL_ID)", nativeVisualId);
+            LogToJava(buf2);
+        } else {
+            // Fallback: WINDOW_FORMAT_RGBA_8888 = 1
+            ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, 1);
+            LogToJava("NativeExecutionThread: ANativeWindow format set to 1 (RGBA_8888 fallback)");
+        }
         g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
         EGLint surfErr = eglGetError();
         if (g_eglSurface == EGL_NO_SURFACE) {
