@@ -1865,6 +1865,13 @@ extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
                 eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &realW);
                 eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &realH);
             }
+            // Если запрос реального размера успешен — сбрасываем флаг «фейкового» viewport:
+            // игра получает правильный viewport, экран рендерится корректно.
+            if (realW > 0 && realH > 0) {
+                g_isFakeViewport = false;
+                g_gameViewportW = realW;
+                g_gameViewportH = realH;
+            }
             glViewport(0, 0, realW, realH); 
         } else {
             glViewport(x, y, width, height); 
@@ -11375,10 +11382,19 @@ static uint32_t __attribute__((pcs("aapcs"))) hle_presentFramebuffer_replacement
 static void __attribute__((pcs("aapcs"))) hle_setFramebuffer_replacement(void* self, void* _cmd) {
     // Биндим FBO 0 — стандартный default framebuffer EGL WindowSurface
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    // ФИКС ЧЁРНОГО ЭКРАНА: первый glViewport(0,0,0,0) вызывался до инициализации surface.
-    // Принудительно выставляем правильный viewport при каждом setFramebuffer.
-    if (g_surfaceWidth > 0 && g_surfaceHeight > 0) {
-        glViewport(0, 0, g_surfaceWidth, g_surfaceHeight);
+    // ФИКС ЧЁРНОГО ЭКРАНА: запрашиваем РЕАЛЬНЫЙ размер EGL-поверхности для viewport,
+    // а не логическое g_surfaceWidth/Height (которое = 480x320, тогда как поверхность
+    // может быть нативного разрешения устройства после исправления setBuffersGeometry).
+    GLsizei vpW = g_surfaceWidth, vpH = g_surfaceHeight; // fallback
+    EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+    if (surf != EGL_NO_SURFACE) {
+        EGLint ew = 0, eh = 0;
+        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &ew);
+        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &eh);
+        if (ew > 0 && eh > 0) { vpW = ew; vpH = eh; }
+    }
+    if (vpW > 0 && vpH > 0) {
+        glViewport(0, 0, vpW, vpH);
     }
 }
 
@@ -13905,9 +13921,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
 
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
     g_nativeWindow = window;
-    
-    ANativeWindow_setBuffersGeometry(g_nativeWindow, g_surfaceWidth, g_surfaceHeight, WINDOW_FORMAT_RGBA_8888);
-    
+
+    // ФИКС ЧЁРНОГО ЭКРАНА: НЕ вызываем ANativeWindow_setBuffersGeometry до eglCreateWindowSurface.
+    // Изменение геометрии окна до создания EGL-поверхности приводит к тому, что
+    // eglCreateWindowSurface молча возвращает EGL_NO_SURFACE на многих драйверах (Adreno, Mali):
+    // драйвер отклоняет уже перестроенный буфер из-за несоответствия формата/размера EGL-конфигу.
+    // Геометрию выставляем после успешного создания поверхности.
+
     LogToJava("Render: Инициализация ANativeWindow для рендера! EGL переведен в режим PBuffer (Offscreen).");
     g_cpuColorBuffer.resize(g_surfaceWidth * g_surfaceHeight, 0xFF000000);
     
@@ -13938,7 +13958,22 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
 
     if (g_gpuOffloadMask & 1) {
         g_eglSurface = eglCreateWindowSurface(g_eglDisplay, config, g_nativeWindow, nullptr);
-        LogToJava("onSurfaceCreated: Создана WindowSurface для прямого GPU-рендера.");
+        EGLint surfErr = eglGetError();
+        if (g_eglSurface == EGL_NO_SURFACE) {
+            char errBuf[128];
+            snprintf(errBuf, sizeof(errBuf), "КРИТИЧЕСКАЯ ОШИБКА: eglCreateWindowSurface вернул EGL_NO_SURFACE! eglError=0x%X", surfErr);
+            LogToJava(errBuf);
+        } else {
+            // Теперь безопасно выставляем геометрию буферов: EGL-поверхность уже захватила окно,
+            // и переконфигурация ANativeWindow не сломает дескриптор поверхности.
+            ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, WINDOW_FORMAT_RGBA_8888);
+            EGLint realW = 0, realH = 0;
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &realW);
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &realH);
+            char surfBuf[128];
+            snprintf(surfBuf, sizeof(surfBuf), "onSurfaceCreated: Создана WindowSurface для прямого GPU-рендера. Реальный размер: %dx%d", realW, realH);
+            LogToJava(surfBuf);
+        }
     } else {
         // ФИКС СПЛЮСНУТОГО ЭКРАНА: Создаем PBuffer в размер экрана игры, а не 64x64
         const EGLint pbufferAttribs[] = { EGL_WIDTH, g_surfaceWidth, EGL_HEIGHT, g_surfaceHeight, EGL_NONE };
