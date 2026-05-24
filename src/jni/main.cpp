@@ -1485,6 +1485,11 @@ extern "C" void MegaDebug_glClear(GLbitfield mask) {
         SyncLog("[RENDER] Выполняем GPU очистку буфера...");
         
         static bool s_viewport_forced = false;
+        // ФИКС: Сбрасываем флаг при пересоздании surface (g_eglSurface мог измениться).
+        // Используем статический дескриптор предыдущей surface для обнаружения смены.
+        static EGLSurface s_last_surf = EGL_NO_SURFACE;
+        EGLSurface cur_surf = eglGetCurrentSurface(EGL_DRAW);
+        if (cur_surf != s_last_surf) { s_viewport_forced = false; s_last_surf = cur_surf; }
         if (!s_viewport_forced) {
             EGLint realW = g_surfaceWidth, realH = g_surfaceHeight;
             EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
@@ -1971,6 +1976,11 @@ extern "C" void Stub_glVertexAttrib4f(GLuint index, GLfloat v0, GLfloat v1, GLfl
         g_vertexAttribs[index].constantValue[2] = v2;
         g_vertexAttribs[index].constantValue[3] = v3;
     }
+    // ФИКС ЧЁРНОГО ЭКРАНА ES1.1: glColor4f/glColor4ub → wrap_glColor4f → Stub_glVertexAttrib4f.
+    // При disabled color array (Wolf3D не использует GL_COLOR_ARRAY) GLES2 читает constant value
+    // атрибута — но только если реальный glVertexAttrib4f был вызван на GPU.
+    // Без этого вызова attrib 1 остаётся неинициализированным → чёрные треугольники.
+    glVertexAttrib4f(index, v0, v1, v2, v3);
 }
 
 extern "C" void Stub_glVertexAttrib4fv(GLuint index, const GLfloat *v) {
@@ -1980,6 +1990,7 @@ extern "C" void Stub_glVertexAttrib4fv(GLuint index, const GLfloat *v) {
         g_vertexAttribs[index].constantValue[2] = v[2];
         g_vertexAttribs[index].constantValue[3] = v[3];
     }
+    if (v) glVertexAttrib4fv(index, v);
 }
 
 extern "C" void Stub_glGetVertexAttribiv(GLuint index, GLenum pname, GLint *params) {
@@ -2402,8 +2413,12 @@ extern "C" void Stub_glTexImage2D(GLenum target, GLint level, GLint internalform
             safe_pixels = converted_buf.data();
         }
     }
-    if (g_gpuOffloadMask & 8) glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
-    else if (!(g_gpuOffloadMask & 2)) {
+    if (g_gpuOffloadMask & 8) {
+        // ФИКС: Используем нормализованные hw_format/hw_internalformat и safe_pixels
+        // (как в GPU default path ниже), а не сырые format/type/pixels.
+        // Передача internalformat=1 или BGRA_EXT напрямую в GLES2 крашит MTK-драйвер.
+        glTexImage2D(target, level, hw_internalformat, width, height, border, hw_format, type, safe_pixels);
+    } else if (!(g_gpuOffloadMask & 2)) {
         // GPU default path (mask=0): загружаем текстуру в реальный GPU.
         // Используем нормализованный hw_format и safe_pixels (уже подготовлены выше).
         glTexImage2D(target, level, hw_internalformat, width, height, border, hw_format, type, safe_pixels);
@@ -2497,7 +2512,23 @@ extern "C" void Stub_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, 
             }
         }
     }
-    if (g_gpuOffloadMask & 8) glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+    // ФИКС: Нормализуем BGRA_EXT → RGBA для GPU (как в Stub_glTexImage2D)
+    GLenum hw_fmt = format;
+    std::vector<uint8_t> sub_converted;
+    const GLvoid* sub_pixels = pixels;
+    if (format == 0x80E1 && type == GL_UNSIGNED_BYTE && pixels) { // GL_BGRA_EXT → GL_RGBA
+        hw_fmt = GL_RGBA;
+        size_t totalBytes = (size_t)width * height * 4;
+        sub_converted.resize(totalBytes);
+        const uint8_t* src = (const uint8_t*)pixels;
+        uint8_t* dst = sub_converted.data();
+        for (size_t i = 0; i < (size_t)width * height; i++) {
+            dst[i*4+0] = src[i*4+2]; dst[i*4+1] = src[i*4+1];
+            dst[i*4+2] = src[i*4+0]; dst[i*4+3] = src[i*4+3];
+        }
+        sub_pixels = sub_converted.data();
+    }
+    if (g_gpuOffloadMask & 8) glTexSubImage2D(target, level, xoffset, yoffset, width, height, hw_fmt, type, sub_pixels);
 }
 
 extern "C" void Stub_glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const GLvoid *data) {
@@ -3442,9 +3473,26 @@ static void UploadES1Uniforms() {
 
     // Включаем/выключаем нужные attrib arrays согласно ES1 состоянию
     // attrib 0 = position, 1 = color, 2 = texcoord
-    if (g_vertexAttribs[0].enabled) glEnableVertexAttribArray(0); else glDisableVertexAttribArray(0);
-    if (g_vertexAttribs[1].enabled) glEnableVertexAttribArray(1); else glDisableVertexAttribArray(1);
-    if (g_vertexAttribs[2].enabled) glEnableVertexAttribArray(2); else glDisableVertexAttribArray(2);
+    if (g_vertexAttribs[0].enabled) {
+        glEnableVertexAttribArray(0);
+    } else {
+        glDisableVertexAttribArray(0);
+        glVertexAttrib4fv(0, g_vertexAttribs[0].constantValue);
+    }
+    if (g_vertexAttribs[1].enabled) {
+        glEnableVertexAttribArray(1);
+    } else {
+        // ФИКС: При disabled GL_COLOR_ARRAY игра использует glColor4f/glColor4ub как constant.
+        // Без передачи constant value attrib 1 = undefined → чёрный экран.
+        glDisableVertexAttribArray(1);
+        glVertexAttrib4fv(1, g_vertexAttribs[1].constantValue);
+    }
+    if (g_vertexAttribs[2].enabled) {
+        glEnableVertexAttribArray(2);
+    } else {
+        glDisableVertexAttribArray(2);
+        glVertexAttrib4fv(2, g_vertexAttribs[2].constantValue);
+    }
 
     // MVP = Projection * Modelview
     if (g_es1uMVP >= 0) {
@@ -12696,9 +12744,11 @@ void main() {
                 g_es1uFogColor   = glGetUniformLocation(g_es1FixedProg, "u_fogColor");
                 g_es1uFogStart   = glGetUniformLocation(g_es1FixedProg, "u_fogStart");
                 g_es1uFogEnd     = glGetUniformLocation(g_es1FixedProg, "u_fogEnd");
-                g_es1uColor      = glGetUniformLocation(g_es1FixedProg, "a_color");
                 g_es1uSampler    = glGetUniformLocation(g_es1FixedProg, "u_sampler");
-                // Устанавливаем дефолтный белый цвет для аттриба color
+                // Примечание: a_color — это attrib (location=1), не uniform.
+                // g_es1uColor не используется в UploadES1Uniforms, constant color
+                // устанавливается через glVertexAttrib4fv(1, ...).
+                g_es1uColor      = 1; // attrib location, зафиксированная через glBindAttribLocation
                 glUseProgram(g_es1FixedProg);
                 glVertexAttrib4f(1, 1.0f, 1.0f, 1.0f, 1.0f); // default white color
                 glUniform1i(g_es1uSampler, 0);
