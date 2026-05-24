@@ -1749,6 +1749,17 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             GLboolean blendEnabled = glIsEnabled(GL_BLEND);
             GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
             GLboolean cullFace = glIsEnabled(GL_CULL_FACE);
+            // ФИКС МАЛЕНЬКОГО КАДРА: сохраняем текущий viewport и выставляем полный размер surface.
+            // Без этого blit происходит в игровом viewport (480x320) внутри surface (1620x1080).
+            GLint oldViewport[4];
+            glGetIntegerv(GL_VIEWPORT, oldViewport);
+            EGLint blitW = g_surfaceWidth, blitH = g_surfaceHeight;
+            EGLSurface blitSurf = eglGetCurrentSurface(EGL_DRAW);
+            if (blitSurf != EGL_NO_SURFACE) {
+                eglQuerySurface(eglGetCurrentDisplay(), blitSurf, EGL_WIDTH, &blitW);
+                eglQuerySurface(eglGetCurrentDisplay(), blitSurf, EGL_HEIGHT, &blitH);
+            }
+            glViewport(0, 0, blitW, blitH);
             bool hasOverlay = (g_onScreenDebugOverlay || g_showPerfOverlay);
             if (hasOverlay) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
             else { glDisable(GL_BLEND); }
@@ -1775,6 +1786,7 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             glActiveTexture(oldActiveTex);
             glBindTexture(GL_TEXTURE_2D, oldTex);
             glBindBuffer(GL_ARRAY_BUFFER, oldArrayBuf);
+            glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
             if (blendEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
             if (depthTest) glEnable(GL_DEPTH_TEST);
             if (cullFace) glEnable(GL_CULL_FACE);
@@ -14006,6 +14018,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     g_gameThreadStarted = true;
 
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+    // ФИКС EGL_BAD_NATIVE_WINDOW: ANativeWindow_fromSurface даёт refcount=1.
+    // Без явного acquire Java SurfaceView может освободить буфер до первого eglSwapBuffers.
+    ANativeWindow_acquire(window);
     g_nativeWindow = window;
 
     // ФИКС ЧЁРНОГО ЭКРАНА: НЕ вызываем ANativeWindow_setBuffersGeometry до eglCreateWindowSurface.
