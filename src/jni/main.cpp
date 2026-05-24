@@ -1763,32 +1763,58 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
             { EGLSurface s = eglGetCurrentSurface(EGL_DRAW); if (s != EGL_NO_SURFACE) { eglQuerySurface(eglGetCurrentDisplay(), s, EGL_WIDTH, &blitW); eglQuerySurface(eglGetCurrentDisplay(), s, EGL_HEIGHT, &blitH); } }
             glViewport(0, 0, blitW, blitH);
             bool hasOverlay = (g_onScreenDebugOverlay || g_showPerfOverlay);
-            if (hasOverlay) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); }
-            else { glDisable(GL_BLEND); }
-            glDisable(GL_DEPTH_TEST);
-            glDisable(GL_CULL_FACE);
-            glUseProgram(overlayProg);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, overlayTex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
-            glUniform1i(glGetUniformLocation(overlayProg, "tex"), 0);
-            float verts[] = {
-                -1.0f,  1.0f, 0.0f, 0.0f,
-                -1.0f, -1.0f, 0.0f, 1.0f,
-                 1.0f,  1.0f, 1.0f, 0.0f,
-                 1.0f, -1.0f, 1.0f, 1.0f
-            };
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
-            glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, verts);
-            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+            // ФИКС ЧЁРНОГО ЭКРАНА: если GPU draw включён (бит 16), Wolf3D уже нарисовал кадр
+            // через OpenGL. CPU-буфер при этом пустой (чёрный). Загружать его как текстуру нельзя
+            // — он перекроет GPU кадр Wolf3D. Грузим CPU-буфер ТОЛЬКО в CPU-rendering режиме
+            // (бит 16 выключен). В GPU режиме рисуем только overlay через GL_BLEND поверх кадра.
+            bool gpuDrawActive = (g_gpuOffloadMask & 16) != 0;
+            if (!gpuDrawActive) {
+                // CPU-rendering: заливаем весь экран из CPU-буфера
+                glDisable(GL_BLEND);
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_CULL_FACE);
+                glUseProgram(overlayProg);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, overlayTex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
+                glUniform1i(glGetUniformLocation(overlayProg, "tex"), 0);
+                float verts[] = { -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f, 1.0f };
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+                glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
+                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, verts);
+                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+            } else if (hasOverlay) {
+                // GPU-rendering + overlay: рисуем только overlay-пиксели поверх GPU кадра через BLEND.
+                // CPU-буфер содержит только overlay (остальное прозрачное 0x00000000).
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_CULL_FACE);
+                glUseProgram(overlayProg);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, overlayTex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_surfaceWidth, g_surfaceHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuColorBuffer.data());
+                glUniform1i(glGetUniformLocation(overlayProg, "tex"), 0);
+                float verts[] = { -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f, 1.0f };
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+                glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
+                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, verts);
+                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, verts + 2);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+            }
             glUseProgram(oldProg);
             glActiveTexture(oldActiveTex);
             glBindTexture(GL_TEXTURE_2D, oldTex);
             glBindBuffer(GL_ARRAY_BUFFER, oldArrayBuf);
-            glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+            // ФИКС: восстанавливаем viewport игры, но если он был 0x0 (начальный мусор) —
+            // выставляем реальный размер поверхности чтобы Wolf3D не рисовал в 0x0.
+            if (oldViewport[2] > 0 && oldViewport[3] > 0) {
+                glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+            } else {
+                glViewport(0, 0, blitW, blitH);
+            }
             if (blendEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
             if (depthTest) glEnable(GL_DEPTH_TEST);
             if (cullFace) glEnable(GL_CULL_FACE);
