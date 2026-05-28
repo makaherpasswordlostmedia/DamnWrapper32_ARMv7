@@ -2,6 +2,10 @@ DamnWrapper32 (ARMv7) [by XaView]
 
 -IOS emulator (wrapper) that currently support these games:
 
+Wolfenstein 3D iPAD(WIP)
+Compatibility: Only broken screen with loop code(Game request OPENGLES 1, i'm currently working on support)
+Perfomance: NO.
+---
 Action Buggy (All versions)
 Compatability: Fully working but saves not tested, idk.
 Perfomance: 25-30 fps on Snapdragon 7 Gen 2+
