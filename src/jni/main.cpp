@@ -198,6 +198,17 @@ struct UITextCache {
 // --- RENDERER STATE ---
 ANativeWindow* g_nativeWindow = nullptr;
 int g_workingWindowFormat = 0; // Рабочий формат ANativeWindow (определяется автоматически при первом успешном swap)
+
+// --- СИНХРОНИЗАЦИЯ ПЕРЕСОЗДАНИЯ SURFACE (Java-поток <-> game-поток) ---
+// Проблема: eglDestroySurface/eglCreateWindowSurface на ANativeWindow требуют
+// что контекст был ОТВЯЗАН (eglMakeCurrent NO_SURFACE) на том же потоке где он привязан.
+// Java-поток (onSurfaceCreated) не может этого сделать — он не владеет контекстом.
+// Решение: Java-поток выставляет флаг и ждёт; game-поток сам делает всё EGL-операции.
+pthread_mutex_t g_surfaceRecreateMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  g_surfaceRecreateCond  = PTHREAD_COND_INITIALIZER;
+// 0 = нет запроса, 1 = Java запросил пересоздание (ждёт), 2 = game-поток завершил
+volatile int    g_surfaceRecreateState = 0;
+ANativeWindow*  g_pendingNativeWindow  = nullptr; // новый window от onSurfaceCreated
 std::vector<uint32_t> g_cpuColorBuffer;
 std::vector<float> g_cpuDepthBuffer;
 float g_cpuClearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -1537,33 +1548,63 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         DumpGLState("BEFORE eglSwapBuffers");
     }
 
+    // ОБРАБОТКА ЗАПРОСА ПЕРЕСОЗДАНИЯ SURFACE от Java-потока (onSurfaceCreated повторный).
+    // Java-поток выставил g_surfaceRecreateState=1 и ждёт на condvar.
+    // Мы на game-потоке — только мы можем безопасно вызвать eglMakeCurrent(NO) и eglDestroySurface,
+    // т.к. именно на этом потоке был вызван eglMakeCurrent при инициализации (требование PowerVR).
+    if (g_surfaceRecreateState == 1) {
+        SyncLog("[EGL] Получен запрос пересоздания surface от Java-потока — обрабатываем на game-потоке...");
+        // 1. Отвязываем контекст (ОБЯЗАТЕЛЬНО на том же потоке где он был привязан)
+        eglMakeCurrent(g_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        // 2. Уничтожаем старую surface
+        if (g_eglSurface != EGL_NO_SURFACE) {
+            eglDestroySurface(g_eglDisplay, g_eglSurface);
+            g_eglSurface = EGL_NO_SURFACE;
+            eglGetError();
+        }
+        // 3. Принимаем новый ANativeWindow от Java-потока
+        pthread_mutex_lock(&g_surfaceRecreateMutex);
+        ANativeWindow* newWin = g_pendingNativeWindow;
+        g_pendingNativeWindow = nullptr;
+        pthread_mutex_unlock(&g_surfaceRecreateMutex);
+
+        if (newWin) {
+            if (g_nativeWindow) ANativeWindow_release(g_nativeWindow);
+            g_nativeWindow = newWin; // acquire уже был вызван в onSurfaceCreated
+        }
+
+        // 4. Создаём новую surface (на game-потоке — правильно для PowerVR)
+        eglGetError();
+        g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
+        EGLint createErr = eglGetError();
+        if (g_eglSurface != EGL_NO_SURFACE) {
+            eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
+            eglGetError();
+            SyncLog("[EGL] Surface пересоздана по запросу Java-потока — OK");
+        } else {
+            SyncLog("[EGL] ОШИБКА пересоздания surface по запросу Java: err=0x" + std::to_string(createErr));
+        }
+
+        // 5. Сигнализируем Java-потоку что готово
+        pthread_mutex_lock(&g_surfaceRecreateMutex);
+        g_surfaceRecreateState = 2;
+        pthread_cond_signal(&g_surfaceRecreateCond);
+        pthread_mutex_unlock(&g_surfaceRecreateMutex);
+
+        // Если surface не создалась — нечего свапать, выходим
+        if (g_eglSurface == EGL_NO_SURFACE) return EGL_FALSE;
+    }
+
     // ФИКС EGL_BAD_SURFACE: перед каждым swap проверяем, что контекст привязан
-    // именно к текущему g_eglSurface на этом потоке. После пересоздания surface
-    // (onSurfaceCreated повторный) старый дескриптор невалиден — нужно rebind.
+    // именно к текущему g_eglSurface на этом потоке.
     {
         EGLContext curCtx  = eglGetCurrentContext();
         EGLSurface curSurf = eglGetCurrentSurface(EGL_DRAW);
         bool needRebind = (curCtx != g_eglContext || curSurf != g_eglSurface);
-        // Если surface была сброшена onSurfaceCreated — пересоздаём прямо здесь
-        if (g_eglSurface == EGL_NO_SURFACE && g_nativeWindow && g_eglConfig) {
-            // ФИКС EGL_BAD_ALLOC (PowerVR): НЕ делаем release+acquire здесь — onSurfaceCreated
-            // уже вызвал acquire для нового окна. Лишний release уронит refcount до нуля и
-            // ANativeWindow станет мёртвым до вызова eglCreateWindowSurface.
-            // ФИКС ЧЁРНОГО ЭКРАНА: НЕ вызываем setBuffersGeometry до eglCreateWindowSurface —
-            // PowerVR/Adreno отклоняют eglCreateWindowSurface если формат буфера уже изменён
-            // (несоответствие EGL config → EGL_BAD_ALLOC).
-            eglGetError(); // сбросить накопленные ошибки перед созданием
-            g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
-            SyncLog("[EGL] g_eglSurface пересоздана превентивно: " +
-                    std::to_string(g_eglSurface != EGL_NO_SURFACE ? 1 : 0));
-            needRebind = true;
-        }
         if (needRebind && g_eglSurface != EGL_NO_SURFACE) {
             eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
             eglGetError();
-            SyncLog("[EGL] Контекст/surface перепривязан перед swap. ctx_match=" +
-                    std::to_string(curCtx == g_eglContext) +
-                    " surf_match=" + std::to_string(curSurf == g_eglSurface));
+            SyncLog("[EGL] Контекст/surface перепривязан перед swap.");
         }
     }
 
@@ -1931,17 +1972,16 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         }
         // ФИКС EGL_BAD_ALLOC (PowerVR): после eglDestroySurface драйвер держит ref на ANativeWindow.
         // release + acquire сбрасывает внутреннее состояние и позволяет новому attach-у работать.
-        // Это безопасно здесь (не в превентивном пути) — onSurfaceCreated НЕ трогал окно в этой ветке.
+        // Безопасно — мы уже на game-потоке, контекст отвязан выше.
         if (g_nativeWindow) {
             ANativeWindow_release(g_nativeWindow);
             ANativeWindow_acquire(g_nativeWindow);
         }
-        // ФИКС ЧЁРНОГО ЭКРАНА: setBuffersGeometry вызывается ПОСЛЕ eglCreateWindowSurface.
-        // До создания surface — драйвер получает несоответствие формата и возвращает EGL_BAD_ALLOC.
-        eglGetError(); // сбросить накопленные ошибки
+        // ФИКС: setBuffersGeometry ТОЛЬКО после eglCreateWindowSurface.
+        // До создания surface — PowerVR/Adreno возвращают EGL_BAD_ALLOC.
+        eglGetError();
         g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
         if (g_eglSurface != EGL_NO_SURFACE) {
-            // Теперь безопасно выставить формат буфера — surface уже создана
             int fmt = g_workingWindowFormat ? g_workingWindowFormat : 4;
             ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt);
             eglGetError();
@@ -14237,25 +14277,27 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
         // старая EGL WindowSurface становится невалидной — eglSwapBuffers падает с EGL_BAD_SURFACE.
         // Раньше мы блокировали повторный вызов, оставляя g_eglSurface протухшей.
         // Теперь пересоздаём только поверхность, не трогая контекст и не перезапуская игру.
-        // ФИКС: Только обновляем ANativeWindow. Game-поток сам обнаружит EGL_BAD_SURFACE
-        // и пересоздаст surface через механизм в MegaDebug_eglSwapBuffers.
-        // НЕ вызываем eglMakeCurrent(NO_SURFACE) — это убьёт контекст на game-потоке!
-        LogToJava("onSurfaceCreated: Поверхность пересоздана — обновляем ANativeWindow.");
+        // ФИКС EGL_BAD_ALLOC (PowerVR): eglDestroySurface + eglCreateWindowSurface НЕЛЬЗЯ вызывать
+        // из Java-потока пока game-поток держит контекст через eglMakeCurrent.
+        // PowerVR требует что контекст был отвязан на ТОМ ЖЕ потоке где он привязан (game-поток).
+        // Решение: сохраняем новый ANativeWindow и сигнализируем game-потоку.
+        // Game-поток сам сделает eglMakeCurrent(NO)+eglDestroySurface+eglCreateWindowSurface.
+        LogToJava("onSurfaceCreated: Поверхность пересоздана — сигнализируем game-потоку.");
         ANativeWindow* newWindow = ANativeWindow_fromSurface(env, surface);
         if (newWindow) {
-            // ФИКС EGL_BAD_ALLOC (PowerVR): ANativeWindow_fromSurface возвращает окно с refcount=1
-            // (удерживается Surface). Нужно явно добавить наш ref через acquire — иначе когда Java
-            // Surface будет переиспользована или GC уберёт ссылку, ANativeWindow исчезнет раньше
-            // чем game-поток успеет вызвать eglCreateWindowSurface → EGL_BAD_ALLOC.
-            ANativeWindow_acquire(newWindow);
-            if (g_nativeWindow) ANativeWindow_release(g_nativeWindow);
-            g_nativeWindow = newWindow;
-            // Старую EGL surface помечаем невалидной — game-поток пересоздаст на следующем кадре
-            if (g_eglSurface != EGL_NO_SURFACE) {
-                eglDestroySurface(g_eglDisplay, g_eglSurface);
-                g_eglSurface = EGL_NO_SURFACE;
+            ANativeWindow_acquire(newWindow); // удерживаем до передачи в game-поток
+            pthread_mutex_lock(&g_surfaceRecreateMutex);
+            if (g_pendingNativeWindow && g_pendingNativeWindow != newWindow) {
+                ANativeWindow_release(g_pendingNativeWindow);
             }
-            LogToJava("onSurfaceCreated: ANativeWindow обновлён, game-поток пересоздаст EGL surface.");
+            g_pendingNativeWindow  = newWindow;
+            g_surfaceRecreateState = 1; // запрос game-потоку
+            pthread_cond_signal(&g_surfaceRecreateCond);
+            // Ждём пока game-поток завершит (таймаут 2 сек на случай краша game-потока)
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 2;
+            pthread_cond_timedwait(&g_surfaceRecreateCond, &g_surfaceRecreateMutex, &ts);
+            pthread_mutex_unlock(&g_surfaceRecreateMutex);
+            LogToJava("onSurfaceCreated: game-поток обработал запрос пересоздания surface.");
         }
         return;
     }
