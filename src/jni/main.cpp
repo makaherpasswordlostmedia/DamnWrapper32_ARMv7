@@ -12019,6 +12019,27 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
 }
 
 static void ApplyGamePatches() {
+    // -----------------------------------------------------------------------
+    // POST-REBASE PATCH: Краш в G_ReloadDefaults (Signal 11, fault 0x200d1bc8)
+    // -----------------------------------------------------------------------
+    // Кастомный парсер ребейзит значение в литерал-пуле __text+0x19BDC,
+    // превращая PC-относительный офсет 0x000B80C4 в абсолютный 0x100B80C4.
+    // ARM инструкция "LDR R1, [PC, R3]" использует его как смещение от PC,
+    // а не как абсолютный адрес, поэтому получается PC + 0x100B80C4 = 0x200D1BC8 — крaш.
+    // Откатываем ребейз этого слота: возвращаем исходный относительный офсет.
+    {
+        uint32_t* patch_addr = (uint32_t*)(g_appSlide + 0x19BDC);
+        if (*patch_addr == (0x000B80C4 + g_appSlide)) {
+            *patch_addr = 0x000B80C4;
+            LogToJava("POST-REBASE PATCH: Откатили ребейз литерал-пула __text+0x19BDC (G_ReloadDefaults crash fix)");
+        } else {
+            char dbg[128];
+            snprintf(dbg, sizeof(dbg), "POST-REBASE PATCH: __text+0x19BDC = 0x%08X (ожидали 0x%08X), пропускаем",
+                     *patch_addr, (uint32_t)(0x000B80C4 + g_appSlide));
+            LogToJava(std::string(dbg));
+        }
+    }
+    // -----------------------------------------------------------------------
     // ФИКС ЧЕРНОГО ЭКРАНА #1: перехватываем -[EAGLView presentFramebuffer] на уровне IMP.
     // Wolf3D вызывает этот метод через прямой указатель из нативного кода (drawFrame),
     // поэтому Stub_objc_msgSend его не видит. Патчим IMP трамплином.
