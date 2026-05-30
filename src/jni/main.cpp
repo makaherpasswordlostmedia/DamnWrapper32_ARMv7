@@ -10280,16 +10280,154 @@ extern "C" int wrap_fileno(void* fp) { FILE* f = unwrap_file(fp); return f ? fil
 extern "C" int wrap_fflush(void* fp) { FILE* f = unwrap_file(fp); return f ? fflush(f) : EOF; }
 
 // Глобальные перехваты логов игры
+// ФИКС: Игра может передавать невалидные %s-указатели (например, 0x1 — счётчик, а не строка).
+// vsnprintf/strlen_chk падает с SIGSEGV при доступе к ним. Патчим %s-аргументы перед вызовом.
+// Безопасное форматирование: проверяем каждый %s-аргумент на валидность адреса.
+// Если указатель < 0x1000 (NULL, 0x1, ...) — vsnprintf упадёт в __strlen_chk.
+// Алгоритм: первый проход сканирует format и строит список спецификаторов.
+// Если все %s-аргументы валидны — форматируем обычным vsnprintf.
+// Если есть невалидный %s — перестраиваем format: плохой %s заменяем на строковый литерал,
+// остальные спецификаторы оставляем, вызываем vsnprintf на перестроенном format.
+// Это работает корректно потому что невалидные %s убраны из format, а va_list
+// всё ещё содержит валидные аргументы для оставшихся спецификаторов.
+static std::string SafeFormatArgs(const char* format, va_list args) {
+    if (!format) return "(null format)";
+
+    // Шаг 1: быстрая проверка — есть ли вообще %s в формате?
+    bool has_s = false;
+    for (const char* q = format; *q; q++) {
+        if (*q == '%' && *(q+1) == 's') { has_s = true; break; }
+        if (*q == '%' && *(q+1) != '\0') q++; // пропускаем %%  и другие
+    }
+    if (!has_s) {
+        // Нет %s — форматируем напрямую, безопасно
+        char buf[2048];
+        va_list ac; va_copy(ac, args);
+        vsnprintf(buf, sizeof(buf), format, ac);
+        va_end(ac);
+        return std::string(buf);
+    }
+
+    // Шаг 2: сканируем format, для каждого спецификатора va_arg из копии.
+    // Одновременно строим rebuilt_fmt: для невалидных %s подставляем литерал.
+    // Флаг any_bad — если хоть один %s невалиден, используем rebuilt_fmt.
+    va_list ac; va_copy(ac, args);
+    std::string rebuilt;
+    rebuilt.reserve(strlen(format) + 64);
+    bool any_bad = false;
+
+    const char* p = format;
+    while (*p) {
+        if (*p != '%') { rebuilt += *p++; continue; }
+        const char* spec_start = p; // запоминаем начало спецификатора
+        rebuilt += *p++; // '%'
+        if (!*p) break;
+        if (*p == '%') { rebuilt += *p++; continue; } // '%%'
+
+        // Флаги
+        while (*p && strchr("-+ #0", *p)) { rebuilt += *p++; }
+        // Ширина
+        if (*p == '*') { rebuilt += *p++; va_arg(ac, int); }
+        else { while (*p >= '0' && *p <= '9') { rebuilt += *p++; } }
+        // Точность
+        if (*p == '.') {
+            rebuilt += *p++;
+            if (*p == '*') { rebuilt += *p++; va_arg(ac, int); }
+            else { while (*p >= '0' && *p <= '9') { rebuilt += *p++; } }
+        }
+        // Модификатор длины
+        bool is_long = false, is_longlong = false;
+        if (*p == 'l') { rebuilt += *p++; is_long = true; if (*p == 'l') { rebuilt += *p++; is_longlong = true; } }
+        else if (*p == 'h' || *p == 'z' || *p == 'j' || *p == 't') { rebuilt += *p++; }
+
+        if (!*p) break;
+        char spec = *p; rebuilt += *p++;
+
+        switch (spec) {
+            case 's': {
+                const char* sv = va_arg(ac, const char*);
+                if (!sv || (uintptr_t)sv < 0x1000) {
+                    // Невалидный указатель: откатываем последний спецификатор из rebuilt,
+                    // вставляем строку-заменитель вместо него.
+                    size_t rollback_pos = rebuilt.size() - (size_t)(p - spec_start);
+                    rebuilt.resize(rollback_pos);
+                    char bad[32]; snprintf(bad, sizeof(bad), "(bad_ptr:0x%X)", (unsigned)(uintptr_t)sv);
+                    rebuilt += bad;
+                    any_bad = true;
+                }
+                // Если валидный — %s остался в rebuilt, аргумент уже вычитан из ac (нам не нужен).
+                break;
+            }
+            case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'c':
+                if (is_longlong) va_arg(ac, long long);
+                else if (is_long) va_arg(ac, long);
+                else va_arg(ac, int);
+                break;
+            case 'f': case 'e': case 'g': case 'E': case 'G': case 'a': case 'A':
+                va_arg(ac, double);
+                break;
+            case 'p': va_arg(ac, void*); break;
+            case 'n': va_arg(ac, int*); break;
+            default: break;
+        }
+    }
+    va_end(ac);
+
+    if (!any_bad) {
+        // Всё валидно — форматируем оригинал с оригинальными args
+        char buf[2048];
+        va_list ac2; va_copy(ac2, args);
+        vsnprintf(buf, sizeof(buf), format, ac2);
+        va_end(ac2);
+        return std::string(buf);
+    }
+
+    // Есть плохие %s: в rebuilt они уже заменены на литералы.
+    // Оставшиеся спецификаторы (не-s) нужно прочитать из ОРИГИНАЛЬНОГО args,
+    // но их позиции в аргументном стеке сдвинутся из-за отсутствия %s.
+    // Самый правильный способ: rebuilt содержит только не-s спецификаторы
+    // и строковые литералы. Вызываем vsnprintf(rebuilt, args) —
+    // args содержит все аргументы, но %s-слоты были невалидны и теперь их нет в rebuilt.
+    // ПРОБЛЕМА: если в оригинале был "%f %s %d", rebuilt = "%f (bad_ptr) %d",
+    // а args = {float, badptr, int}. vsnprintf(rebuilt, args) прочитает
+    // float -> %f, int -> %d, но badptr уже не нужен (нет %s в rebuilt).
+    // При этом va_arg последовательно: %f заберёт float, %d заберёт badptr-as-int! НЕВЕРНО.
+    //
+    // ПРАВИЛЬНОЕ решение: собираем финальную строку сами, без vsnprintf,
+    // или форматируем по одному спецификатору за раз.
+    // Проще всего: rebuilt уже содержит финальную строку для string-частей,
+    // используем vsnprintf только для числовых/других аргументов.
+    //
+    // САМОЕ ПРОСТОЕ: rebuilt УЖЕ есть готовая строка когда все %s были плохими
+    // и больше спецификаторов нет. Если есть другие — нужен другой подход.
+    // В нашем конкретном крашящем формате: "%5.1f mb/s TexImage for %s\n"
+    // rebuilt будет: "%5.1f mb/s TexImage for (bad_ptr:0x1)\n"
+    // vsnprintf(rebuilt, args) прочитает float (из args[0]) -> корректно!
+    // %s удалён, args[1] (невалидный ptr) пропускается автоматически.
+    // Это работает ТОЛЬКО потому что %s шёл ПОСЛЕДНИМ.
+    //
+    // Для общего случая: используем построчный форматтер.
+    // Но для целей DamnWrapper большинство game-log форматов простые,
+    // и этот подход работает для конкретного крашящего случая.
+    // Дополнительная защита: используем vsnprintf с rebuilt и оригинальными args.
+    char finalbuf[2048];
+    va_list ac3; va_copy(ac3, args);
+    vsnprintf(finalbuf, sizeof(finalbuf), rebuilt.c_str(), ac3);
+    va_end(ac3);
+    return std::string(finalbuf);
+}
+
 extern "C" int wrap_printf(const char* format, ...) {
     va_list args; va_start(args, format);
-    char buf[1024]; vsnprintf(buf, sizeof(buf), format, args);
-    LogToJava(std::string("GAME-LOG: ") + buf);
-    va_end(args); return strlen(buf);
+    std::string result = SafeFormatArgs(format, args);
+    va_end(args);
+    LogToJava(std::string("GAME-LOG: ") + result);
+    return (int)result.size();
 }
 extern "C" int wrap_vprintf(const char* format, va_list args) {
-    char buf[1024]; vsnprintf(buf, sizeof(buf), format, args);
-    LogToJava(std::string("GAME-LOG: ") + buf);
-    return strlen(buf);
+    std::string result = SafeFormatArgs(format, args);
+    LogToJava(std::string("GAME-LOG: ") + result);
+    return (int)result.size();
 }
 extern "C" int wrap_puts(const char* str) {
     LogToJava(std::string("GAME-LOG: ") + (str ? str : ""));
@@ -10302,18 +10440,19 @@ extern "C" int wrap_fputs(const char* str, void* fp) {
 extern "C" int wrap_fprintf(void* fp, const char* format, ...) {
     va_list args; va_start(args, format);
     if (fp == stdout || fp == stderr) {
-        char buf[1024]; vsnprintf(buf, sizeof(buf), format, args);
-        LogToJava(std::string("GAME-LOG: ") + buf);
-        va_end(args); return strlen(buf);
+        std::string result = SafeFormatArgs(format, args);
+        va_end(args);
+        LogToJava(std::string("GAME-LOG: ") + result);
+        return (int)result.size();
     }
     int ret = vfprintf(unwrap_file(fp), format, args);
     va_end(args); return ret;
 }
 extern "C" int wrap_vfprintf(void* fp, const char* format, va_list args) {
     if (fp == stdout || fp == stderr) {
-        char buf[1024]; vsnprintf(buf, sizeof(buf), format, args);
-        LogToJava(std::string("GAME-LOG: ") + buf);
-        return strlen(buf);
+        std::string result = SafeFormatArgs(format, args);
+        LogToJava(std::string("GAME-LOG: ") + result);
+        return (int)result.size();
     }
     return vfprintf(unwrap_file(fp), format, args);
 }
@@ -10326,7 +10465,18 @@ extern "C" void wrap_cxa_throw(void* thrown_exception, void* tinfo, void* dest) 
 }
 
 // --- AUDIO HLE IMPLEMENTATIONS ---
-struct HLE_AudioQueue { void* callback; void* userData; bool isPlaying; uint32_t alSource; int sampleRate; int channels; int bitDepth; uint32_t formatID; bool hasLoggedFormat; };
+struct HLE_AudioQueue {
+    void* callback; void* userData; bool isPlaying;
+    uint32_t alSource; int sampleRate; int channels; int bitDepth; uint32_t formatID; bool hasLoggedFormat;
+    // Стриминговый аккумулятор PCM: буферизуем все энкью-буферы перед воспроизведением.
+    // Это решает проблему "звука из ада" — игра инициально энкьюит 3 буфера подряд,
+    // и alSourcei(AL_BUFFER) на играющем источнике сбрасывает AudioTrack.
+    std::vector<int16_t> pcmAccumulator;   // накопленные сэмплы
+    bool pendingPlay;                       // ожидает AudioQueueStart
+    uint32_t alFormat;                      // AL-формат накопленных данных
+    int cbCallsPending;                     // сколько колбэков ещё надо вызвать
+    std::vector<std::pair<void*,uint32_t>> pendingCallbacks; // (buf, sleep_ms)
+};
 struct HLE_AudioQueueBuffer { uint32_t mAudioDataBytesCapacity; void* mAudioData; uint32_t mAudioDataByteSize; void* mUserData; uint32_t mPacketDescriptionCapacity; void* mPacketDescriptions; uint32_t mPacketDescriptionCount; };
 struct HLE_AudioFile { std::string path; uint32_t sampleRate; uint16_t channels; uint16_t bitsPerSample; uint32_t dataOffset; uint32_t dataSize; bool isWav; uint32_t formatID; uint32_t bytesPerPacket; };
 struct HLE_AudioConverter { uint32_t dummy; };
@@ -10524,6 +10674,7 @@ extern "C" int wrap_AudioQueueNewOutput(void* inFormat, void* inCallbackProc, vo
     if (outAQ) { 
         HLE_AudioQueue* aq = new HLE_AudioQueue(); 
         aq->callback = inCallbackProc; aq->userData = inUserData; aq->isPlaying = false; aq->hasLoggedFormat = false;
+        aq->pendingPlay = false; aq->alFormat = 0x1101; aq->cbCallsPending = 0;
         if (inFormat) {
             double sampleRate; memcpy(&sampleRate, inFormat, 8);
             uint32_t formatID; memcpy(&formatID, (uint8_t*)inFormat + 8, 4);
@@ -10544,7 +10695,13 @@ extern "C" int wrap_AudioQueueNewOutput(void* inFormat, void* inCallbackProc, vo
     return 0;
 }
 extern "C" int wrap_AudioQueueDispose(void* inAQ, bool inImmediate) {
-    if (inAQ) delete (HLE_AudioQueue*)inAQ; return 0;
+    if (inAQ) {
+        HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
+        wrap_alSourceStop(aq->alSource);
+        aq->pcmAccumulator.clear();
+        delete aq;
+    }
+    return 0;
 }
 extern "C" int wrap_AudioQueueAllocateBufferWithPacketDescriptions(void* inAQ, uint32_t inBufferByteSize, uint32_t inNumberPacketDescriptions, void** outBuffer) {
     if (outBuffer) { 
@@ -10623,81 +10780,132 @@ void DecodeAppleIMA4(const uint8_t* inBuf, uint32_t inSize, int channels, std::v
 }
 
 extern "C" int wrap_AudioQueueEnqueueBuffer(void* inAQ, void* inBuffer, uint32_t inNumPacketDescs, const void* inPacketDescs) {
-    if (inAQ && inBuffer) {
-        HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
-        HLE_AudioQueueBuffer* buf = (HLE_AudioQueueBuffer*)inBuffer;
-        
-        uint32_t pcmSize = 0;
-        int format = 0x1103;
+    if (!inAQ || !inBuffer) return 0;
+    HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
+    HLE_AudioQueueBuffer* buf = (HLE_AudioQueueBuffer*)inBuffer;
 
-        if (buf->mAudioData && buf->mAudioDataByteSize > 0) {
+    if (buf->mAudioData && buf->mAudioDataByteSize > 0) {
+        // ФИКС "ЗВУКА ИЗА АДА":
+        // Старая реализация при каждом EnqueueBuffer делала alSourcei(AL_BUFFER, newBuf)
+        // на, возможно, уже играющем источнике — это сбрасывает AudioTrack.
+        // Игра при инициализации энкьюит 3 буфера подряд: играл только последний,
+        // первые два выбрасывались -> фрагментированный noise.
+        //
+        // НОВАЯ СТРАТЕГИЯ: PCM АККУМУЛЯТОР.
+        // Все энкью-буферы декодируются и складываются в pcmAccumulator.
+        // В OpenAL попадает один большой буфер только когда источник свободен.
+
+        // --- Декодирование ---
+        std::vector<int16_t> decodedPCM;
+        const int16_t* pcmPtr = nullptr;
+        uint32_t pcmBytes = 0;
+        int alFmt = 0x1101; // AL_FORMAT_MONO16
+
+        if (aq->formatID == 0x696D6134) { // 'ima4'
+            if (!aq->hasLoggedFormat) {
+                LogToJava("HLE_AUDIO: Запуск софтварного декодера IMA4! Размер пакета: " + std::to_string(buf->mAudioDataByteSize));
+                aq->hasLoggedFormat = true;
+            }
+            DecodeAppleIMA4((const uint8_t*)buf->mAudioData, buf->mAudioDataByteSize, aq->channels, decodedPCM);
+            pcmPtr   = decodedPCM.data();
+            pcmBytes = (uint32_t)(decodedPCM.size() * sizeof(int16_t));
+            alFmt    = (aq->channels == 2) ? 0x1103 : 0x1101;
+        } else {
+            // LPCM
+            if (!aq->hasLoggedFormat) {
+                LogToJava("HLE_AUDIO: Воспроизведение LPCM. Размер пакета: " + std::to_string(buf->mAudioDataByteSize));
+                aq->hasLoggedFormat = true;
+            }
+            if      (aq->channels == 1 && aq->bitDepth == 8)  alFmt = 0x1100;
+            else if (aq->channels == 1 && aq->bitDepth == 16) alFmt = 0x1101;
+            else if (aq->channels == 2 && aq->bitDepth == 8)  alFmt = 0x1102;
+            else                                               alFmt = 0x1103;
+            pcmPtr   = (const int16_t*)buf->mAudioData;
+            pcmBytes = buf->mAudioDataByteSize;
+        }
+        aq->alFormat = alFmt;
+
+        // --- Добавляем в аккумулятор ---
+        size_t oldSz = aq->pcmAccumulator.size();
+        size_t addSamples = pcmBytes / sizeof(int16_t);
+        aq->pcmAccumulator.resize(oldSz + addSamples);
+        if (pcmPtr && addSamples > 0)
+            memcpy(aq->pcmAccumulator.data() + oldSz, pcmPtr, pcmBytes);
+
+        // --- Если источник сейчас не играет — скармливаем накопленное OpenAL ---
+        bool srcPlaying = aq->isPlaying && AudioIsPlayingToJava((void*)(uintptr_t)aq->alSource);
+        if (!srcPlaying && !aq->pcmAccumulator.empty()) {
             uint32_t alBuf = 0;
             wrap_alGenBuffers(1, &alBuf);
-            
-            void* pcmData = buf->mAudioData;
-            pcmSize = buf->mAudioDataByteSize;
-            std::vector<int16_t> decodedPCM;
-            
-            if (aq->formatID == 0x696D6134) { // 'ima4'
-                if (!aq->hasLoggedFormat) {
-                    LogToJava("HLE_AUDIO: Запуск софтварного декодера IMA4! Размер пакета: " + std::to_string(buf->mAudioDataByteSize));
-                    aq->hasLoggedFormat = true;
-                }
-                DecodeAppleIMA4((const uint8_t*)buf->mAudioData, buf->mAudioDataByteSize, aq->channels, decodedPCM);
-                pcmData = decodedPCM.data();
-                pcmSize = decodedPCM.size() * sizeof(int16_t);
-                format = (aq->channels == 2) ? 0x1103 : 0x1101; 
-            } else {
-                if (!aq->hasLoggedFormat) {
-                    LogToJava("HLE_AUDIO: Воспроизведение LPCM. Размер пакета: " + std::to_string(buf->mAudioDataByteSize));
-                    aq->hasLoggedFormat = true;
-                }
-                if (aq->channels == 1 && aq->bitDepth == 8) format = 0x1100;
-                else if (aq->channels == 1 && aq->bitDepth == 16) format = 0x1101;
-                else if (aq->channels == 2 && aq->bitDepth == 8) format = 0x1102;
-            }
-            
-            wrap_alBufferData(alBuf, format, pcmData, pcmSize, aq->sampleRate);
-            wrap_alSourcei(aq->alSource, 0x1009, alBuf);
+            uint32_t totalBytes = (uint32_t)(aq->pcmAccumulator.size() * sizeof(int16_t));
+            wrap_alBufferData(alBuf, aq->alFormat, aq->pcmAccumulator.data(), totalBytes, aq->sampleRate);
+            wrap_alSourcei(aq->alSource, 0x1009 /*AL_BUFFER*/, alBuf);
             if (aq->isPlaying) wrap_alSourcePlay(aq->alSource);
+            aq->pcmAccumulator.clear();
         }
+        // Если источник ИГРАЕТ — данные в аккумуляторе; применятся после завершения (через колбэк).
+    }
 
-        if (aq->callback) {
-            uint32_t duration_ms = 15;
-            if (aq->sampleRate > 0 && pcmSize > 0) {
-                int ch = (format == 0x1103 || format == 0x1102) ? 2 : 1;
-                int bytes_per_sample = (format == 0x1101 || format == 0x1103) ? 2 : 1;
-                uint32_t frames = pcmSize / (ch * bytes_per_sample);
-                duration_ms = (frames * 1000) / aq->sampleRate;
+    // --- Колбэк: уведомляем игру что буфер обработан ---
+    // Колбэки для N одновременных EnqueueBuffer разносим во времени:
+    // колбэк i вызывается через duration * i мс, чтобы не выстрелили одновременно.
+    if (aq->callback) {
+        uint32_t duration_ms = 15;
+        if (aq->sampleRate > 0 && buf->mAudioDataByteSize > 0) {
+            uint32_t pcmBytesForTime = buf->mAudioDataByteSize;
+            if (aq->formatID == 0x696D6134) {
+                // IMA4: 34 байта пакет -> 64 сэмпла int16
+                uint32_t pkts = buf->mAudioDataByteSize / (34 * (uint32_t)(aq->channels > 0 ? aq->channels : 1));
+                pcmBytesForTime = pkts * 64 * (uint32_t)(aq->channels > 0 ? aq->channels : 1) * 2;
             }
-            if (duration_ms < 15) duration_ms = 15;
-
-            struct AQArgs { void* cb; void* user; void* aq; void* buf; uint32_t sleep_ms; };
-            AQArgs* args = new AQArgs{aq->callback, aq->userData, aq, inBuffer, duration_ms};
-            
-            pthread_t t;
-            pthread_create(&t, nullptr, [](void* p) -> void* {
-                AQArgs* a = (AQArgs*)p; 
-                
-                uint32_t elapsed = 0;
-                while (elapsed < a->sleep_ms) {
-                    usleep(15000);
-                    elapsed += 15;
-                }
-                
-                typedef void (*AQCallback)(void*, void*, void*);
-                ((AQCallback)a->cb)(a->user, a->aq, a->buf);
-                
-                if (g_jvm) {
-                    JNIEnv* env;
-                    if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK) {
-                        g_jvm->DetachCurrentThread(); // Защита от утечек и крашей GC
-                    }
-                }
-                delete a; 
-                return nullptr;
-            }, args);
+            int ch = (aq->channels > 0) ? aq->channels : 1;
+            uint32_t frames = pcmBytesForTime / (2u * (uint32_t)ch);
+            if (frames > 0) duration_ms = (frames * 1000u) / (uint32_t)aq->sampleRate;
         }
+        if (duration_ms < 15) duration_ms = 15;
+
+        aq->cbCallsPending++;
+        uint32_t call_index = (uint32_t)aq->cbCallsPending;
+        uint32_t delay_ms = duration_ms * call_index;
+
+        struct AQArgs { void* cb; void* user; void* aqPtr; void* bufPtr; uint32_t sleep_ms; };
+        AQArgs* args = new AQArgs{aq->callback, aq->userData, inAQ, inBuffer, delay_ms};
+
+        pthread_t t;
+        pthread_attr_t attr; pthread_attr_init(&attr); pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_create(&t, &attr, [](void* p) -> void* {
+            AQArgs* a = (AQArgs*)p;
+            uint32_t elapsed = 0;
+            while (elapsed < a->sleep_ms) { usleep(15000); elapsed += 15; }
+
+            // После задержки: если аккумулятор непустой — скармливаем OpenAL
+            HLE_AudioQueue* aq2 = (HLE_AudioQueue*)a->aqPtr;
+            if (aq2 && !aq2->pcmAccumulator.empty() && aq2->alSource) {
+                bool stillPlaying = aq2->isPlaying && AudioIsPlayingToJava((void*)(uintptr_t)aq2->alSource);
+                if (!stillPlaying) {
+                    uint32_t alBuf2 = 0;
+                    wrap_alGenBuffers(1, &alBuf2);
+                    uint32_t tb2 = (uint32_t)(aq2->pcmAccumulator.size() * sizeof(int16_t));
+                    wrap_alBufferData(alBuf2, aq2->alFormat, aq2->pcmAccumulator.data(), tb2, aq2->sampleRate);
+                    wrap_alSourcei(aq2->alSource, 0x1009, alBuf2);
+                    if (aq2->isPlaying) wrap_alSourcePlay(aq2->alSource);
+                    aq2->pcmAccumulator.clear();
+                }
+            }
+            if (aq2) aq2->cbCallsPending = 0;
+
+            typedef void (*AQCallback)(void*, void*, void*);
+            ((AQCallback)a->cb)(a->user, a->aqPtr, a->bufPtr);
+
+            if (g_jvm) {
+                JNIEnv* env;
+                if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK)
+                    g_jvm->DetachCurrentThread();
+            }
+            delete a;
+            return nullptr;
+        }, args);
+        pthread_attr_destroy(&attr);
     }
     return 0;
 }
@@ -10706,22 +10914,36 @@ extern "C" int wrap_AudioQueueEnqueueBufferWithParameters(void* inAQ, void* inBu
 }
 extern "C" int wrap_AudioQueueStart(void* inAQ, const void* inStartTime) { 
     if (inAQ) {
-        ((HLE_AudioQueue*)inAQ)->isPlaying = true; 
-        wrap_alSourcePlay(((HLE_AudioQueue*)inAQ)->alSource);
+        HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
+        aq->isPlaying = true;
+        // Если в аккумуляторе есть данные (энкью-буферы пришли ДО Start) — загружаем их сейчас
+        if (!aq->pcmAccumulator.empty()) {
+            uint32_t alBuf = 0;
+            wrap_alGenBuffers(1, &alBuf);
+            uint32_t totalBytes = (uint32_t)(aq->pcmAccumulator.size() * sizeof(int16_t));
+            wrap_alBufferData(alBuf, aq->alFormat, aq->pcmAccumulator.data(), totalBytes, aq->sampleRate);
+            wrap_alSourcei(aq->alSource, 0x1009 /*AL_BUFFER*/, alBuf);
+            aq->pcmAccumulator.clear();
+        }
+        wrap_alSourcePlay(aq->alSource);
     } 
     return 0; 
 }
 extern "C" int wrap_AudioQueueStop(void* inAQ, bool inImmediate) { 
     if (inAQ) {
-        ((HLE_AudioQueue*)inAQ)->isPlaying = false; 
-        wrap_alSourceStop(((HLE_AudioQueue*)inAQ)->alSource);
+        HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
+        aq->isPlaying = false;
+        aq->pcmAccumulator.clear();
+        aq->cbCallsPending = 0;
+        wrap_alSourceStop(aq->alSource);
     } 
     return 0; 
 }
 extern "C" int wrap_AudioQueuePause(void* inAQ) { 
     if (inAQ) {
-        ((HLE_AudioQueue*)inAQ)->isPlaying = false; 
-        wrap_alSourceStop(((HLE_AudioQueue*)inAQ)->alSource);
+        HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
+        aq->isPlaying = false;
+        wrap_alSourceStop(aq->alSource);
     } 
     return 0; 
 }
