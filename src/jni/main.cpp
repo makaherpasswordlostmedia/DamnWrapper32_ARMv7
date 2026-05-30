@@ -1546,9 +1546,13 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         bool needRebind = (curCtx != g_eglContext || curSurf != g_eglSurface);
         // Если surface была сброшена onSurfaceCreated — пересоздаём прямо здесь
         if (g_eglSurface == EGL_NO_SURFACE && g_nativeWindow && g_eglConfig) {
-            // ФИКС EGL_BAD_ALLOC/EGL_BAD_MATCH: release+acquire сбрасывает драйверный ref, затем выставляем формат
-            ANativeWindow_release(g_nativeWindow); ANativeWindow_acquire(g_nativeWindow);
-            { int fmt = g_workingWindowFormat ? g_workingWindowFormat : 4; ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt); eglGetError(); }
+            // ФИКС EGL_BAD_ALLOC (PowerVR): НЕ делаем release+acquire здесь — onSurfaceCreated
+            // уже вызвал acquire для нового окна. Лишний release уронит refcount до нуля и
+            // ANativeWindow станет мёртвым до вызова eglCreateWindowSurface.
+            // ФИКС ЧЁРНОГО ЭКРАНА: НЕ вызываем setBuffersGeometry до eglCreateWindowSurface —
+            // PowerVR/Adreno отклоняют eglCreateWindowSurface если формат буфера уже изменён
+            // (несоответствие EGL config → EGL_BAD_ALLOC).
+            eglGetError(); // сбросить накопленные ошибки перед созданием
             g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
             SyncLog("[EGL] g_eglSurface пересоздана превентивно: " +
                     std::to_string(g_eglSurface != EGL_NO_SURFACE ? 1 : 0));
@@ -1927,18 +1931,20 @@ extern "C" EGLBoolean MegaDebug_eglSwapBuffers(EGLDisplay dpy, EGLSurface surfac
         }
         // ФИКС EGL_BAD_ALLOC (PowerVR): после eglDestroySurface драйвер держит ref на ANativeWindow.
         // release + acquire сбрасывает внутреннее состояние и позволяет новому attach-у работать.
+        // Это безопасно здесь (не в превентивном пути) — onSurfaceCreated НЕ трогал окно в этой ветке.
         if (g_nativeWindow) {
             ANativeWindow_release(g_nativeWindow);
             ANativeWindow_acquire(g_nativeWindow);
         }
-        // Создаём новую WindowSurface с тем же ANativeWindow и config
-        {
+        // ФИКС ЧЁРНОГО ЭКРАНА: setBuffersGeometry вызывается ПОСЛЕ eglCreateWindowSurface.
+        // До создания surface — драйвер получает несоответствие формата и возвращает EGL_BAD_ALLOC.
+        eglGetError(); // сбросить накопленные ошибки
+        g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
+        if (g_eglSurface != EGL_NO_SURFACE) {
+            // Теперь безопасно выставить формат буфера — surface уже создана
             int fmt = g_workingWindowFormat ? g_workingWindowFormat : 4;
             ANativeWindow_setBuffersGeometry(g_nativeWindow, 0, 0, fmt);
             eglGetError();
-        }
-        g_eglSurface = eglCreateWindowSurface(g_eglDisplay, g_eglConfig, g_nativeWindow, nullptr);
-        if (g_eglSurface != EGL_NO_SURFACE) {
             eglMakeCurrent(g_eglDisplay, g_eglSurface, g_eglSurface, g_eglContext);
             eglGetError();
             EGLint nw = 0, nh = 0;
@@ -14237,6 +14243,11 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
         LogToJava("onSurfaceCreated: Поверхность пересоздана — обновляем ANativeWindow.");
         ANativeWindow* newWindow = ANativeWindow_fromSurface(env, surface);
         if (newWindow) {
+            // ФИКС EGL_BAD_ALLOC (PowerVR): ANativeWindow_fromSurface возвращает окно с refcount=1
+            // (удерживается Surface). Нужно явно добавить наш ref через acquire — иначе когда Java
+            // Surface будет переиспользована или GC уберёт ссылку, ANativeWindow исчезнет раньше
+            // чем game-поток успеет вызвать eglCreateWindowSurface → EGL_BAD_ALLOC.
+            ANativeWindow_acquire(newWindow);
             if (g_nativeWindow) ANativeWindow_release(g_nativeWindow);
             g_nativeWindow = newWindow;
             // Старую EGL surface помечаем невалидной — game-поток пересоздаст на следующем кадре
