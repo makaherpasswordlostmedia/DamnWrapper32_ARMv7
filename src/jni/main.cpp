@@ -10466,16 +10466,33 @@ extern "C" void wrap_cxa_throw(void* thrown_exception, void* tinfo, void* dest) 
 
 // --- AUDIO HLE IMPLEMENTATIONS ---
 struct HLE_AudioQueue {
-    void* callback; void* userData; bool isPlaying;
+    // --- Поля только для конструирования (без гонок) ---
+    void* callback; void* userData;
     uint32_t alSource; int sampleRate; int channels; int bitDepth; uint32_t formatID; bool hasLoggedFormat;
-    // Стриминговый аккумулятор PCM: буферизуем все энкью-буферы перед воспроизведением.
-    // Это решает проблему "звука из ада" — игра инициально энкьюит 3 буфера подряд,
-    // и alSourcei(AL_BUFFER) на играющем источнике сбрасывает AudioTrack.
-    std::vector<int16_t> pcmAccumulator;   // накопленные сэмплы
+    uint32_t alFormat;
+
+    // --- Мьютекс защищает всё изменяемое состояние ниже ---
+    pthread_mutex_t mtx;
+
+    // --- Защищённые поля ---
+    bool isPlaying;
     bool pendingPlay;                       // ожидает AudioQueueStart
-    uint32_t alFormat;                      // AL-формат накопленных данных
-    int cbCallsPending;                     // сколько колбэков ещё надо вызвать
-    std::vector<std::pair<void*,uint32_t>> pendingCallbacks; // (buf, sleep_ms)
+    // PCM-аккумулятор: все энкью-буферы складываются сюда.
+    // В OpenAL одним большим блоком — только когда источник свободен.
+    // ВАЖНО: изменять ТОЛЬКО под mtx.
+    std::vector<int16_t> pcmAccumulator;
+    int cbCallsPending;
+    std::vector<std::pair<void*,uint32_t>> pendingCallbacks;
+
+    HLE_AudioQueue() {
+        callback = nullptr; userData = nullptr;
+        alSource = 0; sampleRate = 44100; channels = 1; bitDepth = 16;
+        formatID = 0x6C70636D; hasLoggedFormat = false;
+        alFormat = 0x1101;
+        pthread_mutex_init(&mtx, nullptr);
+        isPlaying = false; pendingPlay = false; cbCallsPending = 0;
+    }
+    ~HLE_AudioQueue() { pthread_mutex_destroy(&mtx); }
 };
 struct HLE_AudioQueueBuffer { uint32_t mAudioDataBytesCapacity; void* mAudioData; uint32_t mAudioDataByteSize; void* mUserData; uint32_t mPacketDescriptionCapacity; void* mPacketDescriptions; uint32_t mPacketDescriptionCount; };
 struct HLE_AudioFile { std::string path; uint32_t sampleRate; uint16_t channels; uint16_t bitsPerSample; uint32_t dataOffset; uint32_t dataSize; bool isWav; uint32_t formatID; uint32_t bytesPerPacket; };
@@ -10672,9 +10689,8 @@ extern "C" int wrap_AudioConverterFillComplexBuffer(void* inAudioConverter, void
 }
 extern "C" int wrap_AudioQueueNewOutput(void* inFormat, void* inCallbackProc, void* inUserData, void* inCallbackRunLoop, void* inCallbackRunLoopMode, uint32_t inFlags, void** outAQ) {
     if (outAQ) { 
-        HLE_AudioQueue* aq = new HLE_AudioQueue(); 
-        aq->callback = inCallbackProc; aq->userData = inUserData; aq->isPlaying = false; aq->hasLoggedFormat = false;
-        aq->pendingPlay = false; aq->alFormat = 0x1101; aq->cbCallsPending = 0;
+        HLE_AudioQueue* aq = new HLE_AudioQueue();
+        aq->callback = inCallbackProc; aq->userData = inUserData; aq->hasLoggedFormat = false;
         if (inFormat) {
             double sampleRate; memcpy(&sampleRate, inFormat, 8);
             uint32_t formatID; memcpy(&formatID, (uint8_t*)inFormat + 8, 4);
@@ -10697,8 +10713,12 @@ extern "C" int wrap_AudioQueueNewOutput(void* inFormat, void* inCallbackProc, vo
 extern "C" int wrap_AudioQueueDispose(void* inAQ, bool inImmediate) {
     if (inAQ) {
         HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
-        wrap_alSourceStop(aq->alSource);
+        pthread_mutex_lock(&aq->mtx);
+        aq->isPlaying = false;
+        aq->cbCallsPending = 0;
         aq->pcmAccumulator.clear();
+        pthread_mutex_unlock(&aq->mtx);
+        wrap_alSourceStop(aq->alSource);
         delete aq;
     }
     return 0;
@@ -10784,26 +10804,30 @@ extern "C" int wrap_AudioQueueEnqueueBuffer(void* inAQ, void* inBuffer, uint32_t
     HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
     HLE_AudioQueueBuffer* buf = (HLE_AudioQueueBuffer*)inBuffer;
 
+    // --- Вычисляем длительность буфера ДО захвата мьютекса (только читаем неизменяемые поля) ---
+    uint32_t duration_ms = 15;
+    if (aq->sampleRate > 0 && buf->mAudioDataByteSize > 0) {
+        uint32_t pcmBytesForTime = buf->mAudioDataByteSize;
+        if (aq->formatID == 0x696D6134) {
+            uint32_t pkts = buf->mAudioDataByteSize / (34u * (uint32_t)(aq->channels > 0 ? aq->channels : 1));
+            pcmBytesForTime = pkts * 64u * (uint32_t)(aq->channels > 0 ? aq->channels : 1) * 2u;
+        }
+        int ch = (aq->channels > 0) ? aq->channels : 1;
+        uint32_t frames = pcmBytesForTime / (2u * (uint32_t)ch);
+        if (frames > 0) duration_ms = (frames * 1000u) / (uint32_t)aq->sampleRate;
+    }
+    if (duration_ms < 15) duration_ms = 15;
+
+    // --- Декодируем PCM полностью ВНЕ мьютекса (тяжёлая операция) ---
+    std::vector<int16_t> decodedPCM;
+    const int16_t* pcmPtr = nullptr;
+    uint32_t pcmBytes = 0;
+    uint32_t alFmt = 0x1101; // AL_FORMAT_MONO16
+
     if (buf->mAudioData && buf->mAudioDataByteSize > 0) {
-        // ФИКС "ЗВУКА ИЗА АДА":
-        // Старая реализация при каждом EnqueueBuffer делала alSourcei(AL_BUFFER, newBuf)
-        // на, возможно, уже играющем источнике — это сбрасывает AudioTrack.
-        // Игра при инициализации энкьюит 3 буфера подряд: играл только последний,
-        // первые два выбрасывались -> фрагментированный noise.
-        //
-        // НОВАЯ СТРАТЕГИЯ: PCM АККУМУЛЯТОР.
-        // Все энкью-буферы декодируются и складываются в pcmAccumulator.
-        // В OpenAL попадает один большой буфер только когда источник свободен.
-
-        // --- Декодирование ---
-        std::vector<int16_t> decodedPCM;
-        const int16_t* pcmPtr = nullptr;
-        uint32_t pcmBytes = 0;
-        int alFmt = 0x1101; // AL_FORMAT_MONO16
-
         if (aq->formatID == 0x696D6134) { // 'ima4'
             if (!aq->hasLoggedFormat) {
-                LogToJava("HLE_AUDIO: Запуск софтварного декодера IMA4! Размер пакета: " + std::to_string(buf->mAudioDataByteSize));
+                LogToJava("HLE_AUDIO: Запуск декодера IMA4! Размер пакета: " + std::to_string(buf->mAudioDataByteSize));
                 aq->hasLoggedFormat = true;
             }
             DecodeAppleIMA4((const uint8_t*)buf->mAudioData, buf->mAudioDataByteSize, aq->channels, decodedPCM);
@@ -10820,56 +10844,56 @@ extern "C" int wrap_AudioQueueEnqueueBuffer(void* inAQ, void* inBuffer, uint32_t
             else if (aq->channels == 1 && aq->bitDepth == 16) alFmt = 0x1101;
             else if (aq->channels == 2 && aq->bitDepth == 8)  alFmt = 0x1102;
             else                                               alFmt = 0x1103;
-            pcmPtr   = (const int16_t*)buf->mAudioData;
+            // Делаем копию данных, чтобы не зависеть от чужого буфера
+            decodedPCM.resize(buf->mAudioDataByteSize / sizeof(int16_t));
+            memcpy(decodedPCM.data(), buf->mAudioData, buf->mAudioDataByteSize);
+            pcmPtr   = decodedPCM.data();
             pcmBytes = buf->mAudioDataByteSize;
         }
-        aq->alFormat = alFmt;
+    }
 
-        // --- Добавляем в аккумулятор ---
+    // --- Захватываем мьютекс и обновляем аккумулятор ---
+    bool shouldPlay = false;
+    uint32_t alBufToPlay = 0;
+    bool doPlay = false;
+
+    pthread_mutex_lock(&aq->mtx);
+    if (pcmPtr && pcmBytes > 0) {
+        aq->alFormat = alFmt;
         size_t oldSz = aq->pcmAccumulator.size();
         size_t addSamples = pcmBytes / sizeof(int16_t);
         aq->pcmAccumulator.resize(oldSz + addSamples);
-        if (pcmPtr && addSamples > 0)
-            memcpy(aq->pcmAccumulator.data() + oldSz, pcmPtr, pcmBytes);
-
-        // --- Если источник сейчас не играет — скармливаем накопленное OpenAL ---
-        bool srcPlaying = aq->isPlaying && AudioIsPlayingToJava((void*)(uintptr_t)aq->alSource);
-        if (!srcPlaying && !aq->pcmAccumulator.empty()) {
-            uint32_t alBuf = 0;
-            wrap_alGenBuffers(1, &alBuf);
-            uint32_t totalBytes = (uint32_t)(aq->pcmAccumulator.size() * sizeof(int16_t));
-            wrap_alBufferData(alBuf, aq->alFormat, aq->pcmAccumulator.data(), totalBytes, aq->sampleRate);
-            wrap_alSourcei(aq->alSource, 0x1009 /*AL_BUFFER*/, alBuf);
-            if (aq->isPlaying) wrap_alSourcePlay(aq->alSource);
-            aq->pcmAccumulator.clear();
-        }
-        // Если источник ИГРАЕТ — данные в аккумуляторе; применятся после завершения (через колбэк).
+        memcpy(aq->pcmAccumulator.data() + oldSz, pcmPtr, pcmBytes);
     }
 
+    // Если источник сейчас не играет — скармливаем накопленное OpenAL
+    bool srcPlaying = aq->isPlaying && AudioIsPlayingToJava((void*)(uintptr_t)aq->alSource);
+    if (!srcPlaying && !aq->pcmAccumulator.empty()) {
+        wrap_alGenBuffers(1, &alBufToPlay);
+        uint32_t totalBytes = (uint32_t)(aq->pcmAccumulator.size() * sizeof(int16_t));
+        // Копируем данные из аккумулятора перед очисткой (alBufferData вызывается под мьютексом
+        // только для передачи данных, сам JNI-вызов не блокируется долго)
+        wrap_alBufferData(alBufToPlay, aq->alFormat, aq->pcmAccumulator.data(), totalBytes, aq->sampleRate);
+        wrap_alSourcei(aq->alSource, 0x1009 /*AL_BUFFER*/, alBufToPlay);
+        aq->pcmAccumulator.clear();
+        doPlay = aq->isPlaying;
+    }
+
+    // Рассчитываем задержку колбэка — каждый последующий EnqueueBuffer сдвигается
+    aq->cbCallsPending++;
+    uint32_t call_index = (uint32_t)aq->cbCallsPending;
+    uint32_t delay_ms = duration_ms * call_index;
+    void* cb   = aq->callback;
+    void* user = aq->userData;
+    pthread_mutex_unlock(&aq->mtx);
+
+    // Воспроизводим за пределами мьютекса
+    if (doPlay) wrap_alSourcePlay(aq->alSource);
+
     // --- Колбэк: уведомляем игру что буфер обработан ---
-    // Колбэки для N одновременных EnqueueBuffer разносим во времени:
-    // колбэк i вызывается через duration * i мс, чтобы не выстрелили одновременно.
-    if (aq->callback) {
-        uint32_t duration_ms = 15;
-        if (aq->sampleRate > 0 && buf->mAudioDataByteSize > 0) {
-            uint32_t pcmBytesForTime = buf->mAudioDataByteSize;
-            if (aq->formatID == 0x696D6134) {
-                // IMA4: 34 байта пакет -> 64 сэмпла int16
-                uint32_t pkts = buf->mAudioDataByteSize / (34 * (uint32_t)(aq->channels > 0 ? aq->channels : 1));
-                pcmBytesForTime = pkts * 64 * (uint32_t)(aq->channels > 0 ? aq->channels : 1) * 2;
-            }
-            int ch = (aq->channels > 0) ? aq->channels : 1;
-            uint32_t frames = pcmBytesForTime / (2u * (uint32_t)ch);
-            if (frames > 0) duration_ms = (frames * 1000u) / (uint32_t)aq->sampleRate;
-        }
-        if (duration_ms < 15) duration_ms = 15;
-
-        aq->cbCallsPending++;
-        uint32_t call_index = (uint32_t)aq->cbCallsPending;
-        uint32_t delay_ms = duration_ms * call_index;
-
+    if (cb) {
         struct AQArgs { void* cb; void* user; void* aqPtr; void* bufPtr; uint32_t sleep_ms; };
-        AQArgs* args = new AQArgs{aq->callback, aq->userData, inAQ, inBuffer, delay_ms};
+        AQArgs* args = new AQArgs{cb, user, inAQ, inBuffer, delay_ms};
 
         pthread_t t;
         pthread_attr_t attr; pthread_attr_init(&attr); pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -10878,21 +10902,29 @@ extern "C" int wrap_AudioQueueEnqueueBuffer(void* inAQ, void* inBuffer, uint32_t
             uint32_t elapsed = 0;
             while (elapsed < a->sleep_ms) { usleep(15000); elapsed += 15; }
 
-            // После задержки: если аккумулятор непустой — скармливаем OpenAL
+            // После задержки: если аккумулятор непустой — скармливаем OpenAL (под мьютексом)
             HLE_AudioQueue* aq2 = (HLE_AudioQueue*)a->aqPtr;
-            if (aq2 && !aq2->pcmAccumulator.empty() && aq2->alSource) {
+            if (aq2 && aq2->alSource) {
+                pthread_mutex_lock(&aq2->mtx);
                 bool stillPlaying = aq2->isPlaying && AudioIsPlayingToJava((void*)(uintptr_t)aq2->alSource);
-                if (!stillPlaying) {
-                    uint32_t alBuf2 = 0;
+                bool doFlush = !stillPlaying && !aq2->pcmAccumulator.empty();
+                uint32_t alBuf2 = 0; uint32_t tb2 = 0; uint32_t fmt2 = aq2->alFormat; int sr2 = aq2->sampleRate;
+                std::vector<int16_t> flushData;
+                if (doFlush) {
+                    flushData.swap(aq2->pcmAccumulator); // атомарно забираем данные
+                    tb2 = (uint32_t)(flushData.size() * sizeof(int16_t));
                     wrap_alGenBuffers(1, &alBuf2);
-                    uint32_t tb2 = (uint32_t)(aq2->pcmAccumulator.size() * sizeof(int16_t));
-                    wrap_alBufferData(alBuf2, aq2->alFormat, aq2->pcmAccumulator.data(), tb2, aq2->sampleRate);
+                }
+                aq2->cbCallsPending = 0;
+                bool shouldAutoPlay = aq2->isPlaying;
+                pthread_mutex_unlock(&aq2->mtx);
+
+                if (doFlush && tb2 > 0) {
+                    wrap_alBufferData(alBuf2, fmt2, flushData.data(), tb2, sr2);
                     wrap_alSourcei(aq2->alSource, 0x1009, alBuf2);
-                    if (aq2->isPlaying) wrap_alSourcePlay(aq2->alSource);
-                    aq2->pcmAccumulator.clear();
+                    if (shouldAutoPlay) wrap_alSourcePlay(aq2->alSource);
                 }
             }
-            if (aq2) aq2->cbCallsPending = 0;
 
             typedef void (*AQCallback)(void*, void*, void*);
             ((AQCallback)a->cb)(a->user, a->aqPtr, a->bufPtr);
@@ -10912,40 +10944,54 @@ extern "C" int wrap_AudioQueueEnqueueBuffer(void* inAQ, void* inBuffer, uint32_t
 extern "C" int wrap_AudioQueueEnqueueBufferWithParameters(void* inAQ, void* inBuffer, uint32_t inNumPacketDescs, const void* inPacketDescs, uint32_t inTrimFramesAtStart, uint32_t inTrimFramesAtEnd, uint32_t inNumParamValues, const void* inParamValues, const void* inStartTime, void* outActualStartTime) {
     return wrap_AudioQueueEnqueueBuffer(inAQ, inBuffer, inNumPacketDescs, inPacketDescs);
 }
-extern "C" int wrap_AudioQueueStart(void* inAQ, const void* inStartTime) { 
+extern "C" int wrap_AudioQueueStart(void* inAQ, const void* inStartTime) {
     if (inAQ) {
         HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
+        uint32_t alBuf = 0; uint32_t totalBytes = 0; bool doFlush = false;
+        uint32_t fmt = 0; int sr = 0;
+        std::vector<int16_t> startData;
+
+        pthread_mutex_lock(&aq->mtx);
         aq->isPlaying = true;
         // Если в аккумуляторе есть данные (энкью-буферы пришли ДО Start) — загружаем их сейчас
         if (!aq->pcmAccumulator.empty()) {
-            uint32_t alBuf = 0;
+            startData.swap(aq->pcmAccumulator);
+            totalBytes = (uint32_t)(startData.size() * sizeof(int16_t));
+            fmt = aq->alFormat; sr = aq->sampleRate;
             wrap_alGenBuffers(1, &alBuf);
-            uint32_t totalBytes = (uint32_t)(aq->pcmAccumulator.size() * sizeof(int16_t));
-            wrap_alBufferData(alBuf, aq->alFormat, aq->pcmAccumulator.data(), totalBytes, aq->sampleRate);
+            doFlush = true;
+        }
+        pthread_mutex_unlock(&aq->mtx);
+
+        if (doFlush) {
+            wrap_alBufferData(alBuf, fmt, startData.data(), totalBytes, sr);
             wrap_alSourcei(aq->alSource, 0x1009 /*AL_BUFFER*/, alBuf);
-            aq->pcmAccumulator.clear();
         }
         wrap_alSourcePlay(aq->alSource);
-    } 
-    return 0; 
+    }
+    return 0;
 }
-extern "C" int wrap_AudioQueueStop(void* inAQ, bool inImmediate) { 
+extern "C" int wrap_AudioQueueStop(void* inAQ, bool inImmediate) {
     if (inAQ) {
         HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
+        pthread_mutex_lock(&aq->mtx);
         aq->isPlaying = false;
         aq->pcmAccumulator.clear();
         aq->cbCallsPending = 0;
+        pthread_mutex_unlock(&aq->mtx);
         wrap_alSourceStop(aq->alSource);
-    } 
-    return 0; 
+    }
+    return 0;
 }
-extern "C" int wrap_AudioQueuePause(void* inAQ) { 
+extern "C" int wrap_AudioQueuePause(void* inAQ) {
     if (inAQ) {
         HLE_AudioQueue* aq = (HLE_AudioQueue*)inAQ;
+        pthread_mutex_lock(&aq->mtx);
         aq->isPlaying = false;
+        pthread_mutex_unlock(&aq->mtx);
         wrap_alSourceStop(aq->alSource);
-    } 
-    return 0; 
+    }
+    return 0;
 }
 extern "C" int wrap_AudioQueueGetProperty(void* inAQ, uint32_t inID, void* outData, uint32_t* ioDataSize) { if (outData && ioDataSize) memset(outData, 0, *ioDataSize); return 0; }
 extern "C" int wrap_AudioQueueGetCurrentTime(void* inAQ, void* inTimeline, void* outTimeStamp, uint8_t* outTimelineDiscontinuity) {
