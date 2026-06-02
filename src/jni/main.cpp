@@ -12019,27 +12019,77 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
 }
 
 static void ApplyGamePatches() {
-    // -----------------------------------------------------------------------
-    // POST-REBASE PATCH: Краш в G_ReloadDefaults (Signal 11, fault 0x200d1bc8)
-    // -----------------------------------------------------------------------
-    // Кастомный парсер ребейзит значение в литерал-пуле __text+0x19BDC,
-    // превращая PC-относительный офсет 0x000B80C4 в абсолютный 0x100B80C4.
-    // ARM инструкция "LDR R1, [PC, R3]" использует его как смещение от PC,
-    // а не как абсолютный адрес, поэтому получается PC + 0x100B80C4 = 0x200D1BC8 — крaш.
-    // Откатываем ребейз этого слота: возвращаем исходный относительный офсет.
+    // =======================================================================
+    // POST-REBASE ПАТЧ 1: ДВОЙНОЙ РЕБЕЙЗ литерал-пулов в __text
+    // =======================================================================
+    // Кастомный парсер DamnWrapper иногда ребейзит значения в литерал-пулах
+    // __text ДВАЖДЫ: сначала проход Mach-O rebase opcodes (0x000XXXXX -> 0x100XXXXX),
+    // затем кастомный ARM-сканер видит 0x100XXXXX и снова добавляет SLIDE
+    // -> 0x200XXXXX. Такой двойной указатель при разыменовании вызывает SIGSEGV
+    // в произвольном коде (W_LumpNameHash, R_InitData и т.д.).
+    //
+    // Исправление: сканируем весь __text и для каждого 32-битного слова V
+    // в диапазоне [0x20000000, 0x20400000) вычитаем g_appSlide один раз.
+    // Диапазон выбран так: V = g_appSlide*2 + original_offset, где
+    // original_offset < 0x400000 (верхняя граница всего Mach-O включая BSS).
+    // Легитимных ARM-констант Doom в этом диапазоне нет.
+    {
+        // Находим __text секцию через g_machoSections
+        uint32_t text_start = 0, text_end = 0;
+        for (const auto& sec : g_machoSections) {
+            if (sec.name == "__TEXT,__text") { text_start = sec.start; text_end = sec.end; break; }
+        }
+        if (text_start == 0) text_start = g_appSlide;
+        if (text_end   == 0) text_end   = g_appSlide + 0xBAF68u; // fallback: known text size
+
+        const uint32_t SLIDE       = g_appSlide;
+        const uint32_t DOUBLE_LO   = 0x20000000u;
+        const uint32_t DOUBLE_HI   = 0x20400000u; // original_offset < 4MB (conservative)
+        uint32_t fixed_count = 0;
+
+        uint32_t* p   = (uint32_t*)text_start;
+        uint32_t* end = (uint32_t*)text_end;
+        while (p < end) {
+            uint32_t v = *p;
+            if (v >= DOUBLE_LO && v < DOUBLE_HI) {
+                *p = v - SLIDE; // убираем один лишний ребейз
+                fixed_count++;
+            }
+            p++;
+        }
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "POST-REBASE PATCH (double-rebase scan): исправлено %u слов в __text [0x%X..0x%X]",
+            fixed_count, text_start, text_end);
+        LogToJava(std::string(msg));
+    }
+
+    // =======================================================================
+    // POST-REBASE ПАТЧ 2: PC-относительный офсет в G_ReloadDefaults (__text+0x19BDC)
+    // =======================================================================
+    // ОТДЕЛЬНЫЙ баг (не двойной ребейз): значение 0x000B80C4 в литерал-пуле
+    // было ребейзено ОДИН РАЗ до 0x100B80C4 — это выглядит корректно для
+    // абсолютного указателя, но ARM-инструкция "LDR R1, [PC, R3]" использует
+    // его как PC-ОТНОСИТЕЛЬНОЕ СМЕЩЕНИЕ (не абсолютный адрес).
+    // PC + 0x100B80C4 = 0x200D1BC8 — за пределами адресного пространства -> SIGSEGV.
+    // Правильное значение: 0x000B80C4 (без ребейза — тогда PC + 0x000B80C4 = 0x100D1BC8, валидно).
     {
         uint32_t* patch_addr = (uint32_t*)(g_appSlide + 0x19BDC);
-        if (*patch_addr == (0x000B80C4 + g_appSlide)) {
+        // После патча 1 двойной ребейз уже снят; этот слот мог содержать
+        // 0x200B80C4 -> стал 0x100B80C4 (ребейзнут один раз). Нам нужно 0x000B80C4.
+        // Либо если патч 1 его не задел (не попал в диапазон [0x20000000,0x20400000)),
+        // он всё ещё 0x100B80C4 — тоже нужно убрать ещё один ребейз.
+        uint32_t cur = *patch_addr;
+        const uint32_t expected_after_p1 = 0x000B80C4 + g_appSlide; // = 0x100B80C4
+        if (cur == expected_after_p1 || cur == expected_after_p1 + g_appSlide) {
             *patch_addr = 0x000B80C4;
-            LogToJava("POST-REBASE PATCH: Откатили ребейз литерал-пула __text+0x19BDC (G_ReloadDefaults crash fix)");
-        } else {
-            char dbg[128];
-            snprintf(dbg, sizeof(dbg), "POST-REBASE PATCH: __text+0x19BDC = 0x%08X (ожидали 0x%08X), пропускаем",
-                     *patch_addr, (uint32_t)(0x000B80C4 + g_appSlide));
-            LogToJava(std::string(dbg));
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                "POST-REBASE PATCH (PC-rel fix): __text+0x19BDC: 0x%08X -> 0x000B80C4 (G_ReloadDefaults)", cur);
+            LogToJava(std::string(msg));
         }
     }
-    // -----------------------------------------------------------------------
+    // =======================================================================
     // ФИКС ЧЕРНОГО ЭКРАНА #1: перехватываем -[EAGLView presentFramebuffer] на уровне IMP.
     // Wolf3D вызывает этот метод через прямой указатель из нативного кода (drawFrame),
     // поэтому Stub_objc_msgSend его не видит. Патчим IMP трамплином.
