@@ -10055,6 +10055,18 @@ extern bool g_machOLoaded;
 // в статический буфер (без malloc).
 
 extern "C" void* wrap_malloc(size_t size) {
+    // ФИКС: Защита от bogus-размера (например strlen(null)+1 = 0xFFFFFFFF).
+    // Такой malloc возвращает NULL, игра потом делает BLX R0 (null) → SIGSEGV.
+    // Если size явно невалиден (>= 0x80000000), выделяем 1 байт и логируем.
+    if (size >= 0x80000000u) {
+        uint32_t lr0 = (uint32_t)__builtin_return_address(0);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "C-API-DEBUG: [malloc] BOGUS SIZE GUARD: size=0x%zX -> заменяем на 1 байт! lr=0x%X (module: %s)",
+            size, lr0, GetModuleInfoForAddress(lr0).c_str());
+        LogToJava(std::string(buf));
+        return malloc(1); // Возвращаем ненулевой указатель — предотвращаем BLX-null краш
+    }
     void* res = malloc(size);
     if (size > 5 * 1024 * 1024) {
         uint32_t lr0 = (uint32_t)__builtin_return_address(0);
@@ -10175,6 +10187,21 @@ extern "C" void* wrap_fopen(const char* path, const char* mode) {
         if (real_f) {
             sPath = bundlePath;
             LogToJava("C-API-IO: Файл успешно открыт из Bundle: " + sPath);
+        }
+    }
+
+    // ФИКС: id.bin — список купленных ID, на первом запуске не существует.
+    // fopen("id.bin","rb") падает → LoadListIDsv оставляет мусорный путь →
+    // SetActiveBundle(null) → strlen(null)+1 = 0xFFFFFFFF → malloc(MAX) = NULL → BLX null → SIGSEGV.
+    // Создаём пустой id.bin чтобы LoadListIDsv получил EOF и не портил путь бандла.
+    if (!real_f && (origPath == "id.bin" || sPath.find("/id.bin") != std::string::npos)) {
+        std::string createPath = g_sandboxDir + "Documents/id.bin";
+        FILE* empty_f = fopen(createPath.c_str(), "wb");
+        if (empty_f) { fclose(empty_f); }
+        real_f = fopen(createPath.c_str(), "rb");
+        if (real_f) {
+            sPath = createPath;
+            LogToJava("C-API-IO: [fopen] id.bin не существовал — создан пустой файл: " + createPath);
         }
     }
 
@@ -12036,6 +12063,46 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                 className, selName, imp_addr, (uint32_t)(uintptr_t)replacement);
             LogToJava(log);
             return;
+        }
+    }
+
+    // ФИКС: метод может быть в суперклассе (например EAGLView наследует от UIView, которая
+    // реализует presentFramebuffer/setFramebuffer). Ищем по всем символам _OBJC_CLASS_$_*
+    // и проверяем их method list. Это ловит случай, когда класс найден, но метод определён
+    // в базовом классе, а не переопределён в самом EAGLView.
+    {
+        // Попробуем суперкласс: cls[1] в ObjC runtime структуре = указатель на суперкласс
+        uint32_t super_ptr = cls[1];
+        int depth = 0;
+        while (super_ptr && super_ptr >= 0x1000 && depth < 8) {
+            uint32_t* super_cls = (uint32_t*)super_ptr;
+            uint32_t super_data = super_cls[4] & ~3u;
+            if (super_data && super_data >= 0x1000) {
+                uint32_t* super_ro = (uint32_t*)super_data;
+                uint32_t super_mlist_ptr = super_ro[5];
+                if (super_mlist_ptr && super_mlist_ptr >= 0x1000) {
+                    uint32_t* super_mlist = (uint32_t*)super_mlist_ptr;
+                    uint32_t super_count = super_mlist[1];
+                    if (super_count < 10000) {
+                        uint32_t* super_methods = super_mlist + 2;
+                        for (uint32_t i = 0; i < super_count; i++) {
+                            uint32_t m_name_ptr = super_methods[i*3 + 0];
+                            uint32_t* m_imp_ptr = &super_methods[i*3 + 2];
+                            if (isValidString((const char*)m_name_ptr) && strcmp((const char*)m_name_ptr, selName) == 0) {
+                                uint32_t imp_addr = *m_imp_ptr;
+                                PatchThumbFunctionToReplacement(imp_addr | 1u, replacement);
+                                char log[256];
+                                snprintf(log, sizeof(log), "PATCH: -[%s(super) %s] IMP @ 0x%08X -> replacement @ 0x%08X",
+                                    className, selName, imp_addr, (uint32_t)(uintptr_t)replacement);
+                                LogToJava(log);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            super_ptr = super_cls[1];
+            depth++;
         }
     }
     LogToJava(std::string("PATCH-WARN: метод ") + selName + " не найден в " + className);
