@@ -12109,6 +12109,47 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
             depth++;
         }
     }
+
+    // ФИКС ЧЁРНОГО ЭКРАНА: presentFramebuffer/setFramebuffer определены в ObjC-категории
+    // на EAGLView, а не в основном method list класса. Сканируем __objc_catlist.
+    // struct category_t { name, cls, instanceMethods, classMethods, ... }
+    {
+        const uint32_t APP_LO = g_appSlide;
+        const uint32_t APP_HI = g_appSlide + 0x1000000u;
+        for (const auto& sec : g_machoSections) {
+            if (sec.name.find("__objc_catlist") == std::string::npos) continue;
+            uint32_t* slot     = (uint32_t*)sec.start;
+            uint32_t* slot_end = (uint32_t*)sec.end;
+            for (; slot < slot_end; slot++) {
+                uint32_t cat_ptr = *slot;
+                if (cat_ptr < APP_LO || cat_ptr >= APP_HI) continue;
+                uint32_t* cat = (uint32_t*)cat_ptr;
+                // cat[1] = pointer to the class this category extends
+                uint32_t cat_cls = cat[1];
+                if (cat_cls != class_ptr) continue; // другой класс
+                // cat[2] = instanceMethods method_list_t*
+                uint32_t mlist_ptr = cat[2];
+                if (mlist_ptr < APP_LO || mlist_ptr >= APP_HI) continue;
+                uint32_t* mlist = (uint32_t*)mlist_ptr;
+                uint32_t count = mlist[1];
+                if (count >= 10000) continue;
+                uint32_t* methods = mlist + 2;
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t m_name_ptr = methods[i*3 + 0];
+                    uint32_t* m_imp_ptr = &methods[i*3 + 2];
+                    if (isValidString((const char*)m_name_ptr) && strcmp((const char*)m_name_ptr, selName) == 0) {
+                        uint32_t imp_addr = *m_imp_ptr;
+                        PatchThumbFunctionToReplacement(imp_addr | 1u, replacement);
+                        char log[256];
+                        snprintf(log, sizeof(log), "PATCH: -[%s(category) %s] IMP @ 0x%08X -> replacement @ 0x%08X",
+                            className, selName, imp_addr, (uint32_t)(uintptr_t)replacement);
+                        LogToJava(log);
+                        return;
+                    }
+                }
+            }
+        }
+    }
     LogToJava(std::string("PATCH-WARN: метод ") + selName + " не найден в " + className);
 }
 
@@ -13353,6 +13394,20 @@ void* NativeExecutionThread(void* arg) {
     EGLint w = 0, h = 0;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+    // ФИКС ЧЁРНОГО ЭКРАНА: Java может передать resWidth=0 в initWrapper -> g_surfaceWidth=0
+    // -> UIScreen bounds = {0,0,0,0} -> игра ставит viewport 0x0 -> ничего не рисуется.
+    // Обновляем из реальных EGL-размеров сразу, до запуска игрового кода.
+    if (w > 0 && h > 0) {
+        if (g_surfaceWidth != w || g_surfaceHeight != h) {
+            char fixBuf[128];
+            snprintf(fixBuf, sizeof(fixBuf),
+                "[EGL-FIX] g_surface: %dx%d -> %dx%d (реальный размер EGL surface)",
+                g_surfaceWidth, g_surfaceHeight, w, h);
+            LogToJava(fixBuf);
+        }
+        g_surfaceWidth  = w;
+        g_surfaceHeight = h;
+    }
     char eglBuf[256];
     snprintf(eglBuf, sizeof(eglBuf), "[MEGA-DEBUG] NativeExecutionThread init: Ctx=%p, Dpy=%p, Surf=%p, SurfSize=%dx%d", ctx, dpy, surf, w, h);
     LogToJava(eglBuf);
