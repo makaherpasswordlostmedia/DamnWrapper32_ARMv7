@@ -12065,6 +12065,59 @@ static void ApplyGamePatches() {
     }
 
     // =======================================================================
+    // POST-REBASE ПАТЧ 1б: ДВОЙНОЙ РЕБЕЙЗ в секциях данных
+    // =======================================================================
+    // Патч 1 выше покрывает только __text — и в текущем крэше нашёл 0 слов.
+    // Значит двойной указатель (0x200cb400) сидит в одной из data-секций
+    // (__objc_const, __nl_symbol_ptr, __data, __const и т.д.).
+    // Сканируем все секции кроме кодовых тем же диапазоном [DOUBLE_LO, DOUBLE_HI).
+    {
+        const uint32_t SLIDE     = g_appSlide;
+        const uint32_t DOUBLE_LO = 0x20000000u;
+        const uint32_t DOUBLE_HI = 0x20400000u;
+        uint32_t fixed_count = 0;
+
+        for (const auto& sec : g_machoSections) {
+            // Пропускаем код — его уже обработал патч 1 выше
+            if (sec.name.find("__TEXT,__text")    != std::string::npos) continue;
+            if (sec.name.find("__stub")            != std::string::npos) continue;
+            if (sec.name.find("__symbol_stub")     != std::string::npos) continue;
+            if (sec.name.find("__picsymbolstub")   != std::string::npos) continue;
+            // Пропускаем строковые секции — там не бывает указателей
+            if (sec.name.find("__cstring")         != std::string::npos) continue;
+            if (sec.name.find("__objc_methname")   != std::string::npos) continue;
+            if (sec.name.find("__objc_classname")  != std::string::npos) continue;
+            if (sec.name.find("__objc_methtype")   != std::string::npos) continue;
+            // __bss и __common — нулевые/рантаймовые, двойного ребейза там нет
+            if (sec.name.find("__bss")             != std::string::npos) continue;
+            if (sec.name.find("__common")          != std::string::npos) continue;
+
+            if (sec.end <= sec.start) continue;
+
+            uint32_t* p   = (uint32_t*)sec.start;
+            uint32_t* end = (uint32_t*)sec.end;
+            while (p < end) {
+                uint32_t v = *p;
+                if (v >= DOUBLE_LO && v < DOUBLE_HI) {
+                    char dbg[128];
+                    snprintf(dbg, sizeof(dbg),
+                        "POST-REBASE PATCH (data double-rebase): sec=%s slot=0x%X 0x%X->0x%X",
+                        sec.name.c_str(), (uint32_t)(uintptr_t)p, v, v - SLIDE);
+                    LogToJava(std::string(dbg));
+                    *p = v - SLIDE;
+                    fixed_count++;
+                }
+                p++;
+            }
+        }
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "POST-REBASE PATCH (data double-rebase scan): исправлено %u слов в data-секциях",
+            fixed_count);
+        LogToJava(std::string(msg));
+    }
+
+    // =======================================================================
     // POST-REBASE ПАТЧ 2: PC-относительный офсет в G_ReloadDefaults (__text+0x19BDC)
     // =======================================================================
     // ОТДЕЛЬНЫЙ баг (не двойной ребейз): значение 0x000B80C4 в литерал-пуле
@@ -12742,7 +12795,10 @@ void LoadMachO(const std::string& bundlePath) {
                                 for (uint32_t j = 0; j < count; j++) {
                                     uint32_t val = ptr[j];
                                     
-                                    if (val == 18362952 || val == 18321096 || val == 7339996) {
+                                    if (val == 18362952 || val == 18321096 || val == 7339996
+                                        || val == 0xcb400      // 832512 — текущий крэш W_LumpNameHash
+                                        || val == 0x100cb400   // уже-ребейзнутая версия того же указателя
+                                    ) {
                                         char alert_buf[256];
                                         snprintf(alert_buf, sizeof(alert_buf), "REBASE-ALERT: Целевая переменная %u (0x%X) найдена по адресу 0x%X (секция %s)", val, val, sect.addr + j*4, sectname.c_str());
                                         LogToJava(alert_buf);
@@ -12889,6 +12945,8 @@ void LoadMachO(const std::string& bundlePath) {
                 //   4. in_known check: цель должна быть в g_machoSections (или в [min..max] для __data)
                 {
                     uint32_t second_pass_count = 0;
+                    FILE* f_diag2 = fopen((g_workDir + "rebase_diag___2ndpass.txt").c_str(), "w");
+                    if (f_diag2) fprintf(f_diag2, "DIAGNOSTICS FOR SECOND PASS\n");
                     for (const auto& sec2 : g_machoSections) {
                         bool is_ptr_table_sec = (
                             sec2.name.find("__DATA,__const") != std::string::npos ||
@@ -12944,8 +13002,15 @@ void LoadMachO(const std::string& bundlePath) {
                             ptr2[j2] = shifted2;
                             g_rebasedSlots.insert(slot2);
                             second_pass_count++;
+                            // Диагностика второго прохода — все слоты в файл
+                            if (f_diag2) {
+                                fprintf(f_diag2,
+                                    "ADDR: 0x%08X | VAL: 0x%08X->0x%08X | SEC: %s\n",
+                                    (uint32_t)(slot2 - g_appSlide), val2, shifted2,
+                                    sec2.name.c_str());
+                            }
                             // Диагностика для конкретных адресов краша
-                            if (val2 == 0x40a68 || val2 == 0x2bbf0) {
+                            if (val2 == 0x40a68 || val2 == 0x2bbf0 || val2 == 0xcb400) {
                                 char dbg[128];
                                 snprintf(dbg, sizeof(dbg), "REBASE-2ND: slot=0x%08X val=0x%08X->0x%08X sec=%s",
                                     (uint32_t)slot2, val2, shifted2, sec2.name.c_str());
@@ -12953,6 +13018,7 @@ void LoadMachO(const std::string& bundlePath) {
                             }
                         }
                     }
+                    if (f_diag2) fclose(f_diag2);
                     LogToJava("REBASE-TRACE: Второй проход (ptr-table секции): дополнительно сдвинуто " + std::to_string(second_pass_count) + " указателей.");
                 }
                 // === КОНЕЦ ВТОРОГО ПРОХОДА ===
