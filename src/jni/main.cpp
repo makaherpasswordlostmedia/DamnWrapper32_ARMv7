@@ -12066,21 +12066,22 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
         }
     }
 
-    // ФИКС: метод может быть в суперклассе (например EAGLView наследует от UIView, которая
-    // реализует presentFramebuffer/setFramebuffer). Ищем по всем символам _OBJC_CLASS_$_*
-    // и проверяем их method list. Это ловит случай, когда класс найден, но метод определён
-    // в базовом классе, а не переопределён в самом EAGLView.
+    // ФИКС: метод может быть в суперклассе нативного ObjC-класса.
+    // ВАЖНО: cls[1] суперкласс — уже ребейзнутый указатель внутри игрового бинаря.
+    // Если суперкласс — HLE-объект (0xe1xxxxxxx), его нельзя читать как class_ro_t -> краш.
+    // Проверяем диапазон: только указатели в [g_appSlide, g_appSlide + 0x1000000) безопасны.
     {
-        // Попробуем суперкласс: cls[1] в ObjC runtime структуре = указатель на суперкласс
+        const uint32_t APP_LO = g_appSlide;
+        const uint32_t APP_HI = g_appSlide + 0x1000000u;
         uint32_t super_ptr = cls[1];
         int depth = 0;
-        while (super_ptr && super_ptr >= 0x1000 && depth < 8) {
+        while (super_ptr >= APP_LO && super_ptr < APP_HI && depth < 8) {
             uint32_t* super_cls = (uint32_t*)super_ptr;
             uint32_t super_data = super_cls[4] & ~3u;
-            if (super_data && super_data >= 0x1000) {
+            if (super_data >= APP_LO && super_data < APP_HI) {
                 uint32_t* super_ro = (uint32_t*)super_data;
                 uint32_t super_mlist_ptr = super_ro[5];
-                if (super_mlist_ptr && super_mlist_ptr >= 0x1000) {
+                if (super_mlist_ptr >= APP_LO && super_mlist_ptr < APP_HI) {
                     uint32_t* super_mlist = (uint32_t*)super_mlist_ptr;
                     uint32_t super_count = super_mlist[1];
                     if (super_count < 10000) {
@@ -12101,7 +12102,10 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                     }
                 }
             }
-            super_ptr = super_cls[1];
+            // Суперкласс суперкласса: cls[1] следующего уровня
+            uint32_t next = super_cls[1];
+            if (next == super_ptr) break; // цикл
+            super_ptr = next;
             depth++;
         }
     }
