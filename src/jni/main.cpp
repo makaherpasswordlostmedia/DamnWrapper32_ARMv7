@@ -6794,6 +6794,24 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return 1;
         }
 
+        // ФИКС КРАША: updateOffscreenTextureDimensions вызывается нативным кодом EAGLView,
+        // который внутри обращается к IRendererGL через ivar. Если IRenderer не инициализирован
+        // (alloc/init прошёл через наш HLE без полноценного конструктора) — SIGSEGV на R0=0.
+        // Оба метода связаны с внутренней системой масштабирования offscreen-текстур которая
+        // нам не нужна: мы рендерим через EGL напрямую.
+        // Перехватываем полностью — нативный IMP не вызываем.
+        if (strcmp(op, "updateOffscreenTextureDimensions") == 0) {
+            LogToJava("HLE: [" + cName + " updateOffscreenTextureDimensions] -> intercepted (IRenderer guard, no-op)");
+            return 0;
+        }
+        if (strcmp(op, "setNPresentationScaleX:") == 0 ||
+            strcmp(op, "setNPresentationScaleY:") == 0 ||
+            strcmp(op, "setNPresentationScale:") == 0) {
+            // Эти методы тоже ведут через IRendererGL и нам не нужны.
+            LogToJava("HLE: [" + cName + " " + std::string(op) + "] -> intercepted (IRenderer guard, no-op)");
+            return 0;
+        }
+
         void* imp = FindMethodIMP(isa, op);
         if (imp) {
             LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " " + std::string(op) + "]");
@@ -10039,10 +10057,15 @@ extern bool g_machOLoaded;
 extern "C" void* wrap_malloc(size_t size) {
     void* res = malloc(size);
     if (size > 5 * 1024 * 1024) {
-        uint32_t lr = (uint32_t)__builtin_return_address(0);
-        char buf[128];
-        snprintf(buf, sizeof(buf), "C-API-DEBUG: [malloc] АНОМАЛИЯ! size=%zu lr=0x%X", size, lr);
+        uint32_t lr0 = (uint32_t)__builtin_return_address(0);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "C-API-DEBUG: [malloc] АНОМАЛИЯ! size=%zu lr=0x%X (module: %s)",
+                 size, lr0, GetModuleInfoForAddress(lr0).c_str());
         LogToJava(std::string(buf));
+        if (!res) {
+            snprintf(buf, sizeof(buf), "C-API-DEBUG: [malloc] АНОМАЛИЯ: malloc вернул NULL для size=%zu — последующий краш вероятен!", size);
+            LogToJava(std::string(buf));
+        }
     }
     return res;
 }
@@ -12885,13 +12908,24 @@ void LoadMachO(const std::string& bundlePath) {
                                                     }
                                                 }
                                             } else {
+                                                // Цель в секции, но не code/string/struct — прочие __data.
                                                 if ((val & 3) != 0) {
                                                     if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "Data: Unaligned & Bad ASCII"; }
                                                 }
+                                                // Маленькое выровненное значение — stride/size буфера, не указатель.
+                                                else if (val < 0x10000 && (val & 0x7F) == 0) { safe_to_rebase = false; reason = "Data: SmallAligned (Buffer Size)"; }
                                             }
                                         } else {
                                             safe_to_rebase = false;
                                             reason = "Unknown Target";
+                                        }
+                                        // Глобальный guard на stride/size значения независимо от target-секции:
+                                        // маленькое значение (<0x10000), кратное 0x80 — это stride/size буфера,
+                                        // а не указатель (арифметическая прогрессия с шагом кратным 128).
+                                        // Применяем ПОСЛЕ классификации target чтобы перекрыть все ветки.
+                                        if (safe_to_rebase && val < 0x10000 && (val & 0x7F) == 0) {
+                                            safe_to_rebase = false;
+                                            reason = "Global: SmallAligned (Buffer Stride)";
                                         }
 
                                         uint32_t curr_addr = sect.addr + j*4;
@@ -13002,7 +13036,11 @@ void LoadMachO(const std::string& bundlePath) {
                                 in_known = (shifted2 >= slid_min2 + 0x1000 && shifted2 < slid_max2);
                             }
                             // Дополнительный guard: маленькое значение (<0x10000), кратное 0x80 —
-                            // это stride/size буфера (matrix palette и т.п.), не указатель
+                            // это stride/size буфера (matrix palette, GL buffer и т.п.), не указатель.
+                            // Применяем БЕЗУСЛОВНО (не только когда in_known==true),
+                            // чтобы поймать случай когда shifted2 случайно попадает в __text
+                            // только потому что в данном бинаре __text начинается низко.
+                            if (val2 < 0x10000 && (val2 & 0x7F) == 0) continue;
                             if (in_known && is_data_sec && val2 < 0x10000 && (val2 & 0x7F) == 0) {
                                 in_known = false;
                             }
