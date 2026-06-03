@@ -12861,6 +12861,9 @@ void LoadMachO(const std::string& bundlePath) {
                                                 // val&3==2 => не выровнен по 4, не реальный указатель — пропускаем
                                                 if ((val & 1) == 0 && (val & 3) != 0) { safe_to_rebase = false; reason = "Code: Even"; }
                                                 else if (((val >> 16) & 0xFFFF) == (val & 0xFFFF)) { safe_to_rebase = false; reason = "Code: Symmetric"; }
+                                                // Маленькое значение (<0x10000), кратное 0x80 — это stride/size буфера
+                                                // (matrix palette, OpenGL buffer sizes и т.п.), не code pointer
+                                                else if (val < 0x10000 && (val & 0x7F) == 0) { safe_to_rebase = false; reason = "Code: SmallAligned (Buffer Size)"; }
                                             } else if (is_raw_string_target) {
                                                 if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "String: Invalid"; }
                                             } else if (is_struct_target) {
@@ -12997,6 +13000,11 @@ void LoadMachO(const std::string& bundlePath) {
                             // (например __bss которая может быть в g_machoSections с size=0 или отсутствовать)
                             if (!in_known && is_data_sec) {
                                 in_known = (shifted2 >= slid_min2 + 0x1000 && shifted2 < slid_max2);
+                            }
+                            // Дополнительный guard: маленькое значение (<0x10000), кратное 0x80 —
+                            // это stride/size буфера (matrix palette и т.п.), не указатель
+                            if (in_known && is_data_sec && val2 < 0x10000 && (val2 & 0x7F) == 0) {
+                                in_known = false;
                             }
                             if (!in_known) continue;
                             ptr2[j2] = shifted2;
