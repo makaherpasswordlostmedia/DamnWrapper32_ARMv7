@@ -10061,11 +10061,15 @@ extern "C" void* wrap_malloc(size_t size) {
     if (size >= 0x80000000u) {
         uint32_t lr0 = (uint32_t)__builtin_return_address(0);
         char buf[256];
+        // Выделяем 4096 байт вместо 1: IRenderer конструктор пишет в этот буфер поля объекта.
+        // 1 байт вызывал тихую порчу памяти (writes OOB) -> рендерер ломался -> чёрный экран.
+        // 4 KB с нулями безопасны: конструктор пишет структуру, не выходя за этот размер.
+        void* safe_buf = calloc(1, 4096);
         snprintf(buf, sizeof(buf),
-            "C-API-DEBUG: [malloc] BOGUS SIZE GUARD: size=0x%zX -> заменяем на 1 байт! lr=0x%X (module: %s)",
+            "C-API-DEBUG: [malloc] BOGUS SIZE GUARD: size=0x%zX -> выделяем 4096 байт (calloc). lr=0x%X (%s)",
             size, lr0, GetModuleInfoForAddress(lr0).c_str());
         LogToJava(std::string(buf));
-        return malloc(1); // Возвращаем ненулевой указатель — предотвращаем BLX-null краш
+        return safe_buf;
     }
     void* res = malloc(size);
     if (size > 5 * 1024 * 1024) {
@@ -14748,8 +14752,26 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivity_initWrapper(JNIEnv *env, jobject thiz, jstring workDir, jstring appBundle, jstring bundleId, jboolean logRender, jboolean logSound, jboolean logFs, jboolean logNet, jboolean logTodo, jboolean logRenderDebug, jboolean logFuncList, jboolean logHiddenClasses, jboolean logOther, jint spamFiltersMask, jboolean onScreenDebugOverlay, jboolean showPerfOverlay, jboolean nativeRootMmap, jint resWidth, jint resHeight, jint esMode, jint gpuOffloadMask) {
     g_mainActivity = env->NewGlobalRef(thiz); 
     g_gpuOffloadMask = gpuOffloadMask;
-    g_surfaceWidth = resWidth;
-    g_surfaceHeight = resHeight;
+    // ФИКС: логируем вызов initWrapper чтобы видеть повторные вызовы с resWidth=0.
+    // Если Java вызывает initWrapper повторно с resWidth=0 (например при onResume),
+    // это затирало бы уже скорректированный g_surfaceWidth из EGL -> чёрный экран.
+    // Обновляем размеры только если новые значения > 0.
+    {
+        char iwBuf[128];
+        snprintf(iwBuf, sizeof(iwBuf), "[initWrapper] resWidth=%d resHeight=%d (current: %dx%d)",
+            resWidth, resHeight, g_surfaceWidth, g_surfaceHeight);
+        // Записываем в лог-файл напрямую, т.к. JNI env ещё не полностью настроен
+        LogToJava(iwBuf);
+    }
+    if (resWidth > 0 && resHeight > 0) {
+        g_surfaceWidth  = resWidth;
+        g_surfaceHeight = resHeight;
+    } else if (g_surfaceWidth <= 0 || g_surfaceHeight <= 0) {
+        // Фолбэк: если EGL ещё не дал нам размер и Java тоже даёт 0 - используем типичный дефолт
+        g_surfaceWidth  = 480;
+        g_surfaceHeight = 320;
+    }
+    // (если resWidth==0 но у нас уже есть валидный размер из EGL - оставляем его)
     g_logRender = logRender;
     g_logSound = logSound;
     g_logFs = logFs;
