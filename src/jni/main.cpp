@@ -4603,6 +4603,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             float fw = g_views[self].frame[2]; float fh = g_views[self].frame[3];
             if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) { w = fw; h = fh; }
         }
+        // Защита от нуля
+        if (w <= 0.0f || w > 4096.0f) { w = 480.0f; h = 320.0f; }
         
         float rect[4] = {x, y, w, h};
         LogToJava(">>>>>>>> [SIZE-CRITICAL] NORMAL MSG_SEND " + std::string(op) + " <<<<<<<<");
@@ -5961,18 +5963,22 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return returnCount;
         }
         if ((clsName == "NSArray" || clsName == "NSMutableArray") && strcmp(op, "objectEnumerator") == 0) {
-            uint32_t* enumInst = (uint32_t*)calloc(1, 32);
+            // Allocate 48 bytes: [0]=isa, [1..2]=64-bit array pointer, [3]=index
+            uint32_t* enumInst = (uint32_t*)calloc(1, 48);
             enumInst[0] = (uint32_t)g_hleClasses["NSEnumerator"];
-            enumInst[1] = (uint32_t)self; // Указатель на массив
-            enumInst[2] = 0; // Текущий индекс
+            uint64_t selfPtr = (uint64_t)(uintptr_t)self;
+            memcpy(&enumInst[1], &selfPtr, 8); // Store full 64-bit pointer in slots [1]+[2]
+            enumInst[3] = 0; // Current index
             return (uint64_t)(uintptr_t)enumInst;
         }
         if (clsName == "NSEnumerator" && strcmp(op, "nextObject") == 0) {
             uint32_t* enumInst = (uint32_t*)self;
-            void* arrPtr = (void*)enumInst[1];
-            uint32_t idx = enumInst[2];
+            uint64_t arrPtrRaw = 0;
+            memcpy(&arrPtrRaw, &enumInst[1], 8); // Read full 64-bit pointer
+            void* arrPtr = (void*)(uintptr_t)arrPtrRaw;
+            uint32_t idx = enumInst[3];
             if (arrPtr && g_arrays.count(arrPtr) && idx < g_arrays[arrPtr].size()) {
-                enumInst[2] = idx + 1;
+                enumInst[3] = idx + 1;
                 return (uint64_t)(uintptr_t)g_arrays[arrPtr][idx];
             }
             return 0;
@@ -6975,6 +6981,8 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
             float fw = g_views[self].frame[2]; float fh = g_views[self].frame[3];
             if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) { w = fw; h = fh; }
         }
+        // Защита от нуля: если g_surfaceWidth ещё не инициализирован — используем дефолт
+        if (w <= 0.0f || w > 4096.0f) { w = 480.0f; h = 320.0f; }
         
         // ВНИМАНИЕ: Возвращаем нормальный CGRect: x=0, y=0, w=width, h=height
         float rectData[4] = {0.0f, 0.0f, w, h};
@@ -7099,32 +7107,31 @@ void* Impl_objc_msgSendSuper2_stret(void* ret_addr, void* super_struct, const ch
     LogToJava(std::string("OBJC-SUPER-STRET-CALL: [(") + cName + "*) " + std::string(op) + "]");
     if (strcmp(op, "frame") == 0 || strcmp(op, "bounds") == 0) {
         LogToJava("[SUPER-STRET-DEBUG] Перехват " + std::string(op) + "! ret_addr=0x" + std::to_string((uintptr_t)ret_addr));
-        if (ret_addr) {
-            float rectData[4] = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
-            if (cName.find("UIScreen") != std::string::npos) {
-                rectData[2] = (float)g_surfaceWidth;
-                rectData[3] = (float)g_surfaceHeight;
-            } else if (g_views.count(receiver)) {
-                float fw = g_views[receiver].frame[2]; float fh = g_views[receiver].frame[3];
-                if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) {
-                    rectData[0] = g_views[receiver].frame[0]; rectData[1] = g_views[receiver].frame[1];
-                    rectData[2] = fw; rectData[3] = fh;
-                }
+        float rectData[4] = {0.0f, 0.0f, (float)g_surfaceWidth, (float)g_surfaceHeight};
+        if (cName.find("UIScreen") != std::string::npos) {
+            rectData[2] = (float)g_surfaceWidth;
+            rectData[3] = (float)g_surfaceHeight;
+        } else if (g_views.count(receiver)) {
+            float fw = g_views[receiver].frame[2]; float fh = g_views[receiver].frame[3];
+            if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) {
+                rectData[0] = g_views[receiver].frame[0]; rectData[1] = g_views[receiver].frame[1];
+                rectData[2] = fw; rectData[3] = fh;
             }
-            if (rectData[2] <= 0.0f || rectData[3] <= 0.0f) {
-                rectData[2] = (float)g_surfaceWidth; rectData[3] = (float)g_surfaceHeight;
         }
-        memcpy(ret_addr, rectData, 16);
+        if (rectData[2] <= 0.0f || rectData[3] <= 0.0f) {
+            rectData[2] = (float)g_surfaceWidth; rectData[3] = (float)g_surfaceHeight;
+        }
+        if (ret_addr) {
+            memcpy(ret_addr, rectData, 16);
+        }
         LogToJava("[SUPER-STRET-DEBUG] Записано: x=" + std::to_string(rectData[0]) + " y=" + std::to_string(rectData[1]) + " w=" + std::to_string(rectData[2]) + " h=" + std::to_string(rectData[3]));
-
         g_fpu_ret[0] = rectData[0];
         g_fpu_ret[1] = rectData[1];
         g_fpu_ret[2] = rectData[2];
         g_fpu_ret[3] = rectData[3];
         g_fpu_ret_flag = 1;
+        return ret_addr;
     }
-    return ret_addr;
-}
 
     if (strcmp(op, "locationInView:") == 0 || strcmp(op, "previousLocationInView:") == 0) {
         if (ret_addr) {
@@ -8341,7 +8348,43 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             Stub_objc_msgSend(g_displayLinkTarget, g_displayLinkSelector, realFakeLink, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         } else {
             static int idle_ticks = 0;
-            if (idle_ticks++ % 60 == 0) LogToJava("[MAIN-LOOP] Крутимся в IDLE_LOOP. g_renderingStarted=" + std::to_string(g_renderingStarted) + " target_set=" + std::to_string(g_displayLinkTarget != nullptr));
+            idle_ticks++;
+            if (idle_ticks % 60 == 0) LogToJava("[MAIN-LOOP] Крутимся в IDLE_LOOP. g_renderingStarted=" + std::to_string(g_renderingStarted) + " target_set=" + std::to_string(g_displayLinkTarget != nullptr));
+
+            // ФИКС ЧЕРНОГО ЭКРАНА: если g_displayLinkTarget уже установлен (CADisplayLink создан
+            // через displayLinkWithTarget:), но g_renderingStarted ещё false (addToRunLoop не был
+            // вызван через msgSend), — форсируем запуск рендера после 2 секунд ожидания.
+            if (!g_renderingStarted && g_displayLinkTarget && g_displayLinkSelector && idle_ticks > 120) {
+                LogToJava("[MAIN-LOOP] FALLBACK: g_displayLinkTarget установлен, но renderingStarted=false. Принудительно включаем рендер.");
+                g_renderingStarted = true;
+            }
+            // Аналогичный fallback для NSTimer-режима: если g_renderingStarted стало true
+            // но g_displayLinkSelector пустой — ищем drawFrame/drawView у известных объектов.
+            if (g_renderingStarted && (!g_displayLinkTarget || !g_displayLinkSelector)) {
+                LogToJava("[MAIN-LOOP] FALLBACK: renderingStarted=true но target/sel не задан. Ищем drawFrame...");
+                for (auto const& pair : g_appSymbols) {
+                    if (pair.first.find("_OBJC_CLASS_$_") == 0) {
+                        const char* selCandidates[] = {"drawFrame", "drawView:", "renderFrame", nullptr};
+                        for (int si = 0; selCandidates[si]; si++) {
+                            if (FindMethodIMP(pair.second, selCandidates[si])) {
+                                // Нужен экземпляр — ищем в g_views
+                                for (auto const& vp : g_views) {
+                                    std::string vCls = GetObjCClassName(vp.first);
+                                    std::string symCls = pair.first.substr(strlen("_OBJC_CLASS_$_"));
+                                    if (vCls.find(symCls) != std::string::npos) {
+                                        g_displayLinkTarget = vp.first;
+                                        g_displayLinkSelector = selCandidates[si];
+                                        LogToJava("[MAIN-LOOP] FALLBACK: найден target=" + vCls + " sel=" + std::string(selCandidates[si]));
+                                        break;
+                                    }
+                                }
+                                if (g_displayLinkTarget) break;
+                            }
+                        }
+                    }
+                    if (g_displayLinkTarget) break;
+                }
+            }
             SyncLog("\n[ABSOLUTE-IDLE-LOOP] --- FRAME START ---");
             g_frameHasDraw = false;
             SyncLog("[ABSOLUTE-IDLE-LOOP] 1. Checking Context...");
@@ -10031,7 +10074,6 @@ std::string DumpHexToString(const char* data, int max_len) {
     char buf[16];
     for (int i = 0; i < max_len; i++) {
         unsigned char c = (unsigned char)data[i];
-        if (c == 0) { hex += "00 "; break; } // Смотрим, где строка реально обрывается
         snprintf(buf, sizeof(buf), "%02X ", c);
         hex += buf;
     }
@@ -11967,6 +12009,63 @@ static void __attribute__((pcs("aapcs"))) hle_setFramebuffer_replacement(void* s
     glViewport(0, 0, vpW, vpH);
 }
 
+// =============================================================================
+// ПАТЧ: -[MainViewController startAnimation] / -[EAGLView startAnimation]
+// Action Buggy вызывает startAnimation через кешированный IMP напрямую,
+// минуя objc_msgSend — поэтому g_renderingStarted никогда не выставляется.
+// Перехватываем на уровне IMP и выставляем флаг рендера.
+// Оригинальный IMP вызывается через нативный вызов ниже (уже пропатчен, 
+// цикл через трамплин не происходит — патч перезаписывает первые 8 байт функции).
+// =============================================================================
+static void* __attribute__((pcs("aapcs"))) hle_startAnimation_replacement(void* self, void* _cmd) {
+    LogToJava("PATCH-HIT: -[startAnimation] intercepted via IMP patch -> g_renderingStarted = true");
+    if (!g_renderingStarted) {
+        g_renderingStarted = true;
+        // Пытаемся определить CADisplayLink target/selector из объекта если ещё не задан
+        if (!g_displayLinkTarget && self) {
+            // Action Buggy: MainViewController хранит EAGLView в ivar[3]
+            uint32_t* mvc = (uint32_t*)self;
+            for (int i = 1; i < 8; i++) {
+                void* candidate = (void*)(uintptr_t)mvc[i];
+                if (!candidate) continue;
+                uint32_t candidateIsa = 0;
+                if (!SafeRead32((uintptr_t)candidate, &candidateIsa)) continue;
+                std::string candidateName = GetObjCClassName(candidate);
+                if (candidateName.find("EAGLView") != std::string::npos ||
+                    candidateName.find("ViewController") != std::string::npos) {
+                    if (FindMethodIMP(candidateIsa, "drawFrame")) {
+                        g_displayLinkTarget = candidate;
+                        g_displayLinkSelector = "drawFrame";
+                        LogToJava("PATCH-HIT: [startAnimation] Auto-detected target=0x" +
+                                  std::to_string((uintptr_t)candidate) + " sel=drawFrame");
+                        break;
+                    }
+                    if (FindMethodIMP(candidateIsa, "drawView:")) {
+                        g_displayLinkTarget = candidate;
+                        g_displayLinkSelector = "drawView:";
+                        LogToJava("PATCH-HIT: [startAnimation] Auto-detected target=0x" +
+                                  std::to_string((uintptr_t)candidate) + " sel=drawView:");
+                        break;
+                    }
+                }
+            }
+            // Fallback: сам self как target
+            if (!g_displayLinkTarget) {
+                uint32_t selfIsa = ((uint32_t*)self)[0];
+                void* drawImp = FindMethodIMP(selfIsa, "drawFrame");
+                if (!drawImp) drawImp = FindMethodIMP(selfIsa, "drawView:");
+                if (drawImp) {
+                    g_displayLinkTarget = self;
+                    g_displayLinkSelector = drawImp == FindMethodIMP(selfIsa, "drawFrame") ? "drawFrame" : "drawView:";
+                    LogToJava("PATCH-HIT: [startAnimation] Fallback: self as target, sel=" +
+                              std::string(g_displayLinkSelector));
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
 // Записывает Thumb-трамплин по адресу target_thumb_addr (бит 0 снят, адрес чётный).
 // Трамплин: LDR PC, [PC, #0] (4 байта Thumb-2) + слово с целевым адресом (4 байта).
 // Итого 8 байт — перекрывает первые 2 Thumb-инструкции _my_CopyString.
@@ -12292,6 +12391,16 @@ static void ApplyGamePatches() {
     // iOS FBO=1 не существует в Android EGL — биндим всегда FBO=0 (default window surface).
     PatchMethodIMP("EAGLView", "setFramebuffer",
                    (void*)hle_setFramebuffer_replacement);
+
+    // ФИКС ЧЕРНОГО ЭКРАНА #3: Action Buggy использует -[MainViewController startAnimation]
+    // и/или -[EAGLView startAnimation] для запуска рендер-цикла. Если они вызываются
+    // через кешированный IMP (не через objc_msgSend), g_renderingStarted не устанавливается.
+    // Патчим оба метода чтобы перехватить вызов и установить флаг.
+    // Примечание: если метод не найден — PatchMethodIMP просто выдаст PATCH-WARN (не краш).
+    PatchMethodIMP("MainViewController", "startAnimation",
+                   (void*)hle_startAnimation_replacement);
+    PatchMethodIMP("EAGLView", "startAnimation",
+                   (void*)hle_startAnimation_replacement);
 }
 
 void LoadMachO(const std::string& bundlePath) {
