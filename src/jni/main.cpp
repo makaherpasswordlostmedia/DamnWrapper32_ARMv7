@@ -1982,7 +1982,24 @@ extern "C" void Stub_glFramebufferRenderbuffer(GLenum target, GLenum attachment,
     glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer); 
 }
 extern "C" void Stub_glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) { 
-    GLint bound_rbo = 0; glGetIntegerv(GL_RENDERBUFFER_BINDING, &bound_rbo); if (bound_rbo == 0) return; 
+    GLint bound_rbo = 0; glGetIntegerv(GL_RENDERBUFFER_BINDING, &bound_rbo); if (bound_rbo == 0) return;
+    // ФИКС ЧЁРНОГО ЭКРАНА: если игра получила UIScreen bounds={0,0,0,0} и создаёт
+    // renderbuffer с нулевым размером — подставляем реальные размеры EGL surface.
+    if (width <= 0 || height <= 0) {
+        EGLDisplay qDpy = eglGetCurrentDisplay();
+        EGLSurface qSurf = eglGetCurrentSurface(EGL_DRAW);
+        EGLint qw = g_surfaceWidth, qh = g_surfaceHeight;
+        if (qSurf != EGL_NO_SURFACE && qDpy != EGL_NO_DISPLAY) {
+            eglQuerySurface(qDpy, qSurf, EGL_WIDTH, &qw);
+            eglQuerySurface(qDpy, qSurf, EGL_HEIGHT, &qh);
+        }
+        if (qw > 0 && qh > 0) {
+            LogToJava("[RBO-FIX] glRenderbufferStorage: размер " + std::to_string(width) + "x" +
+                      std::to_string(height) + " -> " + std::to_string(qw) + "x" + std::to_string(qh));
+            width = qw; height = qh;
+            if (g_surfaceWidth <= 0) { g_surfaceWidth = qw; g_surfaceHeight = qh; }
+        }
+    }
     if (g_gpuOffloadMask & 64) glRenderbufferStorage(target, internalformat, width, height); 
 }
 extern "C" GLenum Stub_glCheckFramebufferStatus(GLenum target) { 
@@ -2027,8 +2044,18 @@ extern "C" void Stub_glViewport(GLint x, GLint y, GLsizei width, GLsizei height)
     LogToJava("[GL-TRACE] glViewport(" + std::to_string(x) + ", " + std::to_string(y) + ", " + std::to_string(width) + ", " + std::to_string(height) + ")");
     if (width == 0 && height == 0) {
         g_isFakeViewport = true;
-        width = 480;
-        height = 320;
+        // ФИКС: запрашиваем реальный EGL-размер вместо хардкодного 480x320
+        EGLDisplay qDpy = eglGetCurrentDisplay();
+        EGLSurface qSurf = eglGetCurrentSurface(EGL_DRAW);
+        EGLint qw = g_surfaceWidth > 0 ? g_surfaceWidth : 480;
+        EGLint qh = g_surfaceHeight > 0 ? g_surfaceHeight : 320;
+        if (qSurf != EGL_NO_SURFACE && qDpy != EGL_NO_DISPLAY) {
+            eglQuerySurface(qDpy, qSurf, EGL_WIDTH, &qw);
+            eglQuerySurface(qDpy, qSurf, EGL_HEIGHT, &qh);
+        }
+        width  = (qw > 0) ? qw : 480;
+        height = (qh > 0) ? qh : 320;
+        LogToJava("[VIEWPORT-FIX] glViewport(0,0,0,0) -> " + std::to_string(width) + "x" + std::to_string(height));
     } else {
         g_isFakeViewport = false;
     }
@@ -4595,9 +4622,24 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         float x = 0.0f;
         float y = 0.0f;
         if (cName.find("UIScreen") != std::string::npos) {
-            // Возвращаем фактические размеры без portrait/landscape swap
-            w = (float)g_surfaceWidth;
-            h = (float)g_surfaceHeight;
+            // ФИКС ЧЁРНОГО ЭКРАНА: EGL fallback если g_surfaceWidth ещё не задан
+            if (g_surfaceWidth <= 0 || g_surfaceHeight <= 0) {
+                EGLDisplay qDpy = eglGetCurrentDisplay();
+                EGLSurface qSurf = eglGetCurrentSurface(EGL_DRAW);
+                if (qSurf != EGL_NO_SURFACE && qDpy != EGL_NO_DISPLAY) {
+                    EGLint qw = 0, qh = 0;
+                    eglQuerySurface(qDpy, qSurf, EGL_WIDTH, &qw);
+                    eglQuerySurface(qDpy, qSurf, EGL_HEIGHT, &qh);
+                    if (qw > 0 && qh > 0) {
+                        g_surfaceWidth  = qw;
+                        g_surfaceHeight = qh;
+                        LogToJava("[MSGSI-FIX] UIScreen bounds: EGL fallback -> " +
+                                  std::to_string(qw) + "x" + std::to_string(qh));
+                    }
+                }
+            }
+            w = (float)(g_surfaceWidth  > 0 ? g_surfaceWidth  : 480);
+            h = (float)(g_surfaceHeight > 0 ? g_surfaceHeight : 320);
         } else if (g_views.count(self)) {
             x = g_views[self].frame[0]; y = g_views[self].frame[1];
             float fw = g_views[self].frame[2]; float fh = g_views[self].frame[3];
@@ -6974,9 +7016,25 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         float w = (float)g_surfaceWidth;
         float h = (float)g_surfaceHeight;
         if (cName.find("UIScreen") != std::string::npos) {
-            // Возвращаем фактический размер поверхности без portrait/landscape swap
-            w = (float)g_surfaceWidth;
-            h = (float)g_surfaceHeight;
+            // ФИКС ЧЁРНОГО ЭКРАНА: если g_surfaceWidth ещё 0 (initWrapper вызван с resWidth=0
+            // до onSurfaceCreated), запрашиваем реальный размер напрямую из EGL.
+            if (g_surfaceWidth <= 0 || g_surfaceHeight <= 0) {
+                EGLDisplay qDpy = eglGetCurrentDisplay();
+                EGLSurface qSurf = eglGetCurrentSurface(EGL_DRAW);
+                if (qSurf != EGL_NO_SURFACE && qDpy != EGL_NO_DISPLAY) {
+                    EGLint qw = 0, qh = 0;
+                    eglQuerySurface(qDpy, qSurf, EGL_WIDTH, &qw);
+                    eglQuerySurface(qDpy, qSurf, EGL_HEIGHT, &qh);
+                    if (qw > 0 && qh > 0) {
+                        g_surfaceWidth  = qw;
+                        g_surfaceHeight = qh;
+                        LogToJava("[STRET-FIX] UIScreen bounds: EGL fallback -> " +
+                                  std::to_string(qw) + "x" + std::to_string(qh));
+                    }
+                }
+            }
+            w = (float)(g_surfaceWidth  > 0 ? g_surfaceWidth  : 480);
+            h = (float)(g_surfaceHeight > 0 ? g_surfaceHeight : 320);
         } else if (g_views.count(self)) {
             float fw = g_views[self].frame[2]; float fh = g_views[self].frame[3];
             if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) { w = fw; h = fh; }
@@ -8357,6 +8415,61 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             if (!g_renderingStarted && g_displayLinkTarget && g_displayLinkSelector && idle_ticks > 120) {
                 LogToJava("[MAIN-LOOP] FALLBACK: g_displayLinkTarget установлен, но renderingStarted=false. Принудительно включаем рендер.");
                 g_renderingStarted = true;
+            }
+            // ФИКС ЧЁРНОГО ЭКРАНА: экстренный поиск drawFrame через g_views если через 3 секунды
+            // рендер так и не запустился (startAnimation не был перехвачен ни через msgSend, ни через IMP).
+            if (!g_renderingStarted && !g_displayLinkTarget && idle_ticks > 180) {
+                LogToJava("[MAIN-LOOP] EMERGENCY: 3s без рендера — сканируем g_views на drawFrame/drawView:");
+                const char* emergencySels[] = {"drawFrame", "drawView:", "renderFrame", "render", nullptr};
+                for (auto const& vp : g_views) {
+                    void* obj = vp.first;
+                    if (!obj) continue;
+                    uint32_t objIsa = 0;
+                    if (!SafeRead32((uintptr_t)obj, &objIsa) || objIsa < 0x1000u) continue;
+                    for (int si = 0; emergencySels[si]; si++) {
+                        if (FindMethodIMP(objIsa, emergencySels[si])) {
+                            g_displayLinkTarget   = obj;
+                            g_displayLinkSelector = emergencySels[si];
+                            g_renderingStarted    = true;
+                            LogToJava("[MAIN-LOOP] EMERGENCY: найден target=" +
+                                      GetObjCClassName(obj) + " sel=" +
+                                      std::string(emergencySels[si]));
+                            break;
+                        }
+                    }
+                    if (g_renderingStarted) break;
+                }
+                // Если и g_views пуст — ищем через g_appSymbols (только по классам с drawFrame)
+                if (!g_renderingStarted) {
+                    for (auto const& pair : g_appSymbols) {
+                        if (pair.first.find("_OBJC_CLASS_$_") == 0) {
+                            for (int si = 0; emergencySels[si]; si++) {
+                                if (FindMethodIMP(pair.second, emergencySels[si])) {
+                                    // Нужен живой экземпляр — создаём через alloc/init
+                                    void* inst = (void*)Stub_objc_msgSend((void*)pair.second, "alloc",
+                                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                                    if (inst) {
+                                        inst = (void*)Stub_objc_msgSend(inst, "init",
+                                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                                    }
+                                    if (inst) {
+                                        g_displayLinkTarget   = inst;
+                                        g_displayLinkSelector = emergencySels[si];
+                                        g_renderingStarted    = true;
+                                        LogToJava("[MAIN-LOOP] EMERGENCY: alloc+init target=" +
+                                                  pair.first + " sel=" + std::string(emergencySels[si]));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        if (g_renderingStarted) break;
+                    }
+                }
+                if (!g_renderingStarted) {
+                    LogToJava("[MAIN-LOOP] EMERGENCY: drawFrame не найден нигде — продолжаем ждать.");
+                    idle_ticks = 120; // Сброс счётчика, повторная попытка через 1 сек
+                }
             }
             // Аналогичный fallback для NSTimer-режима: если g_renderingStarted стало true
             // но g_displayLinkSelector пустой — ищем drawFrame/drawView у известных объектов.
@@ -12229,7 +12342,20 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                 uint32_t* cat = (uint32_t*)cat_ptr;
                 // cat[1] = pointer to the class this category extends
                 uint32_t cat_cls = cat[1];
-                if (cat_cls != class_ptr) continue; // другой класс
+                // ФИКС: после rebase cat[1] может не совпадать с class_ptr из symtab
+                // (разные секции, смещения). Сверяем сначала по указателю, потом по имени класса.
+                bool catClassMatch = (cat_cls == class_ptr);
+                if (!catClassMatch && cat_cls >= APP_LO && cat_cls < APP_HI) {
+                    uint32_t* cat_cls_ptr = (uint32_t*)cat_cls;
+                    uint32_t cat_ro = cat_cls_ptr[4] & ~3u;
+                    if (cat_ro >= APP_LO && cat_ro < APP_HI) {
+                        uint32_t* cat_ro_ptr = (uint32_t*)cat_ro;
+                        const char* cat_cls_name = (const char*)(uintptr_t)cat_ro_ptr[3];
+                        if (isValidString(cat_cls_name) && strcmp(cat_cls_name, className) == 0)
+                            catClassMatch = true;
+                    }
+                }
+                if (!catClassMatch) continue; // другой класс
                 // cat[2] = instanceMethods method_list_t*
                 uint32_t mlist_ptr = cat[2];
                 if (mlist_ptr < APP_LO || mlist_ptr >= APP_HI) continue;
