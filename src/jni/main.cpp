@@ -9762,27 +9762,50 @@ extern "C" char* wrap_strncat(char* dest, const char* src, size_t n) {
     }
     return res;
 }
-extern "C" int wrap___sprintf_chk(char* str, int flag, size_t slen, const char* format, ...) { 
-    va_list args; va_start(args, format); 
-    int ret = vsprintf(str, format, args); 
-    va_end(args); 
-    if (str && (strstr(str, "pngConf") || strstr(str, "jungle"))) {
-        LogToJava(std::string("C-API-DEBUG: [__sprintf_chk] Собрана строка: [") + str + "]");
+extern "C" int wrap___sprintf_chk(char* str, int flag, size_t slen, const char* format, ...) {
+    if (!str) {
+        // Darwin допускает sprintf(NULL, ...) как dry-run; Android падает.
+        va_list args; va_start(args, format);
+        int ret = vsnprintf(nullptr, 0, format, args);
+        va_end(args);
+        return ret;
     }
-    return ret; 
+    va_list args; va_start(args, format);
+    int ret = vsprintf(str, format, args);
+    va_end(args);
+    return ret;
 }
-extern "C" int wrap___snprintf_chk(char *str, size_t maxlen, int flag, size_t bos, const char *format, ...) { 
-    va_list args; va_start(args, format); 
-    int ret = vsnprintf(str, maxlen, format, args); 
-    va_end(args); 
-    if (str && (strstr(str, "pngConf") || strstr(str, "jungle"))) {
-        LogToJava(std::string("C-API-DEBUG: [__snprintf_chk] Собрана строка: [") + str + "]");
-    }
-    return ret; 
+extern "C" int wrap___snprintf_chk(char *str, size_t maxlen, int flag, size_t bos, const char *format, ...) {
+    va_list args; va_start(args, format);
+    int ret = wrap_vsnprintf(str, maxlen, format, args);
+    va_end(args);
+    return ret;
 }
 // iOS/Darwin security wrappers — не реализованы, но нужны для корректной работы строк
 extern "C" int wrap___vsnprintf_chk(char *str, size_t maxlen, int flag, size_t bos, const char *format, va_list ap) {
+    // Защита от NULL dest и SIZE_MAX: Darwin допускает snprintf(NULL, n, ...) как dry-run.
+    // Android libc падает. Эмулируем darwin-поведение через vsnprintf(nullptr, 0, ...).
+    if (!str || maxlen == 0 || maxlen >= 0x80000000u) {
+        return vsnprintf(nullptr, 0, format, ap);
+    }
     return vsnprintf(str, maxlen, format, ap);
+}
+
+// Darwin: snprintf(NULL, n, fmt) / snprintf(buf, SIZE_MAX, fmt) — dry-run или "без ограничений".
+// Android libc: падает в обоих случаях. Перехватываем и эмулируем darwin-поведение.
+extern "C" int wrap_vsnprintf(char *str, size_t size, const char *format, va_list ap) {
+    if (!str || size == 0 || size >= 0x80000000u) {
+        return vsnprintf(nullptr, 0, format, ap);
+    }
+    return vsnprintf(str, size, format, ap);
+}
+
+extern "C" int wrap_snprintf(char *str, size_t size, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    int ret = wrap_vsnprintf(str, size, format, args);
+    va_end(args);
+    return ret;
 }
 extern "C" char* wrap___strncpy_chk(char* dst, const char* src, size_t len, size_t dstlen) {
     return strncpy(dst, src, len);
@@ -11691,7 +11714,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_W(malloc), STB_W(free), STB_W(calloc), STB_W(realloc), STB_D(memcpy), STB_D(memmove), STB_D(memset), STB_D(memcmp), {"_memchr", (void*)(void*(*)(void*, int, size_t))memchr},
     STB_W(strcpy), STB_D(strncpy), STB_D(strcmp), STB_D(strncmp), STB_W(strlen), STB_W(strcat), STB_W(strncat), {"_strchr", (void*)(char*(*)(char*, int))strchr}, {"_strrchr", (void*)(char*(*)(char*, int))strrchr}, {"_strstr", (void*)(char*(*)(char*, const char*))strstr},
     STB_D(strdup), STB_D(strcasecmp), STB_D(strncasecmp), STB_D(strcspn), {"_strpbrk", (void*)(char*(*)(char*, const char*))strpbrk},
-    STB_D(atoi), STB_D(atof), STB_D(atol), STB_D(strtol), STB_D(strtod), STB_D(strtoul), STB_W(strtoll), STB_D(sprintf), STB_D(snprintf), STB_D(vsprintf), STB_D(vsnprintf), STB_D(sscanf), STB_W(printf), STB_W(puts), STB_D(putchar), STB_W(vprintf), STB_W(vfprintf),
+    STB_D(atoi), STB_D(atof), STB_D(atol), STB_D(strtol), STB_D(strtod), STB_D(strtoul), STB_W(strtoll), STB_D(sprintf), STB_W(snprintf), STB_D(vsprintf), STB_W(vsnprintf), STB_D(sscanf), STB_W(printf), STB_W(puts), STB_D(putchar), STB_W(vprintf), STB_W(vfprintf),
     STB_W(fopen), STB_W(fclose), STB_W(fread), STB_W(fwrite), STB_W(fseek), STB_W(ftell), STB_W(fgetpos), STB_W(fsetpos), STB_W(fputc), STB_W(fscanf), STB_W(fflush), STB_W(fputs), STB_W(fprintf), STB_W(fgetc), STB_W(fgets), STB_W(feof), STB_W(ferror), STB_W(fileno), {"___srget", (void*)wrap___srget},
     {"_sqrt", (void*)(double(*)(double))sqrt}, STB_D(sqrtf), {"_pow", (void*)(double(*)(double, double))pow}, STB_D(powf), {"_exp", (void*)(double(*)(double))exp}, STB_D(expf), {"_log", (void*)(double(*)(double))log}, STB_D(logf), {"_log10", (void*)(double(*)(double))log10}, STB_D(log10f), {"_log2", (void*)(double(*)(double))log2}, STB_D(log2f),
     {"_ceil", (void*)(double(*)(double))ceil}, STB_D(ceilf), {"_floor", (void*)(double(*)(double))floor}, STB_D(floorf), {"_round", (void*)(double(*)(double))round}, STB_D(roundf), {"_fmod", (void*)(double(*)(double, double))fmod}, STB_D(fmodf), {"_fmin", (void*)(double(*)(double, double))fmin}, STB_D(fminf), {"_fmax", (void*)(double(*)(double, double))fmax}, STB_D(fmaxf),
