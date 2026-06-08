@@ -8177,7 +8177,12 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
     if (!init_funcs_run) {
         init_funcs_run = true;
         LogToJava("HLE: Выполнение C++ статических конструкторов (__mod_init_func)... (" + std::to_string(g_initFuncs.size()) + " функций)");
-        for (uint32_t func_addr : g_initFuncs) {
+        for (int init_i = 0; init_i < (int)g_initFuncs.size(); init_i++) {
+            uint32_t func_addr = g_initFuncs[init_i];
+            // Логируем каждый конструктор, чтобы знать на каком именно крашнулось.
+            char init_log[128];
+            snprintf(init_log, sizeof(init_log), "HLE: __mod_init_func[%d] @ 0x%08X", init_i, func_addr);
+            LogToJava(std::string(init_log));
             typedef void (*InitFunc)();
             ((InitFunc)func_addr)();
         }
@@ -10212,30 +10217,33 @@ extern bool g_machOLoaded;
 extern "C" void* wrap_malloc(size_t size) {
     // ФИКС: Защита от bogus-размера (например strlen(null)+1 = 0xFFFFFFFF).
     // Такой malloc возвращает NULL, игра потом делает BLX R0 (null) → SIGSEGV.
-    // Если size явно невалиден (>= 0x80000000), выделяем 1 байт и логируем.
+    // Если size явно невалиден (>= 0x80000000), выделяем безопасный буфер и логируем.
+    //
+    // ВАЖНО: LogToJava / std::string / LogToBlackBox здесь ЗАПРЕЩЕНЫ — они сами вызывают
+    // malloc, что приводит к рекурсии и повреждению кучи.
+    // Логируем только через __android_log_print (не выделяет память через наш аллокатор).
     if (size >= 0x80000000u) {
         uint32_t lr0 = (uint32_t)__builtin_return_address(0);
-        char buf[256];
-        // Выделяем 4096 байт вместо 1: IRenderer конструктор пишет в этот буфер поля объекта.
-        // 1 байт вызывал тихую порчу памяти (writes OOB) -> рендерер ломался -> чёрный экран.
-        // 4 KB с нулями безопасны: конструктор пишет структуру, не выходя за этот размер.
-        void* safe_buf = calloc(1, 4096);
-        snprintf(buf, sizeof(buf),
-            "C-API-DEBUG: [malloc] BOGUS SIZE GUARD: size=0x%zX -> выделяем 4096 байт (calloc). lr=0x%X (%s)",
-            size, lr0, GetModuleInfoForAddress(lr0).c_str());
-        LogToJava(std::string(buf));
+        // Выделяем 65536 байт: IRenderer и другие крупные C++ объекты могут писать
+        // больше 4096 байт в этот буфер; 64 KB покрывает подавляющее большинство случаев.
+        void* safe_buf = calloc(1, 65536);
+        // Логируем без heap-аллокаций (статический буфер на стеке + android log).
+        char log_buf[256];
+        snprintf(log_buf, sizeof(log_buf),
+            "[wrap_malloc] BOGUS SIZE GUARD: size=0x%zX -> 65536 bytes (calloc). lr=0x%X",
+            size, lr0);
+        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "%s", log_buf);
         return safe_buf;
     }
     void* res = malloc(size);
     if (size > 5 * 1024 * 1024) {
         uint32_t lr0 = (uint32_t)__builtin_return_address(0);
         char buf[256];
-        snprintf(buf, sizeof(buf), "C-API-DEBUG: [malloc] АНОМАЛИЯ! size=%zu lr=0x%X (module: %s)",
-                 size, lr0, GetModuleInfoForAddress(lr0).c_str());
-        LogToJava(std::string(buf));
+        snprintf(buf, sizeof(buf), "[wrap_malloc] BIG ALLOC: size=%zu lr=0x%X", size, lr0);
+        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "%s", buf);
         if (!res) {
-            snprintf(buf, sizeof(buf), "C-API-DEBUG: [malloc] АНОМАЛИЯ: malloc вернул NULL для size=%zu — последующий краш вероятен!", size);
-            LogToJava(std::string(buf));
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+                "[wrap_malloc] malloc returned NULL for size=%zu — crash likely!", size);
         }
     }
     return res;
