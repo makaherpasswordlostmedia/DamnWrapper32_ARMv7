@@ -132,6 +132,11 @@ int g_surfaceWidth = 480; int g_surfaceHeight = 320;
 uint32_t g_entryPoint = 0; uint32_t g_appSlide = 0; std::map<std::string, uint32_t> g_appSymbols;
 std::map<uintptr_t, std::string> g_missingSymbolAddrs;
 std::vector<uint32_t> g_initFuncs;
+static sigjmp_buf g_initFuncJmpBuf;
+static volatile sig_atomic_t g_inInitFunc = 0;
+static void initFuncSignalGuard(int /*sig*/) {
+    if (g_inInitFunc) siglongjmp(g_initFuncJmpBuf, 1);
+}
 
 struct MachOSectionInfo { std::string name; uint32_t start; uint32_t end; };
 std::vector<MachOSectionInfo> g_machoSections;
@@ -8177,15 +8182,46 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
     if (!init_funcs_run) {
         init_funcs_run = true;
         LogToJava("HLE: Выполнение C++ статических конструкторов (__mod_init_func)... (" + std::to_string(g_initFuncs.size()) + " функций)");
+
+        // Временно перехватываем SIGSEGV/SIGBUS чтобы падение отдельного конструктора
+        // не убивало весь процесс — пропускаем его и идём дальше.
+        struct sigaction sa_guard, sa_old_segv, sa_old_bus;
+        sa_guard.sa_handler = initFuncSignalGuard;
+        sigemptyset(&sa_guard.sa_mask);
+        sa_guard.sa_flags = 0;
+        sigaction(SIGSEGV, &sa_guard, &sa_old_segv);
+        sigaction(SIGBUS,  &sa_guard, &sa_old_bus);
+
         for (int init_i = 0; init_i < (int)g_initFuncs.size(); init_i++) {
             uint32_t func_addr = g_initFuncs[init_i];
             // Логируем каждый конструктор, чтобы знать на каком именно крашнулось.
             char init_log[128];
             snprintf(init_log, sizeof(init_log), "HLE: __mod_init_func[%d] @ 0x%08X", init_i, func_addr);
             LogToJava(std::string(init_log));
-            typedef void (*InitFunc)();
-            ((InitFunc)func_addr)();
+
+            g_inInitFunc = 1;
+            if (sigsetjmp(g_initFuncJmpBuf, 1) == 0) {
+                typedef void (*InitFunc)();
+                ((InitFunc)func_addr)();
+            } else {
+                // Конструктор упал — логируем и продолжаем
+                char warn_log[128];
+                snprintf(warn_log, sizeof(warn_log),
+                         "HLE-WARN: __mod_init_func[%d] @ 0x%08X CRASHED (SIGSEGV/SIGBUS) — пропускаем",
+                         init_i, func_addr);
+                LogToJava(std::string(warn_log));
+                // Восстанавливаем обработчики сигналов после longjmp (SA_RESETHAND не используем,
+                // поэтому ставим снова вручную чтобы следующий конструктор тоже был защищён)
+                sigaction(SIGSEGV, &sa_guard, nullptr);
+                sigaction(SIGBUS,  &sa_guard, nullptr);
+            }
+            g_inInitFunc = 0;
         }
+
+        // Восстанавливаем оригинальные обработчики сигналов
+        sigaction(SIGSEGV, &sa_old_segv, nullptr);
+        sigaction(SIGBUS,  &sa_old_bus,  nullptr);
+
         LogToJava("HLE: C++ статические конструкторы выполнены.");
     }
     
