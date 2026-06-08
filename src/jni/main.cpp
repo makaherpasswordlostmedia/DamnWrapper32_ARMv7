@@ -9747,7 +9747,7 @@ extern "C" size_t wrap_strlcpy(char* dst, const char* src, size_t size) {
         char buf[128];
         snprintf(buf, sizeof(buf),
             "SAFETY: wrap_strlcpy: src %p в недоступной странице — записываем пустую строку",
-            (void*)src, size);
+            (void*)src);
         LogToJava(buf);
         if (dst && size > 0) dst[0] = '\0';
         return 0;
@@ -9775,6 +9775,7 @@ extern "C" int wrap___sprintf_chk(char* str, int flag, size_t slen, const char* 
     va_end(args);
     return ret;
 }
+extern "C" int wrap_vsnprintf(char *str, size_t size, const char *format, va_list ap);
 extern "C" int wrap___snprintf_chk(char *str, size_t maxlen, int flag, size_t bos, const char *format, ...) {
     va_list args; va_start(args, format);
     int ret = wrap_vsnprintf(str, maxlen, format, args);
