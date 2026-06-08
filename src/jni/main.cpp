@@ -137,6 +137,12 @@ static volatile sig_atomic_t g_inInitFunc = 0;
 static void initFuncSignalGuard(int /*sig*/) {
     if (g_inInitFunc) siglongjmp(g_initFuncJmpBuf, 1);
 }
+// SIGALRM watchdog: если конструктор завис — посылаем SIGALRM через 3 секунды.
+// Это прерывает любой blocking syscall (usleep, cond_wait, connect и т.д.) и
+// позволяет siglongjmp вернуться в цикл конструкторов для пропуска зависшего.
+static void initFuncAlarmGuard(int /*sig*/) {
+    if (g_inInitFunc) siglongjmp(g_initFuncJmpBuf, 2); // 2 = timeout (отличаем от crash=1)
+}
 
 struct MachOSectionInfo { std::string name; uint32_t start; uint32_t end; };
 std::vector<MachOSectionInfo> g_machoSections;
@@ -8183,46 +8189,65 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         init_funcs_run = true;
         LogToJava("HLE: Выполнение C++ статических конструкторов (__mod_init_func)... (" + std::to_string(g_initFuncs.size()) + " функций)");
 
-        // Временно перехватываем SIGSEGV/SIGBUS чтобы падение отдельного конструктора
-        // не убивало весь процесс — пропускаем его и идём дальше.
-        struct sigaction sa_guard, sa_old_segv, sa_old_bus;
+        // Временно перехватываем SIGSEGV/SIGBUS (краш) и SIGALRM (зависание/таймаут).
+        // Если конструктор не вернулся за 3 секунды — SIGALRM прерывает его через siglongjmp.
+        struct sigaction sa_guard, sa_alarm, sa_old_segv, sa_old_bus, sa_old_alrm;
         sa_guard.sa_handler = initFuncSignalGuard;
         sigemptyset(&sa_guard.sa_mask);
         sa_guard.sa_flags = 0;
+        sa_alarm.sa_handler = initFuncAlarmGuard;
+        sigemptyset(&sa_alarm.sa_mask);
+        sa_alarm.sa_flags = 0;
         sigaction(SIGSEGV, &sa_guard, &sa_old_segv);
         sigaction(SIGBUS,  &sa_guard, &sa_old_bus);
+        sigaction(SIGALRM, &sa_alarm, &sa_old_alrm);
 
         for (int init_i = 0; init_i < (int)g_initFuncs.size(); init_i++) {
             uint32_t func_addr = g_initFuncs[init_i];
-            // Логируем каждый конструктор, чтобы знать на каком именно крашнулось.
+            // Логируем каждый конструктор, чтобы знать на каком именно зависло/крашнулось.
             char init_log[128];
             snprintf(init_log, sizeof(init_log), "HLE: __mod_init_func[%d] @ 0x%08X", init_i, func_addr);
             LogToJava(std::string(init_log));
 
             g_inInitFunc = 1;
-            if (sigsetjmp(g_initFuncJmpBuf, 1) == 0) {
+            alarm(3); // watchdog: 3 секунды на конструктор, потом SIGALRM -> siglongjmp
+            int jmp_reason = sigsetjmp(g_initFuncJmpBuf, 1);
+            if (jmp_reason == 0) {
                 typedef void (*InitFunc)();
                 ((InitFunc)func_addr)();
+                alarm(0); // конструктор завершился — отменяем watchdog
             } else {
-                // Конструктор упал — логируем и продолжаем
-                char warn_log[128];
-                snprintf(warn_log, sizeof(warn_log),
-                         "HLE-WARN: __mod_init_func[%d] @ 0x%08X CRASHED (SIGSEGV/SIGBUS) — пропускаем",
-                         init_i, func_addr);
+                alarm(0); // отменяем watchdog чтобы не сработал повторно
+                char warn_log[192];
+                if (jmp_reason == 2) {
+                    snprintf(warn_log, sizeof(warn_log),
+                             "HLE-WARN: __mod_init_func[%d] @ 0x%08X TIMEOUT (>3s) — пропускаем (зависание/deadlock)",
+                             init_i, func_addr);
+                } else {
+                    snprintf(warn_log, sizeof(warn_log),
+                             "HLE-WARN: __mod_init_func[%d] @ 0x%08X CRASHED (SIGSEGV/SIGBUS) — пропускаем",
+                             init_i, func_addr);
+                }
                 LogToJava(std::string(warn_log));
-                // Восстанавливаем обработчики сигналов после longjmp (SA_RESETHAND не используем,
-                // поэтому ставим снова вручную чтобы следующий конструктор тоже был защищён)
+                // Восстанавливаем обработчики после longjmp
                 sigaction(SIGSEGV, &sa_guard, nullptr);
                 sigaction(SIGBUS,  &sa_guard, nullptr);
+                sigaction(SIGALRM, &sa_alarm, nullptr);
             }
             g_inInitFunc = 0;
         }
 
         // Восстанавливаем оригинальные обработчики сигналов
+        alarm(0);
         sigaction(SIGSEGV, &sa_old_segv, nullptr);
         sigaction(SIGBUS,  &sa_old_bus,  nullptr);
+        sigaction(SIGALRM, &sa_old_alrm, nullptr);
 
         LogToJava("HLE: C++ статические конструкторы выполнены.");
+        // Патчим presentFramebuffer, setFramebuffer и startAnimation ПОСЛЕ конструкторов:
+        // EAGLView регистрирует эти методы в __mod_init_func, поэтому до конструкторов
+        // PatchMethodIMP всегда выдавал PATCH-WARN "метод не найден" -> чёрный экран.
+        ApplyGamePatches();
     }
     
     uint32_t appDelClassAddr = 0;
@@ -13608,8 +13633,9 @@ void LoadMachO(const std::string& bundlePath) {
 
     // Патчим _my_CopyString до установки g_machOLoaded, пока сегменты ещё W+X
     ApplyMyCopyStringPatch();
-    // Патчим presentFramebuffer и setFramebuffer напрямую через IMP (ФИКС ЧЕРНОГО ЭКРАНА)
-    ApplyGamePatches();
+    // ApplyGamePatches() перенесён ПОСЛЕ C++ конструкторов в Stub_UIApplicationMain:
+    // EAGLView регистрирует свои методы (presentFramebuffer, setFramebuffer) именно
+    // в конструкторах, поэтому патч до конструкторов всегда давал PATCH-WARN.
 
     g_machOLoaded = true; // С этого момента любые новые функции пишутся в лог мгновенно
     
