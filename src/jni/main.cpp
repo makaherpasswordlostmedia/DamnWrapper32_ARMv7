@@ -12443,6 +12443,22 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
     uint32_t count = mlist[1];
     if (count >= 10000) return;
     uint32_t* methods = mlist + 2;
+    // Диагностика: дампим все методы класса один раз (только для первого вызова по этому классу)
+    {
+        char mlist_hdr[256];
+        snprintf(mlist_hdr, sizeof(mlist_hdr),
+            "MLIST-DBG: class='%s' mlist=0x%08X count=%u  (searching '%s')",
+            className, methodList_ptr, count, selName);
+        LogToJava(mlist_hdr);
+        for (uint32_t i = 0; i < count && i < 128; i++) {
+            uint32_t m_name_ptr2 = methods[i*3 + 0];
+            uint32_t m_imp2      = methods[i*3 + 2];
+            const char* mname = isValidString((const char*)m_name_ptr2) ? (const char*)m_name_ptr2 : "<?>";
+            char mline[256];
+            snprintf(mline, sizeof(mline), "  MLIST-DBG[%u]: '%s' imp=0x%08X", i, mname, m_imp2);
+            LogToJava(mline);
+        }
+    }
     for (uint32_t i = 0; i < count; i++) {
         uint32_t m_name_ptr = methods[i*3 + 0];
         uint32_t* m_imp_ptr = &methods[i*3 + 2];
@@ -12750,26 +12766,80 @@ static void ApplyGamePatches() {
         }
     }
     // =======================================================================
-    // ФИКС ЧЕРНОГО ЭКРАНА #1: перехватываем -[EAGLView presentFramebuffer] на уровне IMP.
-    // Wolf3D вызывает этот метод через прямой указатель из нативного кода (drawFrame),
-    // поэтому Stub_objc_msgSend его не видит. Патчим IMP трамплином.
-    PatchMethodIMP("EAGLView", "presentFramebuffer",
-                   (void*)hle_presentFramebuffer_replacement);
+    // ФИКС ЧЕРНОГО ЭКРАНА #1-3: поиск методов presentFramebuffer / setFramebuffer /
+    // startAnimation по всем нативным классам в __objc_classlist.
+    // EAGLView в этом бинаре stripped — имя может быть в classlist но не в symtab,
+    // или методы могут лежать в другом классе (напр. RootController, SharkAppDelegate).
+    // Сканируем все классы и патчим первый нашедшийся.
+    // =======================================================================
+    {
+        const uint32_t APP_LO = g_appSlide;
+        const uint32_t APP_HI = g_appSlide + 0x1000000u;
 
-    // ФИКС ЧЕРНОГО ЭКРАНА #2: перехватываем -[EAGLView setFramebuffer] на уровне IMP.
-    // iOS FBO=1 не существует в Android EGL — биндим всегда FBO=0 (default window surface).
-    PatchMethodIMP("EAGLView", "setFramebuffer",
-                   (void*)hle_setFramebuffer_replacement);
+        // Целевые методы: имя → нашли ли, адрес IMP
+        struct TargetMethod {
+            const char* sel;
+            void* replacement;
+            bool found;
+            std::string foundInClass;
+        };
+        TargetMethod targets[] = {
+            { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,  false, "" },
+            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "" },
+            { "startAnimation",      (void*)hle_startAnimation_replacement,       false, "" },
+        };
 
-    // ФИКС ЧЕРНОГО ЭКРАНА #3: Action Buggy использует -[MainViewController startAnimation]
-    // и/или -[EAGLView startAnimation] для запуска рендер-цикла. Если они вызываются
-    // через кешированный IMP (не через objc_msgSend), g_renderingStarted не устанавливается.
-    // Патчим оба метода чтобы перехватить вызов и установить флаг.
-    // Примечание: если метод не найден — PatchMethodIMP просто выдаст PATCH-WARN (не краш).
-    PatchMethodIMP("MainViewController", "startAnimation",
-                   (void*)hle_startAnimation_replacement);
-    PatchMethodIMP("EAGLView", "startAnimation",
-                   (void*)hle_startAnimation_replacement);
+        for (const auto& sec : g_machoSections) {
+            if (sec.name.find("__objc_classlist") == std::string::npos) continue;
+            uint32_t* slot     = (uint32_t*)(uintptr_t)sec.start;
+            uint32_t* slot_end = (uint32_t*)(uintptr_t)sec.end;
+            for (; slot < slot_end; slot++) {
+                uint32_t cp = *slot;
+                if (cp < APP_LO || cp >= APP_HI) continue;
+                uint32_t* cls_c = (uint32_t*)cp;
+                uint32_t ro_c = cls_c[4] & ~3u;
+                if (ro_c < APP_LO || ro_c >= APP_HI) continue;
+                uint32_t* ro_ptr_c = (uint32_t*)ro_c;
+                // Получаем имя класса для лога
+                const char* cname_c = isValidString((const char*)(uintptr_t)ro_ptr_c[4])
+                                        ? (const char*)(uintptr_t)ro_ptr_c[4] : "?";
+                // Сканируем methodlist
+                uint32_t mlist_c = ro_ptr_c[5];
+                if (!mlist_c || mlist_c < APP_LO || mlist_c >= APP_HI) continue;
+                uint32_t* ml = (uint32_t*)mlist_c;
+                uint32_t cnt = ml[1];
+                if (cnt == 0 || cnt >= 10000) continue;
+                uint32_t* meths = ml + 2;
+                for (uint32_t i = 0; i < cnt; i++) {
+                    uint32_t mn = meths[i*3 + 0];
+                    if (!isValidString((const char*)mn)) continue;
+                    const char* mname = (const char*)mn;
+                    for (auto& tgt : targets) {
+                        if (!tgt.found && strcmp(mname, tgt.sel) == 0) {
+                            uint32_t imp_addr = meths[i*3 + 2];
+                            PatchThumbFunctionToReplacement(imp_addr | 1u, tgt.replacement);
+                            char plog[256];
+                            snprintf(plog, sizeof(plog),
+                                "PATCH: -[%s %s] (classlist scan) IMP @ 0x%08X -> replacement @ 0x%08X",
+                                cname_c, tgt.sel, imp_addr, (uint32_t)(uintptr_t)tgt.replacement);
+                            LogToJava(plog);
+                            tgt.found = true;
+                            tgt.foundInClass = cname_c;
+                        }
+                    }
+                }
+            }
+        }
+        // Отчёт о не найденных методах
+        for (const auto& tgt : targets) {
+            if (!tgt.found) {
+                LogToJava(std::string("PATCH-WARN: метод '") + tgt.sel +
+                          "' не найден ни в одном нативном классе в __objc_classlist");
+            }
+        }
+    }
+
+    // (classlist-scan выше уже нашёл и пропатчил все методы)
 }
 
 void LoadMachO(const std::string& bundlePath) {
