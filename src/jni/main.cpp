@@ -12410,7 +12410,7 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                 uint32_t ro_candidate = cls_candidate[4] & ~3u;
                 if (ro_candidate < APP_LO || ro_candidate >= APP_HI) continue;
                 uint32_t* ro_ptr = (uint32_t*)ro_candidate;
-                const char* cls_name = (const char*)(uintptr_t)ro_ptr[3];
+                const char* cls_name = (const char*)(uintptr_t)ro_ptr[4]; // class_ro_t.name = offset 4
                 if (isValidString(cls_name) && strcmp(cls_name, className) == 0) {
                     class_ptr = cp;
                     char fb_log[128];
@@ -12529,8 +12529,8 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                 if (cat_ptr < APP_LO || cat_ptr >= APP_HI) continue;
                 uint32_t* cat = (uint32_t*)cat_ptr;
 
-                // Диагностика первых N категорий: логируем сырые поля
-                if (catIdx < 8) {
+                // Диагностика ВСЕХ категорий: логируем сырые поля
+                {
                     char raw_dbg[256];
                     snprintf(raw_dbg, sizeof(raw_dbg),
                         "CATLIST-RAW: cat[%d] ptr=0x%08X f0=0x%08X f1=0x%08X f2=0x%08X f3=0x%08X",
@@ -12552,9 +12552,9 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                     uint32_t cat_ro = cat_cls_ptr[4] & ~3u;
                     if (cat_ro >= APP_LO && cat_ro < APP_HI) {
                         uint32_t* cat_ro_ptr = (uint32_t*)cat_ro;
-                        const char* cat_cls_name = (const char*)(uintptr_t)cat_ro_ptr[3];
+                        const char* cat_cls_name = (const char*)(uintptr_t)cat_ro_ptr[4]; // class_ro_t.name = offset 4
                         if (isValidString(cat_cls_name)) {
-                            if (catIdx < 8) {
+                            {
                                 char dbg[256];
                                 snprintf(dbg, sizeof(dbg), "CATLIST-DBG: cat[%d] cls_name='%s' cls_ptr=0x%08X want='%s'",
                                     catIdx, cat_cls_name, cat_cls, className);
@@ -12577,7 +12577,7 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                         uint32_t deref_ro = deref_cls_ptr[4] & ~3u;
                         if (deref_ro >= APP_LO && deref_ro < APP_HI) {
                             uint32_t* deref_ro_ptr = (uint32_t*)deref_ro;
-                            const char* deref_cls_name = (const char*)(uintptr_t)deref_ro_ptr[3];
+                            const char* deref_cls_name = (const char*)(uintptr_t)deref_ro_ptr[4]; // class_ro_t.name = offset 4
                             if (isValidString(deref_cls_name) && strcmp(deref_cls_name, className) == 0)
                                 catClassMatch = true;
                         }
