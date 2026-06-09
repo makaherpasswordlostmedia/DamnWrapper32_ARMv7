@@ -7192,6 +7192,10 @@ void* Impl_objc_msgSendSuper2_stret(void* ret_addr, void* super_struct, const ch
         if (rectData[2] <= 0.0f || rectData[3] <= 0.0f) {
             rectData[2] = (float)g_surfaceWidth; rectData[3] = (float)g_surfaceHeight;
         }
+        // Финальная защита: если всё ещё 0 — используем безопасный дефолт
+        if (rectData[2] <= 0.0f || rectData[3] <= 0.0f) {
+            rectData[2] = 480.0f; rectData[3] = 320.0f;
+        }
         if (ret_addr) {
             memcpy(ret_addr, rectData, 16);
         }
@@ -12473,11 +12477,14 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
     {
         const uint32_t APP_LO = g_appSlide;
         const uint32_t APP_HI = g_appSlide + 0x1000000u;
+        bool foundCatlistSec = false;
         for (const auto& sec : g_machoSections) {
             if (sec.name.find("__objc_catlist") == std::string::npos) continue;
-            uint32_t* slot     = (uint32_t*)sec.start;
-            uint32_t* slot_end = (uint32_t*)sec.end;
-            for (; slot < slot_end; slot++) {
+            foundCatlistSec = true;
+            uint32_t* slot     = (uint32_t*)(uintptr_t)sec.start;
+            uint32_t* slot_end = (uint32_t*)(uintptr_t)sec.end;
+            int catIdx = 0;
+            for (; slot < slot_end; slot++, catIdx++) {
                 uint32_t cat_ptr = *slot;
                 if (cat_ptr < APP_LO || cat_ptr >= APP_HI) continue;
                 uint32_t* cat = (uint32_t*)cat_ptr;
@@ -12492,14 +12499,32 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                     if (cat_ro >= APP_LO && cat_ro < APP_HI) {
                         uint32_t* cat_ro_ptr = (uint32_t*)cat_ro;
                         const char* cat_cls_name = (const char*)(uintptr_t)cat_ro_ptr[3];
-                        if (isValidString(cat_cls_name) && strcmp(cat_cls_name, className) == 0)
-                            catClassMatch = true;
+                        if (isValidString(cat_cls_name)) {
+                            // Логируем первые несколько категорий для диагностики
+                            if (catIdx < 5) {
+                                char dbg[256];
+                                snprintf(dbg, sizeof(dbg), "CATLIST-DBG: cat[%d] cls_name='%s' cls_ptr=0x%08X want='%s' ptr=0x%08X",
+                                    catIdx, cat_cls_name, cat_cls, className, class_ptr);
+                                LogToJava(dbg);
+                            }
+                            if (strcmp(cat_cls_name, className) == 0)
+                                catClassMatch = true;
+                        }
                     }
                 }
                 if (!catClassMatch) continue; // другой класс
+                // Нашли категорию для нашего класса — логируем
+                {
+                    char dbg[128];
+                    snprintf(dbg, sizeof(dbg), "CATLIST-DBG: Найдена категория для '%s' cat_ptr=0x%08X", className, cat_ptr);
+                    LogToJava(dbg);
+                }
                 // cat[2] = instanceMethods method_list_t*
                 uint32_t mlist_ptr = cat[2];
-                if (mlist_ptr < APP_LO || mlist_ptr >= APP_HI) continue;
+                if (mlist_ptr < APP_LO || mlist_ptr >= APP_HI) {
+                    LogToJava(std::string("CATLIST-DBG: mlist_ptr=0x") + std::to_string(mlist_ptr) + " out of range");
+                    continue;
+                }
                 uint32_t* mlist = (uint32_t*)mlist_ptr;
                 uint32_t count = mlist[1];
                 if (count >= 10000) continue;
@@ -12507,17 +12532,22 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                 for (uint32_t i = 0; i < count; i++) {
                     uint32_t m_name_ptr = methods[i*3 + 0];
                     uint32_t* m_imp_ptr = &methods[i*3 + 2];
-                    if (isValidString((const char*)m_name_ptr) && strcmp((const char*)m_name_ptr, selName) == 0) {
-                        uint32_t imp_addr = *m_imp_ptr;
-                        PatchThumbFunctionToReplacement(imp_addr | 1u, replacement);
-                        char log[256];
-                        snprintf(log, sizeof(log), "PATCH: -[%s(category) %s] IMP @ 0x%08X -> replacement @ 0x%08X",
-                            className, selName, imp_addr, (uint32_t)(uintptr_t)replacement);
-                        LogToJava(log);
-                        return;
+                    if (isValidString((const char*)m_name_ptr)) {
+                        if (strcmp((const char*)m_name_ptr, selName) == 0) {
+                            uint32_t imp_addr = *m_imp_ptr;
+                            PatchThumbFunctionToReplacement(imp_addr | 1u, replacement);
+                            char log[256];
+                            snprintf(log, sizeof(log), "PATCH: -[%s(category) %s] IMP @ 0x%08X -> replacement @ 0x%08X",
+                                className, selName, imp_addr, (uint32_t)(uintptr_t)replacement);
+                            LogToJava(log);
+                            return;
+                        }
                     }
                 }
             }
+        }
+        if (!foundCatlistSec) {
+            LogToJava(std::string("CATLIST-DBG: секция __objc_catlist не найдена в g_machoSections для ") + selName);
         }
     }
     LogToJava(std::string("PATCH-WARN: метод ") + selName + " не найден в " + className);
