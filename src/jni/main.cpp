@@ -7060,6 +7060,7 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET MSG_SEND " + std::string(op) + " <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr));
         LogToJava("  Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: 0x" + std::to_string((uintptr_t)ret_addr));
+        // Логируем итоговые значения (уже после защиты от нуля)
         LogToJava("  Writing (Float): x=0 y=0 w=" + std::to_string(w) + " h=" + std::to_string(h));
 
         if (ret_addr) {
@@ -12390,11 +12391,42 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
     // Ищем класс в g_appSymbols по имени _OBJC_CLASS_$_<className>
     std::string sym = std::string("_OBJC_CLASS_$_") + className;
     auto it = g_appSymbols.find(sym);
-    if (it == g_appSymbols.end() || it->second < 0x1000) {
-        LogToJava(std::string("PATCH-WARN: класс ") + className + " не найден в symtab");
-        return;
+    uint32_t class_ptr = 0;
+    if (it != g_appSymbols.end() && it->second >= 0x1000) {
+        class_ptr = it->second;
+    } else {
+        // Fallback: перебираем все ObjC классы в __objc_classlist и ищем по имени класса.
+        // Нужно для stripped бинарей, где имя может отсутствовать в symtab.
+        const uint32_t APP_LO = g_appSlide;
+        const uint32_t APP_HI = g_appSlide + 0x1000000u;
+        for (const auto& sec : g_machoSections) {
+            if (sec.name.find("__objc_classlist") == std::string::npos) continue;
+            uint32_t* slot     = (uint32_t*)(uintptr_t)sec.start;
+            uint32_t* slot_end = (uint32_t*)(uintptr_t)sec.end;
+            for (; slot < slot_end; slot++) {
+                uint32_t cp = *slot;
+                if (cp < APP_LO || cp >= APP_HI) continue;
+                uint32_t* cls_candidate = (uint32_t*)cp;
+                uint32_t ro_candidate = cls_candidate[4] & ~3u;
+                if (ro_candidate < APP_LO || ro_candidate >= APP_HI) continue;
+                uint32_t* ro_ptr = (uint32_t*)ro_candidate;
+                const char* cls_name = (const char*)(uintptr_t)ro_ptr[3];
+                if (isValidString(cls_name) && strcmp(cls_name, className) == 0) {
+                    class_ptr = cp;
+                    char fb_log[128];
+                    snprintf(fb_log, sizeof(fb_log),
+                        "PATCH: класс '%s' найден по classlist @ 0x%08X (не было в symtab)", className, cp);
+                    LogToJava(fb_log);
+                    break;
+                }
+            }
+            if (class_ptr) break;
+        }
+        if (!class_ptr) {
+            LogToJava(std::string("PATCH-WARN: класс ") + className + " не найден в symtab");
+            return;
+        }
     }
-    uint32_t class_ptr = it->second;
     uint32_t* cls = (uint32_t*)class_ptr;
     uint32_t data_ptr = cls[4] & ~3u;
     if (!data_ptr || data_ptr < 0x1000) {
@@ -12473,7 +12505,11 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
 
     // ФИКС ЧЁРНОГО ЭКРАНА: presentFramebuffer/setFramebuffer определены в ObjC-категории
     // на EAGLView, а не в основном method list класса. Сканируем __objc_catlist.
-    // struct category_t { name, cls, instanceMethods, classMethods, ... }
+    // struct category_t (32-bit ObjC2):
+    //   [0] const char* name  (имя категории, C-строка)
+    //   [1] Class cls         (прямой указатель на class object после rebase)
+    //   [2] method_list_t* instanceMethods
+    //   [3] method_list_t* classMethods
     {
         const uint32_t APP_LO = g_appSlide;
         const uint32_t APP_HI = g_appSlide + 0x1000000u;
@@ -12481,6 +12517,10 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
         for (const auto& sec : g_machoSections) {
             if (sec.name.find("__objc_catlist") == std::string::npos) continue;
             foundCatlistSec = true;
+            char sec_dbg[128];
+            snprintf(sec_dbg, sizeof(sec_dbg), "CATLIST-DBG: Найдена секция '%s' [0x%08X..0x%08X] для '%s'",
+                sec.name.c_str(), sec.start, sec.end, selName);
+            LogToJava(sec_dbg);
             uint32_t* slot     = (uint32_t*)(uintptr_t)sec.start;
             uint32_t* slot_end = (uint32_t*)(uintptr_t)sec.end;
             int catIdx = 0;
@@ -12488,11 +12528,25 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                 uint32_t cat_ptr = *slot;
                 if (cat_ptr < APP_LO || cat_ptr >= APP_HI) continue;
                 uint32_t* cat = (uint32_t*)cat_ptr;
-                // cat[1] = pointer to the class this category extends
+
+                // Диагностика первых N категорий: логируем сырые поля
+                if (catIdx < 8) {
+                    char raw_dbg[256];
+                    snprintf(raw_dbg, sizeof(raw_dbg),
+                        "CATLIST-RAW: cat[%d] ptr=0x%08X f0=0x%08X f1=0x%08X f2=0x%08X f3=0x%08X",
+                        catIdx, cat_ptr, cat[0], cat[1], cat[2], cat[3]);
+                    LogToJava(raw_dbg);
+                }
+
+                bool catClassMatch = false;
+
+                // --- Попытка 1: прямое совпадение cat[1] == class_ptr ---
                 uint32_t cat_cls = cat[1];
-                // ФИКС: после rebase cat[1] может не совпадать с class_ptr из symtab
-                // (разные секции, смещения). Сверяем сначала по указателю, потом по имени класса.
-                bool catClassMatch = (cat_cls == class_ptr);
+                if (cat_cls == class_ptr) {
+                    catClassMatch = true;
+                }
+
+                // --- Попытка 2: cat[1] — указатель на class object; читаем его class_ro_t.name ---
                 if (!catClassMatch && cat_cls >= APP_LO && cat_cls < APP_HI) {
                     uint32_t* cat_cls_ptr = (uint32_t*)cat_cls;
                     uint32_t cat_ro = cat_cls_ptr[4] & ~3u;
@@ -12500,11 +12554,10 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                         uint32_t* cat_ro_ptr = (uint32_t*)cat_ro;
                         const char* cat_cls_name = (const char*)(uintptr_t)cat_ro_ptr[3];
                         if (isValidString(cat_cls_name)) {
-                            // Логируем первые несколько категорий для диагностики
-                            if (catIdx < 5) {
+                            if (catIdx < 8) {
                                 char dbg[256];
-                                snprintf(dbg, sizeof(dbg), "CATLIST-DBG: cat[%d] cls_name='%s' cls_ptr=0x%08X want='%s' ptr=0x%08X",
-                                    catIdx, cat_cls_name, cat_cls, className, class_ptr);
+                                snprintf(dbg, sizeof(dbg), "CATLIST-DBG: cat[%d] cls_name='%s' cls_ptr=0x%08X want='%s'",
+                                    catIdx, cat_cls_name, cat_cls, className);
                                 LogToJava(dbg);
                             }
                             if (strcmp(cat_cls_name, className) == 0)
@@ -12512,6 +12565,25 @@ static void PatchMethodIMP(const char* className, const char* selName, void* rep
                         }
                     }
                 }
+
+                // --- Попытка 3: cat[1] — это **classref (указатель на указатель).
+                //     Разыменовываем ещё раз и повторяем проверку по имени. ---
+                if (!catClassMatch && cat_cls >= APP_LO && cat_cls < APP_HI) {
+                    uint32_t deref_cls = *(uint32_t*)cat_cls; // разыменование classref
+                    if (deref_cls == class_ptr) {
+                        catClassMatch = true;
+                    } else if (deref_cls >= APP_LO && deref_cls < APP_HI) {
+                        uint32_t* deref_cls_ptr = (uint32_t*)deref_cls;
+                        uint32_t deref_ro = deref_cls_ptr[4] & ~3u;
+                        if (deref_ro >= APP_LO && deref_ro < APP_HI) {
+                            uint32_t* deref_ro_ptr = (uint32_t*)deref_ro;
+                            const char* deref_cls_name = (const char*)(uintptr_t)deref_ro_ptr[3];
+                            if (isValidString(deref_cls_name) && strcmp(deref_cls_name, className) == 0)
+                                catClassMatch = true;
+                        }
+                    }
+                }
+
                 if (!catClassMatch) continue; // другой класс
                 // Нашли категорию для нашего класса — логируем
                 {
