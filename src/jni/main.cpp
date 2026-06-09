@@ -109,10 +109,18 @@ extern "C" {
 // -------------------------------
 
 pthread_t g_iosMainThread;
-// thread_local указатель на аргументы текущего конструктора — используется в signal handler
-// дочернего потока. Объявлен на уровне файла чтобы быть доступным из static методов.
-struct InitFuncRunArgs;
-static thread_local InitFuncRunArgs* tl_initFuncArgs = nullptr;
+// Структура для запуска __mod_init_func конструкторов в отдельных потоках.
+// Определена на уровне файла — нужна для thread_local указателя ниже.
+struct InitFuncRunArgs {
+    uint32_t        func_addr;
+    pthread_mutex_t done_mutex;
+    pthread_cond_t  done_cond;
+    volatile bool   done;
+    volatile int    crash_sig; // 0 = нет краша, >0 = номер сигнала
+};
+// __thread вместо thread_local: NDK r17c (clang 6) не поддерживает thread_local
+// с incomplete type. __thread — GCC-расширение, работает везде в Android NDK.
+static __thread InitFuncRunArgs* tl_initFuncArgs = nullptr;
 struct MainQueueItem { void* target; const char* sel; void* arg; void* arg2; };
 std::vector<MainQueueItem> g_mainQueue;
 pthread_mutex_t g_mainQueueMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -8193,13 +8201,7 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         // вис в pthread_cond_wait, SIGUSR1 ничего не делал. Решение: запускаем каждый
         // конструктор в дочернем потоке и ждём его через timedwait. При таймауте —
         // detach (поток продолжает работать в фоне, но мы идём дальше).
-        struct InitFuncRunArgs {
-            uint32_t func_addr;
-            pthread_mutex_t done_mutex;
-            pthread_cond_t  done_cond;
-            volatile bool   done;
-            volatile int    crash_sig; // 0 = нет краша, >0 = номер сигнала
-        };
+        // Каждый конструктор запускается в отдельном потоке (см. InitFuncRunArgs/InitFuncThread выше).
         struct InitFuncThread {
             static void* run(void* arg) {
                 InitFuncRunArgs* a = (InitFuncRunArgs*)arg;
