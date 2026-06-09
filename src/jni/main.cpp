@@ -138,10 +138,30 @@ static volatile sig_atomic_t g_inInitFunc = 0;
 static void initFuncSignalGuard(int /*sig*/) {
     if (g_inInitFunc) siglongjmp(g_initFuncJmpBuf, 1);
 }
-// SIGALRM watchdog: если конструктор завис (спинлок, usleep, cond_wait и т.д.)
-// через 3 секунды SIGALRM прерывает его и siglongjmp возвращает управление в цикл.
+// Watchdog через SIGUSR1 + pthread_kill: alarm(3)/SIGALRM не работает в Android JVM-потоках
+// (JVM маскирует SIGALRM для своих нативных тредов). Вместо этого запускаем отдельный
+// watchdog-поток который через pthread_kill шлёт SIGUSR1 напрямую в execution thread.
 static void initFuncAlarmGuard(int /*sig*/) {
     if (g_inInitFunc) siglongjmp(g_initFuncJmpBuf, 2); // 2 = timeout
+}
+
+// Структура для передачи параметров в watchdog-поток
+struct InitFuncWatchdogArgs {
+    pthread_t target;        // поток который выполняет конструктор
+    int       timeout_sec;   // сколько ждать
+    volatile int* cancel;    // ставим 1 когда конструктор завершился нормально
+};
+static void* initFuncWatchdogThread(void* arg) {
+    InitFuncWatchdogArgs* a = (InitFuncWatchdogArgs*)arg;
+    // Ждём timeout_sec * 10 итераций по 100ms, проверяя cancel на каждой.
+    // Это позволяет мгновенно выйти при нормальном завершении конструктора.
+    for (int i = 0; i < a->timeout_sec * 10; i++) {
+        usleep(100000); // 100ms
+        if (*a->cancel) return nullptr; // конструктор завершился — выходим
+    }
+    // Таймаут истёк и конструктор всё ещё работает — прерываем его
+    if (!*a->cancel) pthread_kill(a->target, SIGUSR1);
+    return nullptr;
 }
 
 struct MachOSectionInfo { std::string name; uint32_t start; uint32_t end; };
@@ -8189,18 +8209,20 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         init_funcs_run = true;
         LogToJava("HLE: Выполнение C++ статических конструкторов (__mod_init_func)... (" + std::to_string(g_initFuncs.size()) + " функций)");
 
-        // Перехватываем SIGSEGV/SIGBUS (краш) и SIGALRM (зависание/таймаут).
-        // alarm(3) на каждый конструктор: если не вернулся за 3с — пропускаем.
-        struct sigaction sa_guard, sa_alarm, sa_old_segv, sa_old_bus, sa_old_alrm;
+        // Перехватываем SIGSEGV/SIGBUS (краш) и SIGUSR1 (watchdog timeout).
+        // alarm()/SIGALRM не работают в Android JVM-потоках — JVM их маскирует.
+        // Используем pthread watchdog: отдельный поток шлёт SIGUSR1 через pthread_kill.
+        struct sigaction sa_guard, sa_usr1, sa_old_segv, sa_old_bus, sa_old_usr1;
         sa_guard.sa_handler = initFuncSignalGuard;
         sigemptyset(&sa_guard.sa_mask);
         sa_guard.sa_flags = 0;
-        sa_alarm.sa_handler = initFuncAlarmGuard;
-        sigemptyset(&sa_alarm.sa_mask);
-        sa_alarm.sa_flags = 0;
+        sa_usr1.sa_handler = initFuncAlarmGuard;
+        sigemptyset(&sa_usr1.sa_mask);
+        sa_usr1.sa_flags = 0;
         sigaction(SIGSEGV, &sa_guard, &sa_old_segv);
         sigaction(SIGBUS,  &sa_guard, &sa_old_bus);
-        sigaction(SIGALRM, &sa_alarm, &sa_old_alrm);
+        sigaction(SIGUSR1, &sa_usr1,  &sa_old_usr1);
+        volatile int g_watchdogCancel = 0;
 
         for (int init_i = 0; init_i < (int)g_initFuncs.size(); init_i++) {
             uint32_t func_addr = g_initFuncs[init_i];
@@ -8209,14 +8231,19 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             LogToJava(std::string(init_log));
 
             g_inInitFunc = 1;
-            alarm(3); // watchdog: 3с на конструктор, потом SIGALRM -> siglongjmp
+            g_watchdogCancel = 0;
+            // Запускаем watchdog-поток: 3 секунды, потом pthread_kill(SIGUSR1)
+            InitFuncWatchdogArgs wdArgs = { pthread_self(), 3, &g_watchdogCancel };
+            pthread_t wdThread;
+            pthread_create(&wdThread, nullptr, initFuncWatchdogThread, &wdArgs);
             int jmp_reason = sigsetjmp(g_initFuncJmpBuf, 1);
             if (jmp_reason == 0) {
                 typedef void (*InitFunc)();
                 ((InitFunc)func_addr)();
-                alarm(0); // завершился нормально — отменяем watchdog
+                // Нормальное завершение — отменяем watchdog
+                g_watchdogCancel = 1;
             } else {
-                alarm(0); // отменяем чтобы не сработал повторно
+                g_watchdogCancel = 1; // останавливаем watchdog
                 char warn_log[192];
                 if (jmp_reason == 2) {
                     snprintf(warn_log, sizeof(warn_log),
@@ -8230,15 +8257,15 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
                 LogToJava(std::string(warn_log));
                 sigaction(SIGSEGV, &sa_guard, nullptr);
                 sigaction(SIGBUS,  &sa_guard, nullptr);
-                sigaction(SIGALRM, &sa_alarm, nullptr);
+                sigaction(SIGUSR1, &sa_usr1,  nullptr);
             }
+            pthread_join(wdThread, nullptr); // дожидаемся завершения watchdog
             g_inInitFunc = 0;
         }
 
-        alarm(0);
         sigaction(SIGSEGV, &sa_old_segv, nullptr);
         sigaction(SIGBUS,  &sa_old_bus,  nullptr);
-        sigaction(SIGALRM, &sa_old_alrm, nullptr);
+        sigaction(SIGUSR1, &sa_old_usr1, nullptr);
 
         LogToJava("HLE: C++ статические конструкторы выполнены.");
         // ApplyGamePatches ПОСЛЕ конструкторов: EAGLView регистрирует методы
