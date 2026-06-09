@@ -8212,7 +8212,8 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         // Перехватываем SIGSEGV/SIGBUS (краш) и SIGUSR1 (watchdog timeout).
         // alarm()/SIGALRM не работают в Android JVM-потоках — JVM их маскирует.
         // Используем pthread watchdog: отдельный поток шлёт SIGUSR1 через pthread_kill.
-        struct sigaction sa_guard, sa_usr1, sa_old_segv, sa_old_bus, sa_old_usr1;
+        struct sigaction sa_guard, sa_usr1, sa_old_segv, sa_old_bus, sa_old_usr1,
+                         sa_old_ill, sa_old_trap, sa_old_abrt, sa_old_fpe;
         sa_guard.sa_handler = initFuncSignalGuard;
         sigemptyset(&sa_guard.sa_mask);
         sa_guard.sa_flags = 0;
@@ -8222,6 +8223,13 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         sigaction(SIGSEGV, &sa_guard, &sa_old_segv);
         sigaction(SIGBUS,  &sa_guard, &sa_old_bus);
         sigaction(SIGUSR1, &sa_usr1,  &sa_old_usr1);
+        // Перехватываем SIGILL/SIGTRAP/SIGABRT/SIGFPE — Stub_GenericUnimplemented использует
+        // __builtin_trap() который генерирует SIGTRAP, а не SIGSEGV. Без этого первый
+        // конструктор, вызвавший незаглушённый C-API символ, убивал весь процесс → чёрный экран.
+        sigaction(SIGILL,  &sa_guard, &sa_old_ill);
+        sigaction(SIGTRAP, &sa_guard, &sa_old_trap);
+        sigaction(SIGABRT, &sa_guard, &sa_old_abrt);
+        sigaction(SIGFPE,  &sa_guard, &sa_old_fpe);
         volatile int g_watchdogCancel = 0;
 
         for (int init_i = 0; init_i < (int)g_initFuncs.size(); init_i++) {
@@ -8251,12 +8259,17 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
                         init_i, func_addr);
                 } else {
                     snprintf(warn_log, sizeof(warn_log),
-                        "HLE-WARN: __mod_init_func[%d] @ 0x%08X CRASHED (SIGSEGV/SIGBUS) — пропускаем",
+                        "HLE-WARN: __mod_init_func[%d] @ 0x%08X CRASHED (fatal signal) — пропускаем",
                         init_i, func_addr);
                 }
                 LogToJava(std::string(warn_log));
+                // Переустанавливаем guard-сигналы для следующего конструктора.
                 sigaction(SIGSEGV, &sa_guard, nullptr);
                 sigaction(SIGBUS,  &sa_guard, nullptr);
+                sigaction(SIGILL,  &sa_guard, nullptr);
+                sigaction(SIGTRAP, &sa_guard, nullptr);
+                sigaction(SIGABRT, &sa_guard, nullptr);
+                sigaction(SIGFPE,  &sa_guard, nullptr);
                 sigaction(SIGUSR1, &sa_usr1,  nullptr);
             }
             pthread_join(wdThread, nullptr); // дожидаемся завершения watchdog
@@ -8266,6 +8279,10 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         sigaction(SIGSEGV, &sa_old_segv, nullptr);
         sigaction(SIGBUS,  &sa_old_bus,  nullptr);
         sigaction(SIGUSR1, &sa_old_usr1, nullptr);
+        sigaction(SIGILL,  &sa_old_ill,  nullptr);
+        sigaction(SIGTRAP, &sa_old_trap, nullptr);
+        sigaction(SIGABRT, &sa_old_abrt, nullptr);
+        sigaction(SIGFPE,  &sa_old_fpe,  nullptr);
 
         LogToJava("HLE: C++ статические конструкторы выполнены.");
         // ApplyGamePatches ПОСЛЕ конструкторов: EAGLView регистрирует методы
