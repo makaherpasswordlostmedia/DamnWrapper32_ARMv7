@@ -109,6 +109,10 @@ extern "C" {
 // -------------------------------
 
 pthread_t g_iosMainThread;
+// thread_local указатель на аргументы текущего конструктора — используется в signal handler
+// дочернего потока. Объявлен на уровне файла чтобы быть доступным из static методов.
+struct InitFuncRunArgs;
+static thread_local InitFuncRunArgs* tl_initFuncArgs = nullptr;
 struct MainQueueItem { void* target; const char* sel; void* arg; void* arg2; };
 std::vector<MainQueueItem> g_mainQueue;
 pthread_mutex_t g_mainQueueMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -133,36 +137,6 @@ int g_surfaceWidth = 480; int g_surfaceHeight = 320;
 uint32_t g_entryPoint = 0; uint32_t g_appSlide = 0; std::map<std::string, uint32_t> g_appSymbols;
 std::map<uintptr_t, std::string> g_missingSymbolAddrs;
 std::vector<uint32_t> g_initFuncs;
-static sigjmp_buf g_initFuncJmpBuf;
-static volatile sig_atomic_t g_inInitFunc = 0;
-static void initFuncSignalGuard(int /*sig*/) {
-    if (g_inInitFunc) siglongjmp(g_initFuncJmpBuf, 1);
-}
-// Watchdog через SIGUSR1 + pthread_kill: alarm(3)/SIGALRM не работает в Android JVM-потоках
-// (JVM маскирует SIGALRM для своих нативных тредов). Вместо этого запускаем отдельный
-// watchdog-поток который через pthread_kill шлёт SIGUSR1 напрямую в execution thread.
-static void initFuncAlarmGuard(int /*sig*/) {
-    if (g_inInitFunc) siglongjmp(g_initFuncJmpBuf, 2); // 2 = timeout
-}
-
-// Структура для передачи параметров в watchdog-поток
-struct InitFuncWatchdogArgs {
-    pthread_t target;        // поток который выполняет конструктор
-    int       timeout_sec;   // сколько ждать
-    volatile int* cancel;    // ставим 1 когда конструктор завершился нормально
-};
-static void* initFuncWatchdogThread(void* arg) {
-    InitFuncWatchdogArgs* a = (InitFuncWatchdogArgs*)arg;
-    // Ждём timeout_sec * 10 итераций по 100ms, проверяя cancel на каждой.
-    // Это позволяет мгновенно выйти при нормальном завершении конструктора.
-    for (int i = 0; i < a->timeout_sec * 10; i++) {
-        usleep(100000); // 100ms
-        if (*a->cancel) return nullptr; // конструктор завершился — выходим
-    }
-    // Таймаут истёк и конструктор всё ещё работает — прерываем его
-    if (!*a->cancel) pthread_kill(a->target, SIGUSR1);
-    return nullptr;
-}
 
 struct MachOSectionInfo { std::string name; uint32_t start; uint32_t end; };
 std::vector<MachOSectionInfo> g_machoSections;
@@ -8209,28 +8183,59 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         init_funcs_run = true;
         LogToJava("HLE: Выполнение C++ статических конструкторов (__mod_init_func)... (" + std::to_string(g_initFuncs.size()) + " функций)");
 
-        // Перехватываем SIGSEGV/SIGBUS (краш) и SIGUSR1 (watchdog timeout).
-        // alarm()/SIGALRM не работают в Android JVM-потоках — JVM их маскирует.
-        // Используем pthread watchdog: отдельный поток шлёт SIGUSR1 через pthread_kill.
-        struct sigaction sa_guard, sa_usr1, sa_old_segv, sa_old_bus, sa_old_usr1,
-                         sa_old_ill, sa_old_trap, sa_old_abrt, sa_old_fpe;
-        sa_guard.sa_handler = initFuncSignalGuard;
-        sigemptyset(&sa_guard.sa_mask);
-        sa_guard.sa_flags = 0;
-        sa_usr1.sa_handler = initFuncAlarmGuard;
-        sigemptyset(&sa_usr1.sa_mask);
-        sa_usr1.sa_flags = 0;
-        sigaction(SIGSEGV, &sa_guard, &sa_old_segv);
-        sigaction(SIGBUS,  &sa_guard, &sa_old_bus);
-        sigaction(SIGUSR1, &sa_usr1,  &sa_old_usr1);
-        // Перехватываем SIGILL/SIGTRAP/SIGABRT/SIGFPE — Stub_GenericUnimplemented использует
-        // __builtin_trap() который генерирует SIGTRAP, а не SIGSEGV. Без этого первый
-        // конструктор, вызвавший незаглушённый C-API символ, убивал весь процесс → чёрный экран.
-        sigaction(SIGILL,  &sa_guard, &sa_old_ill);
-        sigaction(SIGTRAP, &sa_guard, &sa_old_trap);
-        sigaction(SIGABRT, &sa_guard, &sa_old_abrt);
-        sigaction(SIGFPE,  &sa_guard, &sa_old_fpe);
-        volatile int g_watchdogCancel = 0;
+        // Сигналы теперь перехватываются в каждом дочернем потоке отдельно.
+        // Главный поток не устанавливает глобальных signal guard-ов для конструкторов.
+
+        // Структура для запуска конструктора в отдельном потоке с синхронизацией.
+        // ПОЧЕМУ ПОТОК, А НЕ SIGUSR1:
+        // pthread_cond_wait/futex на Linux НЕ прерываются siglongjmp из signal handler —
+        // glibc перезапускает futex внутри после получения сигнала. Если конструктор
+        // вис в pthread_cond_wait, SIGUSR1 ничего не делал. Решение: запускаем каждый
+        // конструктор в дочернем потоке и ждём его через timedwait. При таймауте —
+        // detach (поток продолжает работать в фоне, но мы идём дальше).
+        struct InitFuncRunArgs {
+            uint32_t func_addr;
+            pthread_mutex_t done_mutex;
+            pthread_cond_t  done_cond;
+            volatile bool   done;
+            volatile int    crash_sig; // 0 = нет краша, >0 = номер сигнала
+        };
+        struct InitFuncThread {
+            static void* run(void* arg) {
+                InitFuncRunArgs* a = (InitFuncRunArgs*)arg;
+                tl_initFuncArgs = a; // thread_local — виден в signal handler ниже
+                struct sigaction sa;
+                sa.sa_handler = [](int sig) {
+                    InitFuncRunArgs* a2 = tl_initFuncArgs;
+                    if (a2) {
+                        a2->crash_sig = sig;
+                        pthread_mutex_lock(&a2->done_mutex);
+                        a2->done = true;
+                        pthread_cond_signal(&a2->done_cond);
+                        pthread_mutex_unlock(&a2->done_mutex);
+                        tl_initFuncArgs = nullptr;
+                    }
+                    pthread_exit(nullptr);
+                };
+                sigemptyset(&sa.sa_mask);
+                sa.sa_flags = 0;
+                sigaction(SIGSEGV, &sa, nullptr);
+                sigaction(SIGBUS,  &sa, nullptr);
+                sigaction(SIGILL,  &sa, nullptr);
+                sigaction(SIGTRAP, &sa, nullptr);
+                sigaction(SIGABRT, &sa, nullptr);
+                sigaction(SIGFPE,  &sa, nullptr);
+
+                typedef void (*InitFunc)();
+                ((InitFunc)(uintptr_t)a->func_addr)();
+
+                pthread_mutex_lock(&a->done_mutex);
+                a->done = true;
+                pthread_cond_signal(&a->done_cond);
+                pthread_mutex_unlock(&a->done_mutex);
+                return nullptr;
+            }
+        };
 
         for (int init_i = 0; init_i < (int)g_initFuncs.size(); init_i++) {
             uint32_t func_addr = g_initFuncs[init_i];
@@ -8238,51 +8243,51 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             snprintf(init_log, sizeof(init_log), "HLE: __mod_init_func[%d] @ 0x%08X", init_i, func_addr);
             LogToJava(std::string(init_log));
 
-            g_inInitFunc = 1;
-            g_watchdogCancel = 0;
-            // Запускаем watchdog-поток: 3 секунды, потом pthread_kill(SIGUSR1)
-            InitFuncWatchdogArgs wdArgs = { pthread_self(), 3, &g_watchdogCancel };
-            pthread_t wdThread;
-            pthread_create(&wdThread, nullptr, initFuncWatchdogThread, &wdArgs);
-            int jmp_reason = sigsetjmp(g_initFuncJmpBuf, 1);
-            if (jmp_reason == 0) {
-                typedef void (*InitFunc)();
-                ((InitFunc)func_addr)();
-                // Нормальное завершение — отменяем watchdog
-                g_watchdogCancel = 1;
-            } else {
-                g_watchdogCancel = 1; // останавливаем watchdog
-                char warn_log[192];
-                if (jmp_reason == 2) {
-                    snprintf(warn_log, sizeof(warn_log),
-                        "HLE-WARN: __mod_init_func[%d] @ 0x%08X TIMEOUT (>3s) — пропускаем",
-                        init_i, func_addr);
-                } else {
-                    snprintf(warn_log, sizeof(warn_log),
-                        "HLE-WARN: __mod_init_func[%d] @ 0x%08X CRASHED (fatal signal) — пропускаем",
-                        init_i, func_addr);
-                }
-                LogToJava(std::string(warn_log));
-                // Переустанавливаем guard-сигналы для следующего конструктора.
-                sigaction(SIGSEGV, &sa_guard, nullptr);
-                sigaction(SIGBUS,  &sa_guard, nullptr);
-                sigaction(SIGILL,  &sa_guard, nullptr);
-                sigaction(SIGTRAP, &sa_guard, nullptr);
-                sigaction(SIGABRT, &sa_guard, nullptr);
-                sigaction(SIGFPE,  &sa_guard, nullptr);
-                sigaction(SIGUSR1, &sa_usr1,  nullptr);
+            InitFuncRunArgs runArgs;
+            runArgs.func_addr  = func_addr;
+            runArgs.done       = false;
+            runArgs.crash_sig  = 0;
+            pthread_mutex_init(&runArgs.done_mutex, nullptr);
+            pthread_cond_init(&runArgs.done_cond, nullptr);
+
+            pthread_t initThread;
+            pthread_create(&initThread, nullptr, InitFuncThread::run, &runArgs);
+
+            // Ждём завершения конструктора максимум 3 секунды
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += 3;
+
+            pthread_mutex_lock(&runArgs.done_mutex);
+            int wait_res = 0;
+            while (!runArgs.done && wait_res == 0) {
+                wait_res = pthread_cond_timedwait(&runArgs.done_cond, &runArgs.done_mutex, &deadline);
             }
-            pthread_join(wdThread, nullptr); // дожидаемся завершения watchdog
-            g_inInitFunc = 0;
+            bool timed_out = !runArgs.done; // wait_res == ETIMEDOUT
+            pthread_mutex_unlock(&runArgs.done_mutex);
+
+            char warn_log[192];
+            if (timed_out) {
+                snprintf(warn_log, sizeof(warn_log),
+                    "HLE-WARN: __mod_init_func[%d] @ 0x%08X TIMEOUT (>3s) — detach, идём дальше",
+                    init_i, func_addr);
+                LogToJava(std::string(warn_log));
+                pthread_detach(initThread); // поток живёт в фоне, мы идём дальше
+            } else if (runArgs.crash_sig > 0) {
+                snprintf(warn_log, sizeof(warn_log),
+                    "HLE-WARN: __mod_init_func[%d] @ 0x%08X CRASHED (signal %d) — пропускаем",
+                    init_i, func_addr, runArgs.crash_sig);
+                LogToJava(std::string(warn_log));
+                pthread_join(initThread, nullptr);
+            } else {
+                pthread_join(initThread, nullptr); // нормальное завершение
+            }
+
+            pthread_mutex_destroy(&runArgs.done_mutex);
+            pthread_cond_destroy(&runArgs.done_cond);
         }
 
-        sigaction(SIGSEGV, &sa_old_segv, nullptr);
-        sigaction(SIGBUS,  &sa_old_bus,  nullptr);
-        sigaction(SIGUSR1, &sa_old_usr1, nullptr);
-        sigaction(SIGILL,  &sa_old_ill,  nullptr);
-        sigaction(SIGTRAP, &sa_old_trap, nullptr);
-        sigaction(SIGABRT, &sa_old_abrt, nullptr);
-        sigaction(SIGFPE,  &sa_old_fpe,  nullptr);
+        // Сигналы восстанавливать не нужно — они устанавливались только в дочерних потоках.
 
         LogToJava("HLE: C++ статические конструкторы выполнены.");
         // ApplyGamePatches ПОСЛЕ конструкторов: EAGLView регистрирует методы
