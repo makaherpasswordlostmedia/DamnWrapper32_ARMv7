@@ -12803,11 +12803,50 @@ static void ApplyGamePatches() {
                 // Получаем имя класса для лога
                 const char* cname_c = isValidString((const char*)(uintptr_t)ro_ptr_c[4])
                                         ? (const char*)(uintptr_t)ro_ptr_c[4] : "?";
+                // RAW диагностика для EAGLView и других классов-кандидатов
+                bool isTarget = (strcmp(cname_c, "EAGLView") == 0 ||
+                                 strcmp(cname_c, "RootController") == 0 ||
+                                 strcmp(cname_c, "MainViewController") == 0 ||
+                                 strcmp(cname_c, "SharkAppDelegate") == 0 ||
+                                 strcmp(cname_c, "SMB2GameAppDelegate") == 0);
+                if (isTarget) {
+                    char raw[256];
+                    snprintf(raw, sizeof(raw),
+                        "CLSCAN-RAW: '%s' cls=0x%08X cls[4]=0x%08X ro=0x%08X ro[4](name)=0x%08X ro[5](mlist)=0x%08X",
+                        cname_c, cp, cls_c[4], ro_c, ro_ptr_c[4], ro_ptr_c[5]);
+                    LogToJava(raw);
+                }
                 // Сканируем methodlist
                 uint32_t mlist_c = ro_ptr_c[5];
+                if (isTarget) {
+                    char mdbg[256];
+                    if (!mlist_c || mlist_c < APP_LO || mlist_c >= APP_HI) {
+                        snprintf(mdbg, sizeof(mdbg),
+                            "CLSCAN-MLIST: '%s' mlist=0x%08X SKIP (out of range APP=[0x%08X,0x%08X))",
+                            cname_c, mlist_c, APP_LO, APP_HI);
+                    } else {
+                        uint32_t* ml_dbg = (uint32_t*)mlist_c;
+                        snprintf(mdbg, sizeof(mdbg),
+                            "CLSCAN-MLIST: '%s' mlist=0x%08X flags=0x%08X count=%u",
+                            cname_c, mlist_c, ml_dbg[0], ml_dbg[1]);
+                    }
+                    LogToJava(mdbg);
+                }
                 if (!mlist_c || mlist_c < APP_LO || mlist_c >= APP_HI) continue;
                 uint32_t* ml = (uint32_t*)mlist_c;
                 uint32_t cnt = ml[1];
+                if (isTarget) {
+                    // Дампируем первые 10 методов для диагностики
+                    uint32_t* meths_dbg = ml + 2;
+                    for (uint32_t di = 0; di < cnt && di < 10; di++) {
+                        uint32_t mn_dbg = meths_dbg[di*3 + 0];
+                        const char* mn_str = isValidString((const char*)mn_dbg) ? (const char*)mn_dbg : "<?>";
+                        char mline[256];
+                        snprintf(mline, sizeof(mline), "  CLSCAN-METHOD[%u]: name_ptr=0x%08X '%s' imp=0x%08X",
+                            di, mn_dbg, mn_str, meths_dbg[di*3+2]);
+                        LogToJava(mline);
+                    }
+                }
                 if (cnt == 0 || cnt >= 10000) continue;
                 uint32_t* meths = ml + 2;
                 for (uint32_t i = 0; i < cnt; i++) {
