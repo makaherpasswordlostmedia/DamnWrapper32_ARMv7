@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <ucontext.h>
 #include <map>
+#include <set>
 #include <unordered_set>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1450,7 +1451,8 @@ void AudioUnitStreamWriteToJava(const uint8_t* data, int size) {
 // ABSOLUTE MEGA DEBUGGER FOR 0x8 CRASH
 // ==========================================
 void _SyncLog(const std::string& msg) {
-    if (!g_logRenderDebug) return;
+    // Безусловный синхронный лог — не зависит от g_logRenderDebug,
+    // чтобы критические сообщения (PATCH-HIT и т.п.) всегда флашились до краша.
     _LogToJava(msg);
 }
 
@@ -7118,15 +7120,20 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
     }
     if (strcmp(op, "applicationFrame") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
-        // Всегда возвращаем ФАКТИЧЕСКИЕ размеры поверхности без portrait/landscape swap:
-        // g_surfaceWidth=480, g_surfaceHeight=320 → отдаём {0,0,480,320}.
-        // Игры сами ориентируются под свой layout; min/max здесь только ломал ландшафтные игры.
-        float w = (float)g_surfaceWidth;
-        float h = (float)g_surfaceHeight;
+        // Всегда возвращаем ФАКТИЧЕСКИЕ размеры поверхности без portrait/landscape swap.
+        // EGL fallback: если g_surfaceWidth/Height == 0, запрашиваем у EGL напрямую.
+        EGLint eglW = g_surfaceWidth, eglH = g_surfaceHeight;
+        if ((eglW <= 0 || eglH <= 0) && g_eglDisplay != EGL_NO_DISPLAY && g_eglSurface != EGL_NO_SURFACE) {
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH,  &eglW);
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &eglH);
+        }
+        // Финальная защита — безопасный дефолт если всё ещё 0
+        float w = (eglW > 0) ? (float)eglW : 480.0f;
+        float h = (eglH > 0) ? (float)eglH : 320.0f;
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET applicationFrame <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr) + " | Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: 0x" + std::to_string((uintptr_t)ret_addr));
         LogToJava("  Writing: x=0 y=0 w=" + std::to_string(w) + " h=" + std::to_string(h));
-        
+
         if (ret_addr) {
             float* rect = (float*)ret_addr;
             rect[0] = 0.0f; rect[1] = 0.0f; rect[2] = w; rect[3] = h;
@@ -7247,21 +7254,24 @@ void* Impl_objc_msgSendSuper2_stret(void* ret_addr, void* super_struct, const ch
         return ret_addr;
     }
     if (strcmp(op, "applicationFrame") == 0) {
-        float w = (float)g_surfaceWidth;
-        float h = (float)g_surfaceHeight;
-        // Убираем portrait/landscape swap — отдаём фактический размер поверхности
+        // EGL fallback + zero-guard (аналогично Impl_objc_msgSend_stret)
+        EGLint eglW = g_surfaceWidth, eglH = g_surfaceHeight;
+        if ((eglW <= 0 || eglH <= 0) && g_eglDisplay != EGL_NO_DISPLAY && g_eglSurface != EGL_NO_SURFACE) {
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH,  &eglW);
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &eglH);
+        }
+        float w = (eglW > 0) ? (float)eglW : 480.0f;
+        float h = (eglH > 0) ? (float)eglH : 320.0f;
         float rectData[4] = {0.0f, 0.0f, w, h};
         if (ret_addr) {
             memcpy(ret_addr, rectData, 16);
             LogToJava("[SIZE-TRACE] STRET applicationFrame записал: " + std::to_string(w) + "x" + std::to_string(h));
         }
-        
         g_fpu_ret[0] = rectData[0];
         g_fpu_ret[1] = rectData[1];
         g_fpu_ret[2] = rectData[2];
         g_fpu_ret[3] = rectData[3];
         g_fpu_ret_flag = 1;
-        
         return ret_addr;
     }
     if (strcmp(op, "statusBarFrame") == 0) {
@@ -12255,15 +12265,17 @@ static void __attribute__((pcs("aapcs"))) hle_getResolution_replacement(
     uint32_t h = (g_surfaceHeight > 0) ? (uint32_t)g_surfaceHeight : 320u;
     char dbg[256];
     snprintf(dbg, sizeof(dbg),
-        "PATCH-HIT: getResolutionWithDevice: -> phys=%ux%u log=%ux%u res=1.0",
-        w, h, w, h);
-    LogToJava(dbg);
-    if (physW) *physW = w;
-    if (physH) *physH = h;
-    if (logW)  *logW  = w;
-    if (logH)  *logH  = h;
-    if (resX)  *resX  = 1.0f;
-    if (resY)  *resY  = 1.0f;
+        "PATCH-HIT: getResolutionWithDevice: -> phys=%ux%u log=%ux%u res=1.0 physW*=%p physH*=%p",
+        w, h, w, h, (void*)physW, (void*)physH);
+    // SyncLog: безусловный, флашится синхронно — гарантированно попадёт в лог до краша
+    SyncLog(dbg);
+    // Null-guard: параметры приходят со стека (5-й и далее по AAPCS) — могут быть мусором
+    if (physW && (uintptr_t)physW >= 0x1000u) *physW = w;
+    if (physH && (uintptr_t)physH >= 0x1000u) *physH = h;
+    if (logW  && (uintptr_t)logW  >= 0x1000u) *logW  = w;
+    if (logH  && (uintptr_t)logH  >= 0x1000u) *logH  = h;
+    if (resX  && (uintptr_t)resX  >= 0x1000u) *resX  = 1.0f;
+    if (resY  && (uintptr_t)resY  >= 0x1000u) *resY  = 1.0f;
 }
 
 static uint32_t __attribute__((pcs("aapcs"))) hle_presentFramebuffer_replacement(void* self, void* _cmd) {
@@ -12841,25 +12853,28 @@ static void ApplyGamePatches() {
         //   setFramebuffer     → "createFramebuffer" + glBindFramebuffer(0) при вызове (EAGLView)
         //   startAnimation     → "startMainLoop"    (RootController) или "initWithFPS:" (RootController)
         // Патчим оба имени на случай разных версий бинаря.
+        // alias_group: методы с одинаковым ненулевым номером группы считаются алиасами —
+        // как только один из них найден, остальные в той же группе не вызывают PATCH-WARN.
         struct TargetMethod {
             const char* sel;
             void* replacement;
             bool found;
             std::string foundInClass;
+            int alias_group; // 0 = без группы; >0 = алиасы одного логического метода
         };
         TargetMethod targets[] = {
             // getResolutionWithDevice: — вызывается через прямой IMP после [UIApplication delegate]
             { "getResolutionWithDevice:physWidth:physHeight:logWidth:logHeight:resX:resY:",
-                                     (void*)hle_getResolution_replacement,        false, "" },
-            // present* — перехватываем eglSwapBuffers
-            { "present",             (void*)hle_presentFramebuffer_replacement,   false, "" },
-            { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,   false, "" },
-            // createFramebuffer — биндим FBO 0 вместо iOS FBO
-            { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,    false, "" },
-            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "" },
-            // startAnimation — запускаем render loop
-            { "startMainLoop",       (void*)hle_startAnimation_replacement,       false, "" },
-            { "startAnimation",      (void*)hle_startAnimation_replacement,       false, "" },
+                                     (void*)hle_getResolution_replacement,        false, "", 0 },
+            // present* — перехватываем eglSwapBuffers (алиасы, группа 1)
+            { "present",             (void*)hle_presentFramebuffer_replacement,   false, "", 1 },
+            { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,   false, "", 1 },
+            // createFramebuffer/setFramebuffer — биндим FBO 0 (алиасы, группа 2)
+            { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,    false, "", 2 },
+            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "", 2 },
+            // startAnimation — запускаем render loop (алиасы, группа 3)
+            { "startMainLoop",       (void*)hle_startAnimation_replacement,       false, "", 3 },
+            { "startAnimation",      (void*)hle_startAnimation_replacement,       false, "", 3 },
         };
 
         for (const auto& sec : g_machoSections) {
@@ -12946,16 +12961,43 @@ static void ApplyGamePatches() {
                             LogToJava(plog);
                             tgt.found = true;
                             tgt.foundInClass = cname_c;
+                            // Помечаем найденными все алиасы той же группы
+                            if (tgt.alias_group != 0) {
+                                for (auto& other : targets) {
+                                    if (&other != &tgt && other.alias_group == tgt.alias_group) {
+                                        other.found = true;
+                                        if (other.foundInClass.empty())
+                                            other.foundInClass = std::string(cname_c) + " (alias of " + tgt.sel + ")";
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        // Отчёт о не найденных методах
+        // Отчёт о не найденных методах.
+        // Для алиасных групп выводим одно сообщение на группу (только если ни один из группы не найден).
+        std::set<int> reportedGroups;
         for (const auto& tgt : targets) {
             if (!tgt.found) {
-                LogToJava(std::string("PATCH-WARN: метод '") + tgt.sel +
-                          "' не найден ни в одном нативном классе в __objc_classlist");
+                if (tgt.alias_group != 0) {
+                    if (reportedGroups.count(tgt.alias_group)) continue;
+                    reportedGroups.insert(tgt.alias_group);
+                    // Собираем все имена алиасов этой группы
+                    std::string names;
+                    for (const auto& other : targets) {
+                        if (other.alias_group == tgt.alias_group) {
+                            if (!names.empty()) names += " / ";
+                            names += other.sel;
+                        }
+                    }
+                    LogToJava("PATCH-WARN: ни один из алиасов [" + names +
+                              "] не найден в __objc_classlist");
+                } else {
+                    LogToJava(std::string("PATCH-WARN: метод '") + tgt.sel +
+                              "' не найден ни в одном нативном классе в __objc_classlist");
+                }
             }
         }
     }
