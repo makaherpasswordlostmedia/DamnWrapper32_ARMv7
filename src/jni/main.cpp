@@ -21,7 +21,6 @@
 #include <ucontext.h>
 #include <map>
 #include <set>
-#include <unordered_set>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -1452,7 +1451,7 @@ void AudioUnitStreamWriteToJava(const uint8_t* data, int size) {
 // ==========================================
 void _SyncLog(const std::string& msg) {
     // Безусловный синхронный лог — не зависит от g_logRenderDebug,
-    // чтобы критические сообщения (PATCH-HIT и т.п.) всегда флашились до краша.
+    // чтобы PATCH-HIT и критические сообщения гарантированно флашились до краша.
     _LogToJava(msg);
 }
 
@@ -7028,26 +7027,24 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
     }
     if (strcmp(op, "frame") == 0 || strcmp(op, "bounds") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
+        // Универсальный EGL fallback: используем глобальные g_eglDisplay/g_eglSurface
+        // (они всегда валидны после NativeExecutionThread init, в отличие от eglGetCurrent*
+        // которые возвращают NO_SURFACE если контекст откреплён от потока).
+        if ((g_surfaceWidth <= 0 || g_surfaceHeight <= 0) &&
+            g_eglDisplay != EGL_NO_DISPLAY && g_eglSurface != EGL_NO_SURFACE) {
+            EGLint qw = 0, qh = 0;
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH,  &qw);
+            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &qh);
+            if (qw > 0 && qh > 0) {
+                g_surfaceWidth  = qw;
+                g_surfaceHeight = qh;
+                LogToJava("[STRET-FIX] " + std::string(op) + ": EGL global fallback -> " +
+                          std::to_string(qw) + "x" + std::to_string(qh));
+            }
+        }
         float w = (float)g_surfaceWidth;
         float h = (float)g_surfaceHeight;
         if (cName.find("UIScreen") != std::string::npos) {
-            // ФИКС ЧЁРНОГО ЭКРАНА: если g_surfaceWidth ещё 0 (initWrapper вызван с resWidth=0
-            // до onSurfaceCreated), запрашиваем реальный размер напрямую из EGL.
-            if (g_surfaceWidth <= 0 || g_surfaceHeight <= 0) {
-                EGLDisplay qDpy = eglGetCurrentDisplay();
-                EGLSurface qSurf = eglGetCurrentSurface(EGL_DRAW);
-                if (qSurf != EGL_NO_SURFACE && qDpy != EGL_NO_DISPLAY) {
-                    EGLint qw = 0, qh = 0;
-                    eglQuerySurface(qDpy, qSurf, EGL_WIDTH, &qw);
-                    eglQuerySurface(qDpy, qSurf, EGL_HEIGHT, &qh);
-                    if (qw > 0 && qh > 0) {
-                        g_surfaceWidth  = qw;
-                        g_surfaceHeight = qh;
-                        LogToJava("[STRET-FIX] UIScreen bounds: EGL fallback -> " +
-                                  std::to_string(qw) + "x" + std::to_string(qh));
-                    }
-                }
-            }
             w = (float)(g_surfaceWidth  > 0 ? g_surfaceWidth  : 480);
             h = (float)(g_surfaceHeight > 0 ? g_surfaceHeight : 320);
         } else if (g_views.count(self)) {
@@ -7120,14 +7117,12 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
     }
     if (strcmp(op, "applicationFrame") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
-        // Всегда возвращаем ФАКТИЧЕСКИЕ размеры поверхности без portrait/landscape swap.
-        // EGL fallback: если g_surfaceWidth/Height == 0, запрашиваем у EGL напрямую.
+        // EGL fallback + zero-guard: g_surfaceWidth может быть 0 если initWrapper ещё не вызван.
         EGLint eglW = g_surfaceWidth, eglH = g_surfaceHeight;
         if ((eglW <= 0 || eglH <= 0) && g_eglDisplay != EGL_NO_DISPLAY && g_eglSurface != EGL_NO_SURFACE) {
             eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH,  &eglW);
             eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &eglH);
         }
-        // Финальная защита — безопасный дефолт если всё ещё 0
         float w = (eglW > 0) ? (float)eglW : 480.0f;
         float h = (eglH > 0) ? (float)eglH : 320.0f;
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET applicationFrame <<<<<<<<");
@@ -12269,7 +12264,8 @@ static void __attribute__((pcs("aapcs"))) hle_getResolution_replacement(
         w, h, w, h, (void*)physW, (void*)physH);
     // SyncLog: безусловный, флашится синхронно — гарантированно попадёт в лог до краша
     SyncLog(dbg);
-    // Null-guard: параметры приходят со стека (5-й и далее по AAPCS) — могут быть мусором
+    // Null-guard: параметры 5-7 приходят со стека (ARMv7 AAPCS) — могут быть мусором.
+    // Проверяем что адрес валиден (>= 0x1000 = выше нулевой страницы).
     if (physW && (uintptr_t)physW >= 0x1000u) *physW = w;
     if (physH && (uintptr_t)physH >= 0x1000u) *physH = h;
     if (logW  && (uintptr_t)logW  >= 0x1000u) *logW  = w;
@@ -12855,26 +12851,31 @@ static void ApplyGamePatches() {
         // Патчим оба имени на случай разных версий бинаря.
         // alias_group: методы с одинаковым ненулевым номером группы считаются алиасами —
         // как только один из них найден, остальные в той же группе не вызывают PATCH-WARN.
+        // patch_all_classes: если true — патчим метод во ВСЕХ классах где он найден,
+        // а не только в первом (нужно для getResolutionWithDevice: который есть у двух делегатов).
         struct TargetMethod {
             const char* sel;
             void* replacement;
             bool found;
             std::string foundInClass;
-            int alias_group; // 0 = без группы; >0 = алиасы одного логического метода
+            int alias_group;    // 0 = без группы; >0 = алиасы одного логического метода
+            bool patch_all_classes; // если true — патчим во всех классах, не только в первом
         };
         TargetMethod targets[] = {
-            // getResolutionWithDevice: — вызывается через прямой IMP после [UIApplication delegate]
+            // getResolutionWithDevice: — вызывается через прямой IMP после [UIApplication delegate].
+            // patch_all_classes=true: и SMB2GameAppDelegate, и SharkAppDelegate содержат этот метод.
+            // [UIApplication delegate] может вернуть любой из них — патчим оба.
             { "getResolutionWithDevice:physWidth:physHeight:logWidth:logHeight:resX:resY:",
-                                     (void*)hle_getResolution_replacement,        false, "", 0 },
+                                     (void*)hle_getResolution_replacement,        false, "", 0, true },
             // present* — перехватываем eglSwapBuffers (алиасы, группа 1)
-            { "present",             (void*)hle_presentFramebuffer_replacement,   false, "", 1 },
-            { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,   false, "", 1 },
+            { "present",             (void*)hle_presentFramebuffer_replacement,   false, "", 1, false },
+            { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,   false, "", 1, false },
             // createFramebuffer/setFramebuffer — биндим FBO 0 (алиасы, группа 2)
-            { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,    false, "", 2 },
-            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "", 2 },
+            { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,    false, "", 2, false },
+            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "", 2, false },
             // startAnimation — запускаем render loop (алиасы, группа 3)
-            { "startMainLoop",       (void*)hle_startAnimation_replacement,       false, "", 3 },
-            { "startAnimation",      (void*)hle_startAnimation_replacement,       false, "", 3 },
+            { "startMainLoop",       (void*)hle_startAnimation_replacement,       false, "", 3, false },
+            { "startAnimation",      (void*)hle_startAnimation_replacement,       false, "", 3, false },
         };
 
         for (const auto& sec : g_machoSections) {
@@ -12943,16 +12944,10 @@ static void ApplyGamePatches() {
                     const char* mname = (const char*)mn;
                     uint32_t imp_addr = meths[i*3 + 2];
                     for (auto& tgt : targets) {
-                        if (!tgt.found && strcmp(mname, tgt.sel) == 0) {
-                            // Проверяем что этот IMP ещё не был пропатчен другим target
-                            bool alreadyPatched = false;
-                            for (const auto& other : targets) {
-                                if (other.found && other.foundInClass == cname_c) {
-                                    // Если другой target того же replacement уже пропатчил этот класс - ok
-                                    // Но если IMP совпадает — пропускаем дублирование
-                                }
-                            }
-                            (void)alreadyPatched;
+                        // patch_all_classes=false: пропускаем если уже нашли в любом классе
+                        // patch_all_classes=true: патчим в каждом классе где встречается
+                        bool alreadyFoundForThisClass = (tgt.found && !tgt.patch_all_classes);
+                        if (!alreadyFoundForThisClass && strcmp(mname, tgt.sel) == 0) {
                             PatchThumbFunctionToReplacement(imp_addr | 1u, tgt.replacement);
                             char plog[256];
                             snprintf(plog, sizeof(plog),
@@ -12960,11 +12955,11 @@ static void ApplyGamePatches() {
                                 cname_c, tgt.sel, imp_addr, (uint32_t)(uintptr_t)tgt.replacement);
                             LogToJava(plog);
                             tgt.found = true;
-                            tgt.foundInClass = cname_c;
-                            // Помечаем найденными все алиасы той же группы
+                            if (tgt.foundInClass.empty()) tgt.foundInClass = cname_c;
+                            // Помечаем найденными все алиасы той же группы (кроме patch_all_classes)
                             if (tgt.alias_group != 0) {
                                 for (auto& other : targets) {
-                                    if (&other != &tgt && other.alias_group == tgt.alias_group) {
+                                    if (&other != &tgt && other.alias_group == tgt.alias_group && !other.patch_all_classes) {
                                         other.found = true;
                                         if (other.foundInClass.empty())
                                             other.foundInClass = std::string(cname_c) + " (alias of " + tgt.sel + ")";
@@ -12977,14 +12972,14 @@ static void ApplyGamePatches() {
             }
         }
         // Отчёт о не найденных методах.
-        // Для алиасных групп выводим одно сообщение на группу (только если ни один из группы не найден).
+        // Для алиасных групп (alias_group>0) выводим одно сообщение на группу
+        // только если НИ ОДИН из группы не найден.
         std::set<int> reportedGroups;
         for (const auto& tgt : targets) {
             if (!tgt.found) {
                 if (tgt.alias_group != 0) {
                     if (reportedGroups.count(tgt.alias_group)) continue;
                     reportedGroups.insert(tgt.alias_group);
-                    // Собираем все имена алиасов этой группы
                     std::string names;
                     for (const auto& other : targets) {
                         if (other.alias_group == tgt.alias_group) {
