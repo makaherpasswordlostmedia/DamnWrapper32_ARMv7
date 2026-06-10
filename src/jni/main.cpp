@@ -12249,6 +12249,28 @@ static uint32_t __attribute__((pcs("aapcs"))) hle_presentFramebuffer_replacement
 // Патчим: всегда биндим FBO 0 (главный буфер окна) вместо iOS-шного FBO 1.
 // Это гарантирует, что draw calls идут в реальный window surface.
 // =============================================================================
+// =============================================================================
+// ПАТЧ: -[EAGLView createFramebuffer]
+// SMB2 Lite использует createFramebuffer вместо setFramebuffer.
+// createFramebuffer создаёт iOS FBO (ID > 0) и биндит его.
+// В Android EGL нет iOS-совместимых FBO — после создания всегда биндим FBO 0
+// (default window surface). Оригинальный код пропускаем — он всё равно создаст
+// невалидный FBO. Вместо этого просто биндим FBO 0 и настраиваем viewport.
+// =============================================================================
+static void __attribute__((pcs("aapcs"))) hle_createFramebuffer_replacement(void* self, void* _cmd) {
+    LogToJava("PATCH-HIT: -[EAGLView createFramebuffer] intercepted -> glBindFramebuffer(0)");
+    // Биндим FBO 0 — стандартный default framebuffer EGL WindowSurface
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    EGLint vpW = 0, vpH = 0;
+    EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+    if (surf != EGL_NO_SURFACE) {
+        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_WIDTH, &vpW);
+        eglQuerySurface(eglGetCurrentDisplay(), surf, EGL_HEIGHT, &vpH);
+    }
+    if (vpW <= 0 || vpH <= 0) { vpW = g_surfaceWidth; vpH = g_surfaceHeight; }
+    glViewport(0, 0, vpW, vpH);
+}
+
 static void __attribute__((pcs("aapcs"))) hle_setFramebuffer_replacement(void* self, void* _cmd) {
     // Биндим FBO 0 — стандартный default framebuffer EGL WindowSurface
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -12277,49 +12299,55 @@ static void __attribute__((pcs("aapcs"))) hle_setFramebuffer_replacement(void* s
 // цикл через трамплин не происходит — патч перезаписывает первые 8 байт функции).
 // =============================================================================
 static void* __attribute__((pcs("aapcs"))) hle_startAnimation_replacement(void* self, void* _cmd) {
-    LogToJava("PATCH-HIT: -[startAnimation] intercepted via IMP patch -> g_renderingStarted = true");
+    LogToJava("PATCH-HIT: -[startAnimation/startMainLoop] intercepted via IMP patch -> g_renderingStarted = true");
     if (!g_renderingStarted) {
         g_renderingStarted = true;
-        // Пытаемся определить CADisplayLink target/selector из объекта если ещё не задан
+        uint32_t selfIsa = self ? ((uint32_t*)self)[0] : 0;
+
+        // Список render-loop selectors в порядке приоритета
+        const char* loopSels[] = {
+            "drawFrame", "drawView:", "mainLoop", "_mainLoop:", "dl_mainLoop:", nullptr
+        };
+
+        // Ищем render loop selector в self (RootController / MainViewController / EAGLView)
+        for (int si = 0; loopSels[si]; si++) {
+            if (selfIsa && FindMethodIMP(selfIsa, loopSels[si])) {
+                g_displayLinkTarget   = self;
+                g_displayLinkSelector = loopSels[si];
+                char dbg[128];
+                snprintf(dbg, sizeof(dbg),
+                    "PATCH-HIT: [startMainLoop] self=0x%08X sel=%s",
+                    (uint32_t)(uintptr_t)self, loopSels[si]);
+                LogToJava(dbg);
+                break;
+            }
+        }
+
+        // Если не нашли — ищем в ivars self
         if (!g_displayLinkTarget && self) {
-            // Action Buggy: MainViewController хранит EAGLView в ivar[3]
             uint32_t* mvc = (uint32_t*)self;
-            for (int i = 1; i < 8; i++) {
-                void* candidate = (void*)(uintptr_t)mvc[i];
-                if (!candidate) continue;
+            for (int i = 1; i < 12 && !g_displayLinkTarget; i++) {
+                uint32_t candidateVal = mvc[i];
+                void* candidate = (void*)(uintptr_t)candidateVal;
+                if (!candidate || candidateVal < 0x1000) continue;
                 uint32_t candidateIsa = 0;
-                if (!SafeRead32((uintptr_t)candidate, &candidateIsa)) continue;
-                std::string candidateName = GetObjCClassName(candidate);
-                if (candidateName.find("EAGLView") != std::string::npos ||
-                    candidateName.find("ViewController") != std::string::npos) {
-                    if (FindMethodIMP(candidateIsa, "drawFrame")) {
-                        g_displayLinkTarget = candidate;
-                        g_displayLinkSelector = "drawFrame";
-                        LogToJava("PATCH-HIT: [startAnimation] Auto-detected target=0x" +
-                                  std::to_string((uintptr_t)candidate) + " sel=drawFrame");
-                        break;
-                    }
-                    if (FindMethodIMP(candidateIsa, "drawView:")) {
-                        g_displayLinkTarget = candidate;
-                        g_displayLinkSelector = "drawView:";
-                        LogToJava("PATCH-HIT: [startAnimation] Auto-detected target=0x" +
-                                  std::to_string((uintptr_t)candidate) + " sel=drawView:");
-                        break;
+                if (!SafeRead32(candidateVal, &candidateIsa)) continue;
+                for (int si = 0; loopSels[si] && !g_displayLinkTarget; si++) {
+                    if (FindMethodIMP(candidateIsa, loopSels[si])) {
+                        g_displayLinkTarget   = candidate;
+                        g_displayLinkSelector = loopSels[si];
+                        char dbg[256];
+                        snprintf(dbg, sizeof(dbg),
+                            "PATCH-HIT: [startMainLoop] ivar[%d]=0x%08X sel=%s",
+                            i, candidateVal, loopSels[si]);
+                        LogToJava(dbg);
                     }
                 }
             }
-            // Fallback: сам self как target
-            if (!g_displayLinkTarget) {
-                uint32_t selfIsa = ((uint32_t*)self)[0];
-                void* drawImp = FindMethodIMP(selfIsa, "drawFrame");
-                if (!drawImp) drawImp = FindMethodIMP(selfIsa, "drawView:");
-                if (drawImp) {
-                    g_displayLinkTarget = self;
-                    g_displayLinkSelector = drawImp == FindMethodIMP(selfIsa, "drawFrame") ? "drawFrame" : "drawView:";
-                    LogToJava("PATCH-HIT: [startAnimation] Fallback: self as target, sel=" +
-                              std::string(g_displayLinkSelector));
-                }
-            }
+        }
+
+        if (!g_displayLinkTarget) {
+            LogToJava("PATCH-HIT: [startMainLoop] не удалось определить render loop target/sel!");
         }
     }
     return nullptr;
@@ -12777,6 +12805,11 @@ static void ApplyGamePatches() {
         const uint32_t APP_HI = g_appSlide + 0x1000000u;
 
         // Целевые методы: имя → нашли ли, адрес IMP
+        // ВАЖНО: в SMB2 Lite методы переименованы относительно стандартного Wolf3D шаблона:
+        //   presentFramebuffer → "present"          (EAGLView)
+        //   setFramebuffer     → "createFramebuffer" + glBindFramebuffer(0) при вызове (EAGLView)
+        //   startAnimation     → "startMainLoop"    (RootController) или "initWithFPS:" (RootController)
+        // Патчим оба имени на случай разных версий бинаря.
         struct TargetMethod {
             const char* sel;
             void* replacement;
@@ -12784,9 +12817,15 @@ static void ApplyGamePatches() {
             std::string foundInClass;
         };
         TargetMethod targets[] = {
+            // present* — перехватываем eglSwapBuffers
+            { "present",             (void*)hle_presentFramebuffer_replacement,  false, "" },
             { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,  false, "" },
-            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "" },
-            { "startAnimation",      (void*)hle_startAnimation_replacement,       false, "" },
+            // createFramebuffer — биндим FBO 0 вместо iOS FBO
+            { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,   false, "" },
+            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,      false, "" },
+            // startAnimation — запускаем render loop
+            { "startMainLoop",       (void*)hle_startAnimation_replacement,      false, "" },
+            { "startAnimation",      (void*)hle_startAnimation_replacement,      false, "" },
         };
 
         for (const auto& sec : g_machoSections) {
@@ -12853,9 +12892,18 @@ static void ApplyGamePatches() {
                     uint32_t mn = meths[i*3 + 0];
                     if (!isValidString((const char*)mn)) continue;
                     const char* mname = (const char*)mn;
+                    uint32_t imp_addr = meths[i*3 + 2];
                     for (auto& tgt : targets) {
                         if (!tgt.found && strcmp(mname, tgt.sel) == 0) {
-                            uint32_t imp_addr = meths[i*3 + 2];
+                            // Проверяем что этот IMP ещё не был пропатчен другим target
+                            bool alreadyPatched = false;
+                            for (const auto& other : targets) {
+                                if (other.found && other.foundInClass == cname_c) {
+                                    // Если другой target того же replacement уже пропатчил этот класс - ok
+                                    // Но если IMP совпадает — пропускаем дублирование
+                                }
+                            }
+                            (void)alreadyPatched;
                             PatchThumbFunctionToReplacement(imp_addr | 1u, tgt.replacement);
                             char plog[256];
                             snprintf(plog, sizeof(plog),
