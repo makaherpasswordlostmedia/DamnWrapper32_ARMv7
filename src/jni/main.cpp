@@ -12235,6 +12235,37 @@ void RenderHLEUI();
 extern EGLDisplay g_eglDisplay;
 extern EGLSurface g_eglSurface;
 
+// =============================================================================
+// ПАТЧ: -[AppDelegate getResolutionWithDevice:physWidth:physHeight:logWidth:logHeight:resX:resY:]
+// SMB2 вызывает этот метод через кешированный IMP напрямую (не через msgSend) сразу
+// после получения [UIApplication delegate]. Нативный IMP читает ivar'ы self как
+// настоящего ObjC-объекта — краш на нашем HLE-объекте (size=4).
+// Патчим IMP — возвращаем реальное разрешение EGL surface.
+//
+// ARMv7 AAPCS: self=r0, _cmd=r1, device=r2, physW*=r3, physH*=[sp+0],
+//              logW*=[sp+4], logH*=[sp+8], resX*=[sp+12], resY*=[sp+16]
+// =============================================================================
+static void __attribute__((pcs("aapcs"))) hle_getResolution_replacement(
+        void* self, void* _cmd, void* device,
+        uint32_t* physW, uint32_t* physH,
+        uint32_t* logW,  uint32_t* logH,
+        float*    resX,  float*    resY)
+{
+    uint32_t w = (g_surfaceWidth  > 0) ? (uint32_t)g_surfaceWidth  : 480u;
+    uint32_t h = (g_surfaceHeight > 0) ? (uint32_t)g_surfaceHeight : 320u;
+    char dbg[256];
+    snprintf(dbg, sizeof(dbg),
+        "PATCH-HIT: getResolutionWithDevice: -> phys=%ux%u log=%ux%u res=1.0",
+        w, h, w, h);
+    LogToJava(dbg);
+    if (physW) *physW = w;
+    if (physH) *physH = h;
+    if (logW)  *logW  = w;
+    if (logH)  *logH  = h;
+    if (resX)  *resX  = 1.0f;
+    if (resY)  *resY  = 1.0f;
+}
+
 static uint32_t __attribute__((pcs("aapcs"))) hle_presentFramebuffer_replacement(void* self, void* _cmd) {
     LogToJava("PATCH-HIT: -[EAGLView presentFramebuffer] intercepted via IMP patch -> eglSwapBuffers");
     RenderHLEUI();
@@ -12384,7 +12415,7 @@ static void PatchThumbFunctionToReplacement(uint32_t func_addr_with_thumb_bit, v
     __builtin___clear_cache((char*)ptr, (char*)(ptr + 8));
 
     char log[128];
-    snprintf(log, sizeof(log), "PATCH: _my_CopyString @ 0x%08X перенаправлена на hle_my_CopyString_replacement @ 0x%08X",
+    snprintf(log, sizeof(log), "PATCH: Thumb trampoline @ 0x%08X -> replacement @ 0x%08X",
         code_addr, dest);
     LogToJava(log);
 }
@@ -12817,15 +12848,18 @@ static void ApplyGamePatches() {
             std::string foundInClass;
         };
         TargetMethod targets[] = {
+            // getResolutionWithDevice: — вызывается через прямой IMP после [UIApplication delegate]
+            { "getResolutionWithDevice:physWidth:physHeight:logWidth:logHeight:resX:resY:",
+                                     (void*)hle_getResolution_replacement,        false, "" },
             // present* — перехватываем eglSwapBuffers
-            { "present",             (void*)hle_presentFramebuffer_replacement,  false, "" },
-            { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,  false, "" },
+            { "present",             (void*)hle_presentFramebuffer_replacement,   false, "" },
+            { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,   false, "" },
             // createFramebuffer — биндим FBO 0 вместо iOS FBO
-            { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,   false, "" },
-            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,      false, "" },
+            { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,    false, "" },
+            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "" },
             // startAnimation — запускаем render loop
-            { "startMainLoop",       (void*)hle_startAnimation_replacement,      false, "" },
-            { "startAnimation",      (void*)hle_startAnimation_replacement,      false, "" },
+            { "startMainLoop",       (void*)hle_startAnimation_replacement,       false, "" },
+            { "startAnimation",      (void*)hle_startAnimation_replacement,       false, "" },
         };
 
         for (const auto& sec : g_machoSections) {
