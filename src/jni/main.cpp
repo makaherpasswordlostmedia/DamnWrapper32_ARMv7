@@ -4326,6 +4326,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             strcmp(targetSel, "performSelectorOnMainThread:withObject:waitUntilDone:") == 0 ||
             strcmp(targetSel, "performSelector:withObject:afterDelay:") == 0 ||
             strcmp(targetSel, "scale") == 0 ||
+            strcmp(targetSel, "userInterfaceIdiom") == 0 ||
             strcmp(targetSel, "displayLinkWithTarget:selector:") == 0) {
             LogToJava(std::string(">>>>>>>> [RESPONDS-TRACE] [") + cName + " respondsToSelector:@" + targetSel + "] -> 1 (HLE Base)");
             return 1;
@@ -5446,8 +5447,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
         if (clsName == "UIScreenMode") {
             if (strcmp(op, "size") == 0) {
-                float w = (float)g_surfaceWidth;
-                float h = (float)g_surfaceHeight;
+                float w = (float)(g_surfaceWidth  > 0 ? g_surfaceWidth  : 480);
+                float h = (float)(g_surfaceHeight > 0 ? g_surfaceHeight : 320);
                 g_fpu_ret[0] = w; g_fpu_ret[1] = h; g_fpu_ret_flag = 1;
                 uint32_t iw, ih; memcpy(&iw, &w, 4); memcpy(&ih, &h, 4);
                 return ((uint64_t)ih << 32) | iw; 
@@ -7060,7 +7061,7 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         float rectData[4] = {0.0f, 0.0f, w, h};
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET MSG_SEND " + std::string(op) + " <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr));
-        LogToJava("  Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: 0x" + std::to_string((uintptr_t)ret_addr));
+        { char _ra[32]; snprintf(_ra, sizeof(_ra), "0x%08X", (uint32_t)(uintptr_t)ret_addr); LogToJava("  Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: " + std::string(_ra)); }
         // Логируем итоговые значения (уже после защиты от нуля)
         LogToJava("  Writing (Float): x=0 y=0 w=" + std::to_string(w) + " h=" + std::to_string(h));
 
@@ -7128,7 +7129,7 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         float w = (eglW > 0) ? (float)eglW : 480.0f;
         float h = (eglH > 0) ? (float)eglH : 320.0f;
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET applicationFrame <<<<<<<<");
-        LogToJava("  Caller: " + GetModuleInfoForAddress(lr) + " | Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: 0x" + std::to_string((uintptr_t)ret_addr));
+        { char _ra[32]; snprintf(_ra, sizeof(_ra), "0x%08X", (uint32_t)(uintptr_t)ret_addr); LogToJava("  Caller: " + GetModuleInfoForAddress(lr) + " | Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: " + std::string(_ra)); }
         LogToJava("  Writing: x=0 y=0 w=" + std::to_string(w) + " h=" + std::to_string(h));
 
         if (ret_addr) {
@@ -10331,6 +10332,23 @@ extern "C" void wrap_dispatch_once(uint32_t* predicate, void* block) {
     }
 }
 
+// Простой dummy-пул для dispatch_queue_create: возвращаем уникальный ненулевой токен.
+// SDK-код (Tapjoy, AdMob, Applifier) проверяет != NULL — нулевой вернул бы SIGSEGV.
+static uint32_t s_hle_dummy_queue_pool[64] = {0};
+static int      s_hle_dummy_queue_idx     = 0;
+
+extern "C" void* wrap_dispatch_queue_create(const char* label, void* attr) {
+    int idx = __sync_fetch_and_add(&s_hle_dummy_queue_idx, 1) % 64;
+    void* q = (void*)&s_hle_dummy_queue_pool[idx];
+    LogToJava(std::string("C-API-HLE: dispatch_queue_create(\"") +
+              (label ? label : "<null>") + "\") -> " +
+              [&]{ char b[32]; snprintf(b,sizeof(b),"0x%08X",(uint32_t)(uintptr_t)q); return std::string(b); }());
+    return q;
+}
+
+extern "C" void wrap_dispatch_retain(void* /*queue*/)  { /* no-op — наш пул статический */ }
+extern "C" void wrap_dispatch_release(void* /*queue*/) { /* no-op — наш пул статический */ }
+
 std::string DumpHexToString(const char* data, int max_len) {
     if (!data) return "null";
     std::string hex = "";
@@ -11830,7 +11848,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_S(glLinkProgram), STB_S(glRenderbufferStorage), {"_glRenderbufferStorageOES", (void*)Stub_glRenderbufferStorage}, STB_S(glGetRenderbufferParameteriv), {"_glGetRenderbufferParameterivOES", (void*)Stub_glGetRenderbufferParameteriv}, STB_S(glCheckFramebufferStatus), {"_glCheckFramebufferStatusOES", (void*)Stub_glCheckFramebufferStatus}, STB_S(glShaderSource), STB_W(glUniformMatrix4fv), {"_glUseProgram", (void*)MegaDebug_glUseProgram}, STB_S(glVertexAttribPointer), STB_S(glViewport), STB_S(NSHomeDirectory), STB_S(NSTemporaryDirectory), STB_S(NSSearchPathForDirectoriesInDomains),
     STB_W(SCNetworkReachabilityCreateWithName), {"_SCNetworkReachabilityCreateWithAddress", (void*)+[](void* a, void* b) -> void* { return (void*)0xDEADBEEF; }}, {"_SCNetworkReachabilityGetFlags", (void*)+[](void* r, uint32_t* f) -> bool { if(f) *f = 2; return true; }},
     {"_AVAudioSessionCategoryPlayback", (void*)&hle_AVAudioSessionCategoryPlayback_ptr}, {"_AVAudioSessionCategoryAmbient", (void*)&hle_AVAudioSessionCategoryAmbient_ptr}, {"_NSUserDefaultsDidChangeNotification", (void*)&hle_NSUserDefaultsDidChangeNotification_ptr}, {"_kCFCoreFoundationVersionNumber", (void*)&wrap_kCFCoreFoundationVersionNumber}, {"_CGSizeZero", (void*)&wrap_CGSizeZero}, {"_CGPointZero", (void*)&wrap_CGPointZero}, {"__objc_empty_cache", (void*)&hle_objc_empty_cache}, STB_S(objc_enumerationMutation),
-    {"__dispatch_main_q", (void*)&hle_dispatch_main_q_struct}, STB_W(dispatch_get_main_queue), STB_W(dispatch_async), STB_W(dispatch_sync), STB_W(dispatch_once),
+    {"__dispatch_main_q", (void*)&hle_dispatch_main_q_struct}, STB_W(dispatch_get_main_queue), STB_W(dispatch_async), STB_W(dispatch_sync), STB_W(dispatch_once), STB_W(dispatch_queue_create), STB_W(dispatch_retain), STB_W(dispatch_release),
     STB_W(mach_absolute_time), STB_W(mach_timebase_info), STB_S(CFAbsoluteTimeGetCurrent), {"___cxa_pure_virtual", (void*)Stub_cxa_pure_virtual},
     
     STB_W(malloc), STB_W(free), STB_W(calloc), STB_W(realloc), STB_D(memcpy), STB_D(memmove), STB_D(memset), STB_D(memcmp), {"_memchr", (void*)(void*(*)(void*, int, size_t))memchr},
