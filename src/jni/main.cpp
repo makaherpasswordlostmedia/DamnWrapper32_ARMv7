@@ -4634,42 +4634,43 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
 
     if (strcmp(op, "frame") == 0 || strcmp(op, "bounds") == 0 || strcmp(op, "applicationFrame") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
-        float w = (float)g_surfaceWidth;
-        float h = (float)g_surfaceHeight;
-        float x = 0.0f;
-        float y = 0.0f;
-        if (cName.find("UIScreen") != std::string::npos) {
-            // ФИКС ЧЁРНОГО ЭКРАНА: EGL fallback если g_surfaceWidth ещё не задан
-            if (g_surfaceWidth <= 0 || g_surfaceHeight <= 0) {
-                EGLDisplay qDpy = eglGetCurrentDisplay();
-                EGLSurface qSurf = eglGetCurrentSurface(EGL_DRAW);
-                if (qSurf != EGL_NO_SURFACE && qDpy != EGL_NO_DISPLAY) {
-                    EGLint qw = 0, qh = 0;
-                    eglQuerySurface(qDpy, qSurf, EGL_WIDTH, &qw);
-                    eglQuerySurface(qDpy, qSurf, EGL_HEIGHT, &qh);
-                    if (qw > 0 && qh > 0) {
-                        g_surfaceWidth  = qw;
-                        g_surfaceHeight = qh;
-                        LogToJava("[MSGSI-FIX] UIScreen bounds: EGL fallback -> " +
-                                  std::to_string(qw) + "x" + std::to_string(qh));
-                    }
+        // ФИКС: универсальный EGL fallback (не только для UIScreen).
+        // Пробуем глобальные g_eglDisplay/g_eglSurface, затем eglGetCurrent*.
+        {
+            EGLDisplay qDpy  = (g_eglDisplay != EGL_NO_DISPLAY) ? g_eglDisplay : eglGetCurrentDisplay();
+            EGLSurface qSurf = (g_eglSurface != EGL_NO_SURFACE) ? g_eglSurface : eglGetCurrentSurface(EGL_DRAW);
+            if (qDpy != EGL_NO_DISPLAY && qSurf != EGL_NO_SURFACE) {
+                EGLint qw = 0, qh = 0;
+                eglQuerySurface(qDpy, qSurf, EGL_WIDTH, &qw);
+                eglQuerySurface(qDpy, qSurf, EGL_HEIGHT, &qh);
+                if (qw > 0 && qh > 0 && (qw != g_surfaceWidth || qh != g_surfaceHeight)) {
+                    char fixBuf[128];
+                    snprintf(fixBuf, sizeof(fixBuf),
+                        "[MSGSI-FIX] %s EGL fallback %dx%d -> %dx%d",
+                        op, g_surfaceWidth, g_surfaceHeight, qw, qh);
+                    LogToJava(fixBuf);
+                    g_surfaceWidth  = qw;
+                    g_surfaceHeight = qh;
                 }
             }
-            w = (float)(g_surfaceWidth  > 0 ? g_surfaceWidth  : 480);
-            h = (float)(g_surfaceHeight > 0 ? g_surfaceHeight : 320);
-        } else if (g_views.count(self)) {
+        }
+        float x = 0.0f, y = 0.0f;
+        // Универсальный дефолт — не зависит от класса
+        float w = (float)(g_surfaceWidth  > 0 ? g_surfaceWidth  : 480);
+        float h = (float)(g_surfaceHeight > 0 ? g_surfaceHeight : 320);
+        if (cName.find("UIScreen") == std::string::npos && g_views.count(self)) {
             x = g_views[self].frame[0]; y = g_views[self].frame[1];
             float fw = g_views[self].frame[2]; float fh = g_views[self].frame[3];
             if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) { w = fw; h = fh; }
         }
-        // Защита от нуля
+        // Финальная защита от нуля/мусора
         if (w <= 0.0f || w > 4096.0f) { w = 480.0f; h = 320.0f; }
         
         float rect[4] = {x, y, w, h};
         LogToJava(">>>>>>>> [SIZE-CRITICAL] NORMAL MSG_SEND " + std::string(op) + " <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr));
         LogToJava("  Class: " + cName + " | ptr: " + ptrStr);
-        LogToJava("  Returning: x=" + std::to_string(x) + " y=" + std::to_string(y) + " w=" + std::to_string(w) + " h=" + std::to_string(h));
+        { char _wh[128]; snprintf(_wh,sizeof(_wh),"  Returning: x=%.1f y=%.1f w=%.1f h=%.1f [g_surfW=%d g_surfH=%d]",x,y,w,h,g_surfaceWidth,g_surfaceHeight); LogToJava(_wh); }
         
         g_fpu_ret[0] = rect[0];
         g_fpu_ret[1] = rect[1];
@@ -7033,31 +7034,38 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
     }
     if (strcmp(op, "frame") == 0 || strcmp(op, "bounds") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
-        // Универсальный EGL fallback: используем глобальные g_eglDisplay/g_eglSurface
-        // (они всегда валидны после NativeExecutionThread init, в отличие от eglGetCurrent*
-        // которые возвращают NO_SURFACE если контекст откреплён от потока).
-        if ((g_surfaceWidth <= 0 || g_surfaceHeight <= 0) &&
-            g_eglDisplay != EGL_NO_DISPLAY && g_eglSurface != EGL_NO_SURFACE) {
-            EGLint qw = 0, qh = 0;
-            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH,  &qw);
-            eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &qh);
-            if (qw > 0 && qh > 0) {
-                g_surfaceWidth  = qw;
-                g_surfaceHeight = qh;
-                LogToJava("[STRET-FIX] " + std::string(op) + ": EGL global fallback -> " +
-                          std::to_string(qw) + "x" + std::to_string(qh));
+        // ФИКС: расширенный EGL fallback — пробуем глобальные g_eglDisplay/g_eglSurface,
+        // затем eglGetCurrent* (на случай если g_eglSurface ещё EGL_NO_SURFACE но контекст
+        // уже привязан). Срабатывает при ЛЮБОМ значении g_surfaceWidth, не только <= 0:
+        // это нужно чтобы подхватить реальный размер экрана даже если initWrapper передал 0.
+        {
+            EGLDisplay qDpy  = (g_eglDisplay != EGL_NO_DISPLAY) ? g_eglDisplay : eglGetCurrentDisplay();
+            EGLSurface qSurf = (g_eglSurface != EGL_NO_SURFACE) ? g_eglSurface : eglGetCurrentSurface(EGL_DRAW);
+            if (qDpy != EGL_NO_DISPLAY && qSurf != EGL_NO_SURFACE) {
+                EGLint qw = 0, qh = 0;
+                eglQuerySurface(qDpy, qSurf, EGL_WIDTH,  &qw);
+                eglQuerySurface(qDpy, qSurf, EGL_HEIGHT, &qh);
+                if (qw > 0 && qh > 0 && (qw != g_surfaceWidth || qh != g_surfaceHeight)) {
+                    char fixBuf[128];
+                    snprintf(fixBuf, sizeof(fixBuf),
+                        "[STRET-FIX] %s: EGL fallback %dx%d -> %dx%d",
+                        op, g_surfaceWidth, g_surfaceHeight, qw, qh);
+                    _SyncLog(fixBuf); // безусловный — чтобы попало в лог даже при g_disableLogging
+                    g_surfaceWidth  = qw;
+                    g_surfaceHeight = qh;
+                }
             }
         }
-        float w = (float)g_surfaceWidth;
-        float h = (float)g_surfaceHeight;
-        if (cName.find("UIScreen") != std::string::npos) {
-            w = (float)(g_surfaceWidth  > 0 ? g_surfaceWidth  : 480);
-            h = (float)(g_surfaceHeight > 0 ? g_surfaceHeight : 320);
-        } else if (g_views.count(self)) {
+        // Универсальный дефолт 480x320 — НЕ зависит от cName (UIScreen или нет).
+        // Раньше ветка UIScreen была единственной с fallback, другие объекты получали w=0.
+        float w = (float)(g_surfaceWidth  > 0 ? g_surfaceWidth  : 480);
+        float h = (float)(g_surfaceHeight > 0 ? g_surfaceHeight : 320);
+        // Для конкретного View уточняем из сохранённого frame (если он разумный)
+        if (cName.find("UIScreen") == std::string::npos && g_views.count(self)) {
             float fw = g_views[self].frame[2]; float fh = g_views[self].frame[3];
             if (fw > 0.0f && fw <= 4096.0f && fh > 0.0f && fh <= 4096.0f) { w = fw; h = fh; }
         }
-        // Защита от нуля: если g_surfaceWidth ещё не инициализирован — используем дефолт
+        // Финальная защита от нуля/мусора
         if (w <= 0.0f || w > 4096.0f) { w = 480.0f; h = 320.0f; }
         
         // ВНИМАНИЕ: Возвращаем нормальный CGRect: x=0, y=0, w=width, h=height
@@ -7065,8 +7073,8 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET MSG_SEND " + std::string(op) + " <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr));
         { char _ra[32]; snprintf(_ra, sizeof(_ra), "0x%08X", (uint32_t)(uintptr_t)ret_addr); LogToJava("  Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: " + std::string(_ra)); }
-        // Логируем итоговые значения (уже после защиты от нуля)
-        LogToJava("  Writing (Float): x=0 y=0 w=" + std::to_string(w) + " h=" + std::to_string(h));
+        // Логируем итоговые значения + g_surfaceWidth для диагностики
+        { char _wh[128]; snprintf(_wh, sizeof(_wh), "  Writing (Float): x=0 y=0 w=%.1f h=%.1f [g_surfW=%d g_surfH=%d]", w, h, g_surfaceWidth, g_surfaceHeight); LogToJava(_wh); }
 
         if (ret_addr) {
             LogToJava("  [STRET-MEM] До записи:    " + DumpHexToString((const char*)ret_addr, 16));
@@ -12279,22 +12287,38 @@ static void __attribute__((pcs("aapcs"))) hle_getResolution_replacement(
         uint32_t* logW,  uint32_t* logH,
         float*    resX,  float*    resY)
 {
+    // ФИКС: EGL fallback перед чтением g_surfaceWidth — на случай если initWrapper
+    // был вызван с resWidth=0 до создания EGL surface (race condition при старте).
+    if ((g_surfaceWidth <= 0 || g_surfaceHeight <= 0) && g_eglDisplay != EGL_NO_DISPLAY) {
+        EGLSurface qSurf = (g_eglSurface != EGL_NO_SURFACE) ? g_eglSurface : eglGetCurrentSurface(EGL_DRAW);
+        if (qSurf != EGL_NO_SURFACE) {
+            EGLint qw = 0, qh = 0;
+            eglQuerySurface(g_eglDisplay, qSurf, EGL_WIDTH, &qw);
+            eglQuerySurface(g_eglDisplay, qSurf, EGL_HEIGHT, &qh);
+            if (qw > 0 && qh > 0) { g_surfaceWidth = qw; g_surfaceHeight = qh; }
+        }
+    }
     uint32_t w = (g_surfaceWidth  > 0) ? (uint32_t)g_surfaceWidth  : 480u;
     uint32_t h = (g_surfaceHeight > 0) ? (uint32_t)g_surfaceHeight : 320u;
-    char dbg[256];
+    char dbg[384];
     snprintf(dbg, sizeof(dbg),
-        "PATCH-HIT: getResolutionWithDevice: -> phys=%ux%u log=%ux%u res=1.0 physW*=%p physH*=%p",
-        w, h, w, h, (void*)physW, (void*)physH);
-    // SyncLog: безусловный, флашится синхронно — гарантированно попадёт в лог до краша
-    SyncLog(dbg);
+        "PATCH-HIT: getResolutionWithDevice: -> %ux%u | physW*=%p physH*=%p logW*=%p logH*=%p resX*=%p resY*=%p | g_surfW=%d g_surfH=%d",
+        w, h, (void*)physW, (void*)physH, (void*)logW, (void*)logH, (void*)resX, (void*)resY,
+        g_surfaceWidth, g_surfaceHeight);
+    // ФИКС: _SyncLog вызывается БЕЗУСЛОВНО (минуя g_disableLogging) — гарантированно
+    // попадёт в лог до краша даже если логирование выключено в настройках.
+    _SyncLog(dbg);
     // Null-guard: параметры 5-7 приходят со стека (ARMv7 AAPCS) — могут быть мусором.
     // Проверяем что адрес валиден (>= 0x1000 = выше нулевой страницы).
-    if (physW && (uintptr_t)physW >= 0x1000u) *physW = w;
-    if (physH && (uintptr_t)physH >= 0x1000u) *physH = h;
+    if (physW && (uintptr_t)physW >= 0x1000u) { _SyncLog("  -> *physW OK"); *physW = w; }
+    else { char _b[64]; snprintf(_b,sizeof(_b),"  -> physW SKIP (ptr=0x%08X)",(uint32_t)(uintptr_t)physW); _SyncLog(_b); }
+    if (physH && (uintptr_t)physH >= 0x1000u) { _SyncLog("  -> *physH OK"); *physH = h; }
+    else { char _b[64]; snprintf(_b,sizeof(_b),"  -> physH SKIP (ptr=0x%08X)",(uint32_t)(uintptr_t)physH); _SyncLog(_b); }
     if (logW  && (uintptr_t)logW  >= 0x1000u) *logW  = w;
     if (logH  && (uintptr_t)logH  >= 0x1000u) *logH  = h;
     if (resX  && (uintptr_t)resX  >= 0x1000u) *resX  = 1.0f;
     if (resY  && (uintptr_t)resY  >= 0x1000u) *resY  = 1.0f;
+    _SyncLog("PATCH-HIT: getResolutionWithDevice: DONE");
 }
 
 static uint32_t __attribute__((pcs("aapcs"))) hle_presentFramebuffer_replacement(void* self, void* _cmd) {
