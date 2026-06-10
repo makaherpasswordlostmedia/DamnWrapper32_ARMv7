@@ -5457,7 +5457,10 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
 
         if (clsName == "UIApplication") {
             if (strcmp(op, "statusBarOrientation") == 0) return 3; // UIDeviceOrientationLandscapeRight
-            if (strcmp(op, "delegate") == 0) return (uint64_t)(uintptr_t)g_appDelegateInstance;
+            if (strcmp(op, "delegate") == 0) {
+                LogToJava(std::string("HLE-TRACE: [UIApplication delegate] -> 0x") + [&]{ char b[32]; snprintf(b,sizeof(b),"%08X",(uint32_t)(uintptr_t)g_appDelegateInstance); return std::string(b); }());
+                return (uint64_t)(uintptr_t)g_appDelegateInstance;
+            }
             if (strcmp(op, "keyWindow") == 0) {
                 static uint32_t* dummyWindow = nullptr;
                 if (!dummyWindow) {
