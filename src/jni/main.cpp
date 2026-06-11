@@ -13023,22 +13023,24 @@ static void ApplyGamePatches() {
             std::string foundInClass;
             int alias_group;    // 0 = без группы; >0 = алиасы одного логического метода
             bool patch_all_classes; // если true — патчим во всех классах, не только в первом
+            const char* catlist_class; // класс для catlist-fallback (nullptr = не пробовать)
         };
         TargetMethod targets[] = {
             // getResolutionWithDevice: — вызывается через прямой IMP после [UIApplication delegate].
             // patch_all_classes=true: и SMB2GameAppDelegate, и SharkAppDelegate содержат этот метод.
             // [UIApplication delegate] может вернуть любой из них — патчим оба.
             { "getResolutionWithDevice:physWidth:physHeight:logWidth:logHeight:resX:resY:",
-                                     (void*)hle_getResolution_replacement,        false, "", 0, true },
+                                     (void*)hle_getResolution_replacement,        false, "", 0, true,  nullptr },
             // present* — перехватываем eglSwapBuffers (алиасы, группа 1)
-            { "present",             (void*)hle_presentFramebuffer_replacement,   false, "", 1, false },
-            { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,   false, "", 1, false },
+            // catlist_class="EAGLView": метод может лежать в ObjC-категории, не в основном classlist
+            { "present",             (void*)hle_presentFramebuffer_replacement,   false, "", 1, false, "EAGLView" },
+            { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,   false, "", 1, false, "EAGLView" },
             // createFramebuffer/setFramebuffer — биндим FBO 0 (алиасы, группа 2)
-            { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,    false, "", 2, false },
-            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "", 2, false },
+            { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,    false, "", 2, false, "EAGLView" },
+            { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "", 2, false, "EAGLView" },
             // startAnimation — запускаем render loop (алиасы, группа 3)
-            { "startMainLoop",       (void*)hle_startAnimation_replacement,       false, "", 3, false },
-            { "startAnimation",      (void*)hle_startAnimation_replacement,       false, "", 3, false },
+            { "startMainLoop",       (void*)hle_startAnimation_replacement,       false, "", 3, false, nullptr },
+            { "startAnimation",      (void*)hle_startAnimation_replacement,       false, "", 3, false, nullptr },
         };
 
         for (const auto& sec : g_machoSections) {
@@ -13158,7 +13160,36 @@ static void ApplyGamePatches() {
                 }
             }
         }
-    }
+
+        // ФИКС ЧЁРНОГО ЭКРАНА: catlist fallback.
+        // Если метод не найден в classlist (напр. presentFramebuffer в stripped EAGLView),
+        // пробуем найти его в __objc_catlist через PatchMethodIMP.
+        // Для alias_group: как только один алиас из группы пропатчен через catlist,
+        // помечаем всю группу найденной чтобы не было двойного патча.
+        std::set<int> patchedGroups;
+        for (auto& tgt : targets) {
+            if (tgt.found) continue;
+            if (!tgt.catlist_class) continue;
+            if (tgt.alias_group != 0 && patchedGroups.count(tgt.alias_group)) {
+                tgt.found = true;
+                continue;
+            }
+            LogToJava(std::string("CATLIST-FALLBACK: пробуем -[") + tgt.catlist_class + " " + tgt.sel + "] через PatchMethodIMP");
+            PatchMethodIMP(tgt.catlist_class, tgt.sel, tgt.replacement);
+            // PatchMethodIMP логирует PATCH: ... если нашёл, или PATCH-WARN если нет.
+            // Помечаем как найденный (catlist-fallback) чтобы не дублировать patching.
+            tgt.found = true;
+            if (tgt.alias_group != 0) {
+                patchedGroups.insert(tgt.alias_group);
+                for (auto& other : targets) {
+                    if (&other != &tgt && other.alias_group == tgt.alias_group) {
+                        other.found = true;
+                    }
+                }
+            }
+        }
+
+    } // конец блока ФИКС ЧЕРНОГО ЭКРАНА #1-3
 
     // (classlist-scan выше уже нашёл и пропатчил все методы)
 }
