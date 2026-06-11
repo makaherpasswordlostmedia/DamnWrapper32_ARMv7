@@ -7034,6 +7034,16 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
     }
     if (strcmp(op, "frame") == 0 || strcmp(op, "bounds") == 0) {
         uint32_t lr = (uint32_t)__builtin_return_address(0);
+
+        // STRET-ENTRY: логируем g_surface ДО EGL re-query, чтобы поймать кто его испортил
+        {
+            char entry_buf[128];
+            snprintf(entry_buf, sizeof(entry_buf),
+                "[STRET-ENTRY] op=%s g_surfW=%d g_surfH=%d eglDpy=%p eglSurf=%p",
+                op, g_surfaceWidth, g_surfaceHeight, (void*)g_eglDisplay, (void*)g_eglSurface);
+            _SyncLog(entry_buf);
+        }
+
         // ФИКС: расширенный EGL fallback — пробуем глобальные g_eglDisplay/g_eglSurface,
         // затем eglGetCurrent* (на случай если g_eglSurface ещё EGL_NO_SURFACE но контекст
         // уже привязан). Срабатывает при ЛЮБОМ значении g_surfaceWidth, не только <= 0:
@@ -7045,6 +7055,14 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
                 EGLint qw = 0, qh = 0;
                 eglQuerySurface(qDpy, qSurf, EGL_WIDTH,  &qw);
                 eglQuerySurface(qDpy, qSurf, EGL_HEIGHT, &qh);
+                // STRET-EGL: логируем результат eglQuerySurface ВСЕГДА (не только при изменении)
+                {
+                    char egl_buf[128];
+                    snprintf(egl_buf, sizeof(egl_buf),
+                        "[STRET-EGL] qw=%d qh=%d (g_surfW=%d g_surfH=%d) dpy=%p surf=%p",
+                        qw, qh, g_surfaceWidth, g_surfaceHeight, (void*)qDpy, (void*)qSurf);
+                    _SyncLog(egl_buf);
+                }
                 if (qw > 0 && qh > 0 && (qw != g_surfaceWidth || qh != g_surfaceHeight)) {
                     char fixBuf[128];
                     snprintf(fixBuf, sizeof(fixBuf),
@@ -7054,6 +7072,13 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
                     g_surfaceWidth  = qw;
                     g_surfaceHeight = qh;
                 }
+            } else {
+                // EGL недоступен — логируем явно
+                char no_egl_buf[128];
+                snprintf(no_egl_buf, sizeof(no_egl_buf),
+                    "[STRET-EGL] ПРОПУСК: qDpy=%p qSurf=%p — EGL недоступен, g_surface не обновлён",
+                    (void*)qDpy, (void*)qSurf);
+                _SyncLog(no_egl_buf);
             }
         }
         // Универсальный дефолт 480x320 — НЕ зависит от cName (UIScreen или нет).
@@ -8479,10 +8504,24 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         
         if (FindMethodIMP(appDelIsa, "application:didFinishLaunchingWithOptions:")) {
             LogToJava("HLE: Вызов application:didFinishLaunchingWithOptions:...");
+            int _dlw = g_surfaceWidth, _dlh = g_surfaceHeight; // DELEGATE-WATCH
             Stub_objc_msgSend(appDel, "application:didFinishLaunchingWithOptions:", uiApp, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            if (g_surfaceWidth != _dlw || g_surfaceHeight != _dlh) { // DELEGATE-WATCH
+                char _dlbuf[192]; snprintf(_dlbuf, sizeof(_dlbuf),
+                    "[DELEGATE-WATCH] application:didFinishLaunchingWithOptions: ИЗМЕНИЛ g_surface: %dx%d -> %dx%d",
+                    _dlw, _dlh, g_surfaceWidth, g_surfaceHeight);
+                _SyncLog(_dlbuf);
+            }
         } else if (FindMethodIMP(appDelIsa, "applicationDidFinishLaunching:")) {
             LogToJava("HLE: Вызов applicationDidFinishLaunching:...");
+            int _dlw = g_surfaceWidth, _dlh = g_surfaceHeight; // DELEGATE-WATCH
             Stub_objc_msgSend(appDel, "applicationDidFinishLaunching:", uiApp, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            if (g_surfaceWidth != _dlw || g_surfaceHeight != _dlh) { // DELEGATE-WATCH
+                char _dlbuf[192]; snprintf(_dlbuf, sizeof(_dlbuf),
+                    "[DELEGATE-WATCH] applicationDidFinishLaunching: ИЗМЕНИЛ g_surface: %dx%d -> %dx%d",
+                    _dlw, _dlh, g_surfaceWidth, g_surfaceHeight);
+                _SyncLog(_dlbuf);
+            }
         } else {
             LogToJava("HLE: ВНИМАНИЕ! Метод запуска делегата не найден!");
         }
