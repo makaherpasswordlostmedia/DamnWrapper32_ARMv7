@@ -8269,6 +8269,9 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             snprintf(init_log, sizeof(init_log), "HLE: __mod_init_func[%d] @ 0x%08X", init_i, func_addr);
             LogToJava(std::string(init_log));
 
+            // CTOR-WATCH: запоминаем g_surface до вызова конструктора
+            int ctor_prev_w = g_surfaceWidth, ctor_prev_h = g_surfaceHeight;
+
             InitFuncRunArgs runArgs;
             runArgs.func_addr  = func_addr;
             runArgs.done       = false;
@@ -8311,11 +8314,56 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
 
             pthread_mutex_destroy(&runArgs.done_mutex);
             pthread_cond_destroy(&runArgs.done_cond);
+
+            // CTOR-WATCH: проверяем, не испортил ли конструктор g_surface
+            if (g_surfaceWidth != ctor_prev_w || g_surfaceHeight != ctor_prev_h) {
+                char watch_buf[192];
+                snprintf(watch_buf, sizeof(watch_buf),
+                    "HLE-WARN: [CTOR-WATCH] __mod_init_func[%d] @ 0x%08X ИЗМЕНИЛ g_surface: %dx%d -> %dx%d!",
+                    init_i, func_addr, ctor_prev_w, ctor_prev_h, g_surfaceWidth, g_surfaceHeight);
+                _SyncLog(watch_buf); // безусловный лог, даже если g_disableLogging
+            }
         }
 
         // Сигналы восстанавливать не нужно — они устанавливались только в дочерних потоках.
 
         LogToJava("HLE: C++ статические конструкторы выполнены.");
+
+        // POST-CTOR-CHECK: один из конструкторов мог испортить g_surfaceWidth/Height.
+        // Восстанавливаем из EGL если значения стали невалидными (<=0 или >8192).
+        {
+            bool surface_bad = (g_surfaceWidth <= 0 || g_surfaceWidth > 8192 ||
+                                g_surfaceHeight <= 0 || g_surfaceHeight > 8192);
+            if (surface_bad) {
+                EGLDisplay _pcdpy = (g_eglDisplay != EGL_NO_DISPLAY) ? g_eglDisplay : eglGetCurrentDisplay();
+                EGLSurface _pcsurf = (g_eglSurface != EGL_NO_SURFACE) ? g_eglSurface : eglGetCurrentSurface(EGL_DRAW);
+                EGLint _pcw = 0, _pch = 0;
+                if (_pcdpy != EGL_NO_DISPLAY && _pcsurf != EGL_NO_SURFACE) {
+                    eglQuerySurface(_pcdpy, _pcsurf, EGL_WIDTH,  &_pcw);
+                    eglQuerySurface(_pcdpy, _pcsurf, EGL_HEIGHT, &_pch);
+                }
+                char pcc_buf[192];
+                snprintf(pcc_buf, sizeof(pcc_buf),
+                    "[POST-CTOR-CHECK] g_surface ПОВРЕЖДЁН: %dx%d — восстанавливаем из EGL: %dx%d",
+                    g_surfaceWidth, g_surfaceHeight, _pcw, _pch);
+                _SyncLog(pcc_buf);
+                if (_pcw > 0 && _pch > 0) {
+                    g_surfaceWidth  = _pcw;
+                    g_surfaceHeight = _pch;
+                } else {
+                    // EGL тоже недоступен — хотя бы убираем мусор
+                    g_surfaceWidth  = 480;
+                    g_surfaceHeight = 320;
+                    _SyncLog("[POST-CTOR-CHECK] EGL недоступен, фолбэк 480x320");
+                }
+            } else {
+                char pcc_ok[128];
+                snprintf(pcc_ok, sizeof(pcc_ok),
+                    "[POST-CTOR-CHECK] g_surface OK: %dx%d", g_surfaceWidth, g_surfaceHeight);
+                _SyncLog(pcc_ok);
+            }
+        }
+
         // ApplyGamePatches ПОСЛЕ конструкторов: EAGLView регистрирует методы
         // (presentFramebuffer, setFramebuffer) в __mod_init_func — до этого
         // PatchMethodIMP не находил их и выдавал PATCH-WARN -> чёрный экран.
@@ -14291,6 +14339,21 @@ void main() {
         LogToJava("NativeExecutionThread: Подготовка к прыжку в сырой _start (XNU ABI). g_entryPoint = " + std::string(_ep_hex));
     }
     LogToJava("NativeExecutionThread: ---> ПРЫЖОК В IOS <---");
+
+    // PRE-JUMP-CHECK: финальная проверка g_surface перед передачей управления iOS-коду.
+    // Если здесь значения некорректны — UIScreen bounds вернёт {0,0,0,0} и игра не запустится.
+    {
+        char pjc_buf[128];
+        snprintf(pjc_buf, sizeof(pjc_buf),
+            "[PRE-JUMP-CHECK] g_surfaceWidth=%d g_surfaceHeight=%d",
+            g_surfaceWidth, g_surfaceHeight);
+        _SyncLog(pjc_buf);
+        if (g_surfaceWidth <= 0 || g_surfaceWidth > 8192 ||
+            g_surfaceHeight <= 0 || g_surfaceHeight > 8192) {
+            _SyncLog("[PRE-JUMP-CHECK] ПРЕДУПРЕЖДЕНИЕ: g_surface невалиден перед прыжком! "
+                     "Игра, скорее всего, получит чёрный экран.");
+        }
+    }
 
 #if defined(__arm__)
     // Сохраняем все нужные значения в переменных с явной привязкой к регистрам,
