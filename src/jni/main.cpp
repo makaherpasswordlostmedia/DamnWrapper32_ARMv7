@@ -143,7 +143,31 @@ char g_crashLogPath[1024] = {0}; volatile int g_crash_counter = 0;
 EGLConfig  g_eglConfig  = nullptr;
 EGLDisplay g_eglDisplay = EGL_NO_DISPLAY; EGLContext g_eglContext = EGL_NO_CONTEXT; EGLSurface g_eglSurface = EGL_NO_SURFACE;
 void* g_currentEAGLContext = nullptr;
-int g_surfaceWidth = 480; int g_surfaceHeight = 320;
+// SURFACE-MUTEX: g_surfaceWidth/g_surfaceHeight читаются и пишутся из нескольких потоков
+// (NativeExecutionThread/iOS-main и render-поток EAGLView/RootController).
+// volatile предотвращает кэширование в регистрах; для атомарности используем g_surfaceMutex.
+static pthread_mutex_t g_surfaceMutex = PTHREAD_MUTEX_INITIALIZER;
+volatile int g_surfaceWidth = 480; volatile int g_surfaceHeight = 320;
+
+// SetSurfaceSize — единственная точка записи g_surfaceWidth/g_surfaceHeight.
+// Логирует каждое изменение через _SyncLog (безусловно), что позволяет найти
+// источник data race по логу. Мьютекс защищает от одновременных записей из
+// NativeExecutionThread и render-потока.
+static inline void SetSurfaceSize(int w, int h, const char* caller) {
+    pthread_mutex_lock(&g_surfaceMutex);
+    int old_w = g_surfaceWidth, old_h = g_surfaceHeight;
+    if (w != old_w || h != old_h) {
+        g_surfaceWidth  = w;
+        g_surfaceHeight = h;
+        // Логируем через write в файл напрямую, минуя JNI (JNI может быть недоступен)
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+            "[SET-SURFACE] %s: %dx%d -> %dx%d (tid=%ld &w=%p)",
+            caller, old_w, old_h, w, h, (long)pthread_self(), (void*)&g_surfaceWidth);
+        _SyncLog(buf);
+    }
+    pthread_mutex_unlock(&g_surfaceMutex);
+}
 uint32_t g_entryPoint = 0; uint32_t g_appSlide = 0; std::map<std::string, uint32_t> g_appSymbols;
 std::map<uintptr_t, std::string> g_missingSymbolAddrs;
 std::vector<uint32_t> g_initFuncs;
@@ -2013,7 +2037,7 @@ extern "C" void Stub_glRenderbufferStorage(GLenum target, GLenum internalformat,
             LogToJava("[RBO-FIX] glRenderbufferStorage: размер " + std::to_string(width) + "x" +
                       std::to_string(height) + " -> " + std::to_string(qw) + "x" + std::to_string(qh));
             width = qw; height = qh;
-            if (g_surfaceWidth <= 0) { g_surfaceWidth = qw; g_surfaceHeight = qh; }
+            if (g_surfaceWidth <= 0) { SetSurfaceSize(qw, qh, "RBO-FIX"); }
         }
     }
     if (g_gpuOffloadMask & 64) glRenderbufferStorage(target, internalformat, width, height); 
@@ -4649,8 +4673,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         "[MSGSI-FIX] %s EGL fallback %dx%d -> %dx%d",
                         op, g_surfaceWidth, g_surfaceHeight, qw, qh);
                     LogToJava(fixBuf);
-                    g_surfaceWidth  = qw;
-                    g_surfaceHeight = qh;
+                    SetSurfaceSize(qw, qh, "MSGSI-FIX");
                 }
             }
         }
@@ -7037,10 +7060,11 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
 
         // STRET-ENTRY: логируем g_surface ДО EGL re-query, чтобы поймать кто его испортил
         {
-            char entry_buf[128];
+            char entry_buf[160];
             snprintf(entry_buf, sizeof(entry_buf),
-                "[STRET-ENTRY] op=%s g_surfW=%d g_surfH=%d eglDpy=%p eglSurf=%p",
-                op, g_surfaceWidth, g_surfaceHeight, (void*)g_eglDisplay, (void*)g_eglSurface);
+                "[STRET-ENTRY] op=%s g_surfW=%d g_surfH=%d eglDpy=%p eglSurf=%p &g_surfW=%p",
+                op, g_surfaceWidth, g_surfaceHeight, (void*)g_eglDisplay, (void*)g_eglSurface,
+                (void*)&g_surfaceWidth);
             _SyncLog(entry_buf);
         }
 
@@ -7069,8 +7093,7 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
                         "[STRET-FIX] %s: EGL fallback %dx%d -> %dx%d",
                         op, g_surfaceWidth, g_surfaceHeight, qw, qh);
                     _SyncLog(fixBuf); // безусловный — чтобы попало в лог даже при g_disableLogging
-                    g_surfaceWidth  = qw;
-                    g_surfaceHeight = qh;
+                    SetSurfaceSize(qw, qh, "STRET-FIX");
                 }
             } else {
                 // EGL недоступен — логируем явно
@@ -7095,11 +7118,19 @@ void* Impl_objc_msgSend_stret(void* ret_addr, void* self, const char* op, void* 
         
         // ВНИМАНИЕ: Возвращаем нормальный CGRect: x=0, y=0, w=width, h=height
         float rectData[4] = {0.0f, 0.0f, w, h};
+        // Снимок g_surface ДО LogToJava: JNI-вызовы открывают окно для data race,
+        // во время которого render-поток может перезаписать g_surfaceWidth/Height.
+        // Снимок гарантирует, что лог отражает значения на момент вычисления w/h.
+        int snap_surfW = g_surfaceWidth, snap_surfH = g_surfaceHeight;
+        // ARM vararg ABI fix: float в variadic-функции может попасть в VFP-регистр
+        // вместо целочисленного (r2/r3), что приводит к snprintf читающему 0.
+        // Явный каст в int устраняет неоднозначность ABI.
+        int wi = (int)w, hi = (int)h;
         LogToJava(">>>>>>>> [SIZE-CRITICAL] STRET MSG_SEND " + std::string(op) + " <<<<<<<<");
         LogToJava("  Caller: " + GetModuleInfoForAddress(lr));
         { char _ra[32]; snprintf(_ra, sizeof(_ra), "0x%08X", (uint32_t)(uintptr_t)ret_addr); LogToJava("  Class: " + cName + " | ptr: " + ptrStr + " | ret_addr: " + std::string(_ra)); }
-        // Логируем итоговые значения + g_surfaceWidth для диагностики
-        { char _wh[128]; snprintf(_wh, sizeof(_wh), "  Writing (Float): x=0 y=0 w=%.1f h=%.1f [g_surfW=%d g_surfH=%d]", w, h, g_surfaceWidth, g_surfaceHeight); LogToJava(_wh); }
+        // Логируем итоговые значения: wi/hi из снимка, snap_surf* из снимка
+        { char _wh[128]; snprintf(_wh, sizeof(_wh), "  Writing (Float): x=0 y=0 w=%d h=%d [g_surfW=%d g_surfH=%d] (snap)", wi, hi, snap_surfW, snap_surfH); LogToJava(_wh); }
 
         if (ret_addr) {
             LogToJava("  [STRET-MEM] До записи:    " + DumpHexToString((const char*)ret_addr, 16));
@@ -8373,12 +8404,10 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
                     g_surfaceWidth, g_surfaceHeight, _pcw, _pch);
                 _SyncLog(pcc_buf);
                 if (_pcw > 0 && _pch > 0) {
-                    g_surfaceWidth  = _pcw;
-                    g_surfaceHeight = _pch;
+                    SetSurfaceSize(_pcw, _pch, "POST-CTOR-CHECK/EGL");
                 } else {
                     // EGL тоже недоступен — хотя бы убираем мусор
-                    g_surfaceWidth  = 480;
-                    g_surfaceHeight = 320;
+                    SetSurfaceSize(480, 320, "POST-CTOR-CHECK/fallback");
                     _SyncLog("[POST-CTOR-CHECK] EGL недоступен, фолбэк 480x320");
                 }
             } else {
@@ -12382,7 +12411,7 @@ static void __attribute__((pcs("aapcs"))) hle_getResolution_replacement(
             EGLint qw = 0, qh = 0;
             eglQuerySurface(g_eglDisplay, qSurf, EGL_WIDTH, &qw);
             eglQuerySurface(g_eglDisplay, qSurf, EGL_HEIGHT, &qh);
-            if (qw > 0 && qh > 0) { g_surfaceWidth = qw; g_surfaceHeight = qh; }
+            if (qw > 0 && qh > 0) { SetSurfaceSize(qw, qh, "getResolutionWithDevice/EGL"); }
         }
     }
     uint32_t w = (g_surfaceWidth  > 0) ? (uint32_t)g_surfaceWidth  : 480u;
@@ -14250,8 +14279,7 @@ void* NativeExecutionThread(void* arg) {
                 g_surfaceWidth, g_surfaceHeight, w, h);
             LogToJava(fixBuf);
         }
-        g_surfaceWidth  = w;
-        g_surfaceHeight = h;
+        SetSurfaceSize(w, h, "EGL-FIX/NativeExecutionThread");
     }
     char eglBuf[256];
     snprintf(eglBuf, sizeof(eglBuf), "[MEGA-DEBUG] NativeExecutionThread init: Ctx=%p, Dpy=%p, Surf=%p, SurfSize=%dx%d", ctx, dpy, surf, w, h);
@@ -15620,12 +15648,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
         LogToJava(iwBuf);
     }
     if (resWidth > 0 && resHeight > 0) {
-        g_surfaceWidth  = resWidth;
-        g_surfaceHeight = resHeight;
+        SetSurfaceSize(resWidth, resHeight, "initWrapper");
     } else if (g_surfaceWidth <= 0 || g_surfaceHeight <= 0) {
         // Фолбэк: если EGL ещё не дал нам размер и Java тоже даёт 0 - используем типичный дефолт
-        g_surfaceWidth  = 480;
-        g_surfaceHeight = 320;
+        SetSurfaceSize(480, 320, "initWrapper/fallback");
     }
     // (если resWidth==0 но у нас уже есть валидный размер из EGL - оставляем его)
     g_logRender = logRender;
