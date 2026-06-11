@@ -8674,7 +8674,7 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             // рендер так и не запустился (startAnimation не был перехвачен ни через msgSend, ни через IMP).
             if (!g_renderingStarted && !g_displayLinkTarget && idle_ticks > 180) {
                 LogToJava("[MAIN-LOOP] EMERGENCY: 3s без рендера — сканируем g_views на drawFrame/drawView:");
-                const char* emergencySels[] = {"drawFrame", "drawView:", "renderFrame", "render", nullptr};
+                const char* emergencySels[] = {"drawFrame", "drawView:", "renderFrame", "render", "update", nullptr};
                 for (auto const& vp : g_views) {
                     void* obj = vp.first;
                     if (!obj) continue;
@@ -8731,7 +8731,7 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
                 LogToJava("[MAIN-LOOP] FALLBACK: renderingStarted=true но target/sel не задан. Ищем drawFrame...");
                 for (auto const& pair : g_appSymbols) {
                     if (pair.first.find("_OBJC_CLASS_$_") == 0) {
-                        const char* selCandidates[] = {"drawFrame", "drawView:", "renderFrame", nullptr};
+                        const char* selCandidates[] = {"drawFrame", "drawView:", "renderFrame", "update", nullptr};
                         for (int si = 0; selCandidates[si]; si++) {
                             if (FindMethodIMP(pair.second, selCandidates[si])) {
                                 // Нужен экземпляр — ищем в g_views
@@ -12508,7 +12508,7 @@ static void* __attribute__((pcs("aapcs"))) hle_startAnimation_replacement(void* 
 
         // Список render-loop selectors в порядке приоритета
         const char* loopSels[] = {
-            "drawFrame", "drawView:", "mainLoop", "_mainLoop:", "dl_mainLoop:", nullptr
+            "drawFrame", "drawView:", "mainLoop", "_mainLoop:", "dl_mainLoop:", "update", nullptr
         };
 
         // Ищем render loop selector в self (RootController / MainViewController / EAGLView)
