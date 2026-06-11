@@ -12455,6 +12455,23 @@ static uint32_t __attribute__((pcs("aapcs"))) hle_presentFramebuffer_replacement
 }
 
 // =============================================================================
+// ПАТЧ: -[EAGLContext presentRenderbuffer:]
+// Action Buggy вызывает этот метод через кешированный IMP напрямую,
+// минуя objc_msgSend — поэтому HLE-перехват в Stub_objc_msgSend не срабатывает
+// и g_swappedThisFrame остаётся false → чёрный экран.
+// Перехватываем на уровне IMP, аналогично presentFramebuffer.
+// Сигнатура: - (BOOL)presentRenderbuffer:(NSUInteger)target  → r0=1
+// ARMv7 AAPCS: self=r0, _cmd=r1, target=r2
+// =============================================================================
+static uint32_t __attribute__((pcs("aapcs"))) hle_presentRenderbuffer_replacement(
+        void* self, void* _cmd, uint32_t target) {
+    LogToJava("PATCH-HIT: -[EAGLContext presentRenderbuffer:] intercepted via IMP patch -> eglSwapBuffers");
+    RenderHLEUI();
+    MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface);
+    return 1; // YES
+}
+
+// =============================================================================
 // ПАТЧ: -[EAGLView setFramebuffer]
 // Wolf3D вызывает setFramebuffer перед каждым кадром. Внутри он делает
 // glBindFramebufferOES(1, fbo) — и наш Stub_glBindFramebuffer с mask=0 это игнорирует.
@@ -13045,6 +13062,8 @@ static void ApplyGamePatches() {
             // catlist_class="EAGLView": метод может лежать в ObjC-категории, не в основном classlist
             { "present",             (void*)hle_presentFramebuffer_replacement,   false, "", 1, false, "EAGLView" },
             { "presentFramebuffer",  (void*)hle_presentFramebuffer_replacement,   false, "", 1, false, "EAGLView" },
+            // presentRenderbuffer: — Action Buggy вызывает через кешированный IMP напрямую на EAGLContext
+            { "presentRenderbuffer:", (void*)hle_presentRenderbuffer_replacement, false, "", 1, false, "EAGLContext" },
             // createFramebuffer/setFramebuffer — биндим FBO 0 (алиасы, группа 2)
             { "createFramebuffer",   (void*)hle_createFramebuffer_replacement,    false, "", 2, false, "EAGLView" },
             { "setFramebuffer",      (void*)hle_setFramebuffer_replacement,       false, "", 2, false, "EAGLView" },
@@ -13069,6 +13088,7 @@ static void ApplyGamePatches() {
                                         ? (const char*)(uintptr_t)ro_ptr_c[4] : "?";
                 // RAW диагностика для EAGLView и других классов-кандидатов
                 bool isTarget = (strcmp(cname_c, "EAGLView") == 0 ||
+                                 strcmp(cname_c, "EAGLContext") == 0 ||
                                  strcmp(cname_c, "RootController") == 0 ||
                                  strcmp(cname_c, "MainViewController") == 0 ||
                                  strcmp(cname_c, "SharkAppDelegate") == 0 ||
