@@ -8658,6 +8658,16 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             g_swappedThisFrame = false; // Новый кадр — разрешаем один swap
             g_frameHasDraw = false;
             Stub_objc_msgSend(g_displayLinkTarget, g_displayLinkSelector, realFakeLink, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            // ФИКС ЧЁРНОГО ЭКРАНА: Action Buggy вызывает [EAGLContext presentRenderbuffer:]
+            // напрямую через кешированный IMP (минуя Stub_objc_msgSend), поэтому HLE-перехват
+            // в Stub_objc_msgSend не срабатывает и g_swappedThisFrame остаётся false.
+            // Если после вызова update/drawFrame swap так и не был сделан — делаем его здесь.
+            if (!g_swappedThisFrame && g_eglSurface != EGL_NO_SURFACE) {
+                static int fallback_cnt = 0;
+                if (fallback_cnt++ < 5) LogToJava("[MAIN-LOOP] FALLBACK SWAP: presentRenderbuffer не перехвачен, делаем eglSwapBuffers принудительно");
+                RenderHLEUI();
+                MegaDebug_eglSwapBuffers(g_eglDisplay, g_eglSurface);
+            }
         } else {
             static int idle_ticks = 0;
             idle_ticks++;
