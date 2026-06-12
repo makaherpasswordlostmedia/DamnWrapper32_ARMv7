@@ -8591,8 +8591,8 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
         realFakeLink[1] = (uint32_t)(uintptr_t)g_displayLinkTarget;
         realFakeLink[2] = (uint32_t)(uintptr_t)g_displayLinkSelector;
     }
+    LogToJava("DEBUG: ENTERING MAIN LOOP");
     while (true) {
-        // ПОТОКОБЕЗОПАСНАЯ ОБРАБОТКА ИВЕНТОВ ВИДЕО
         pthread_mutex_lock(&g_videoMutex);
         if (!g_pendingVideoFinishes.empty()) {
             std::vector<void*> finishes = g_pendingVideoFinishes;
@@ -10640,7 +10640,7 @@ extern "C" void* wrap_fopen(const char* path, const char* mode) {
     if (sPath.find(".dll") != std::string::npos || sPath.find("mscorlib") != std::string::npos || sPath.find("Mono") != std::string::npos) {
         LogToJava("MONO-TRACE: [fopen] Попытка открыть: " + sPath + " | Caller: " + GetModuleInfoForAddress(lr));
     } else {
-        LogToBlackBox("C-API-DEBUG: [FOPEN] Попытка открыть файл: [" + sPath + "] Caller: " + GetModuleInfoForAddress(lr));
+        LogToJava("C-API-DEBUG: [FOPEN] Попытка открыть файл: [" + sPath + "] Caller: " + GetModuleInfoForAddress(lr));
         if (sPath.find("pngConf") != std::string::npos || sPath.find("jungle") != std::string::npos || sPath.find("achieve") != std::string::npos || sPath.find(".ima") != std::string::npos || sPath.find(".wav") != std::string::npos) {
             LogToJava("C-API-DEBUG: ВАЖНЫЙ [FOPEN]: [" + sPath + "] Caller: " + GetModuleInfoForAddress(lr));
         }
