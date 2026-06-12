@@ -10729,6 +10729,12 @@ extern "C" size_t wrap_fread(void* ptr, size_t size, size_t nitems, void* fp) {
         memset(ptr, 0, size * nitems);
     }
 
+    if (g_fileNames.count(fp) && g_fileNames[fp].find(".bin") != std::string::npos) {
+        LogToJava("[FREAD-TRACE] " + g_fileNames[fp] + " off=" + std::to_string(cur_offset) +
+                  " want=" + std::to_string(size*nitems) + " got=" + std::to_string(bytesRead) +
+                  " first=" + DumpHexToString((const char*)ptr, std::min((size_t)16, bytesRead > 0 ? bytesRead : size*nitems)));
+    }
+
     if (g_fileNames.count(fp) && bytesRead > 0) {
         if (!g_fileReadStats.count(fp)) {
             g_fileReadStats[fp].firstOffset = cur_offset;
@@ -10757,7 +10763,9 @@ extern "C" int wrap_fseek(void* fp, long offset, int whence) {
     FILE* real_f = unwrap_file(fp);
     if (!real_f) return -1;
     int res = fseek(real_f, offset, whence); 
-    if (g_fileNames.count(fp)) {
+    if (g_fileNames.count(fp) && g_fileNames[fp].find(".bin") != std::string::npos) {
+        LogToJava("[FSEEK-TRACE] " + g_fileNames[fp] + " offset=" + std::to_string(offset) + " whence=" + std::to_string(whence) + " -> result: " + std::to_string(res));
+    } else if (g_fileNames.count(fp)) {
         LogToBlackBox("C-API-IO: fseek offset=" + std::to_string(offset) + " whence=" + std::to_string(whence) + " in " + g_fileNames[fp] + " -> result: " + std::to_string(res));
     }
     return res; 
