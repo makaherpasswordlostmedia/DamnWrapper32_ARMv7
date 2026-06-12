@@ -6673,10 +6673,32 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     // Ветка 3: Нативные классы (VC и App)
     else {
         if (strcmp(op, "alloc") == 0) {
-            uint32_t* cls = (uint32_t*)self; uint32_t data_ptr = cls[4] & ~3; uint32_t instance_size = 32; 
-            if (data_ptr > 0x1000) { uint32_t parsed_size = ((uint32_t*)data_ptr)[2]; if (parsed_size > 0 && parsed_size < 100000) instance_size = parsed_size; }
-            void* instance = calloc(1, instance_size); ((uint32_t*)instance)[0] = (uint32_t)self; 
-            
+            uint32_t* cls = (uint32_t*)self; uint32_t data_ptr = cls[4] & ~3; uint32_t instance_size = 256;
+            if (data_ptr > 0x1000) {
+                uint32_t* ro = (uint32_t*)data_ptr;
+                uint32_t ro_flags       = ro[0];
+                uint32_t ro_inst_start  = ro[1];
+                uint32_t ro_inst_size   = ro[2];
+                // Диагностика: логируем сырые поля class_ro_t до принятия решения о размере
+                { char _rodbg[192]; snprintf(_rodbg, sizeof(_rodbg),
+                    "HLE_DEBUG: [ALLOC-RO] cls=0x%08X data=0x%08X flags=0x%08X start=%u size=%u",
+                    (uint32_t)(uintptr_t)self, data_ptr, ro_flags, ro_inst_start, ro_inst_size);
+                  LogToJava(_rodbg); }
+                // Защита: instanceSize < 8 означает либо мусор либо не-ребейзнутый/неверный data_ptr.
+                // Минимальный ObjC-объект = isa (4 байта) + хотя бы один ivar = 8 байт.
+                // Также отсекаем значения выглядящие как указатели (> 0x10000) — признак
+                // что data_ptr указывает на class_rw_t вместо class_ro_t (уже initialized runtime).
+                if (ro_inst_size >= 8 && ro_inst_size < 100000) {
+                    instance_size = ro_inst_size;
+                } else {
+                    char _skip[160]; snprintf(_skip, sizeof(_skip),
+                        "HLE_DEBUG: [ALLOC-RO] instanceSize=%u REJECTED (out of range), using default %u",
+                        ro_inst_size, instance_size);
+                    LogToJava(_skip);
+                }
+            }
+            void* instance = calloc(1, instance_size); ((uint32_t*)instance)[0] = (uint32_t)self;
+
             std::string cName = GetObjCClassName(self);
             LogToJava("HLE_DEBUG: [ALLOC] Создан нативный объект класса: " + cName + " (size: " + std::to_string(instance_size) + ")");
             
@@ -8193,10 +8215,14 @@ extern "C" void* wrap_NSAllocateObject(void* aClass, uint32_t extraBytes, void* 
     if (!aClass || (uintptr_t)aClass < 0x1000) return nullptr;
     uint32_t* cls = (uint32_t*)aClass;
     uint32_t data_ptr = cls[4] & ~3;
-    uint32_t instance_size = 32;
+    uint32_t instance_size = 256;
     if (data_ptr > 0x1000) {
-        uint32_t parsed_size = ((uint32_t*)data_ptr)[2];
-        if (parsed_size > 0 && parsed_size < 100000) instance_size = parsed_size;
+        uint32_t* ro = (uint32_t*)data_ptr;
+        uint32_t ro_inst_size = ro[2];
+        // Защита: instanceSize < 8 = мусор или неверный data_ptr; > 100000 = явный мусор.
+        if (ro_inst_size >= 8 && ro_inst_size < 100000) {
+            instance_size = ro_inst_size;
+        }
     }
     void* instance = calloc(1, instance_size + extraBytes);
     ((uint32_t*)instance)[0] = (uint32_t)aClass;
@@ -13127,10 +13153,12 @@ static void ApplyGamePatches() {
                                  strcmp(cname_c, "SharkAppDelegate") == 0 ||
                                  strcmp(cname_c, "SMB2GameAppDelegate") == 0);
                 if (isTarget) {
-                    char raw[256];
+                    char raw[320];
                     snprintf(raw, sizeof(raw),
-                        "CLSCAN-RAW: '%s' cls=0x%08X cls[4]=0x%08X ro=0x%08X ro[4](name)=0x%08X ro[5](mlist)=0x%08X",
-                        cname_c, cp, cls_c[4], ro_c, ro_ptr_c[4], ro_ptr_c[5]);
+                        "CLSCAN-RAW: '%s' cls=0x%08X cls[4]=0x%08X ro=0x%08X ro[0](flags)=0x%08X ro[1](start)=%u ro[2](size)=%u ro[4](name)=0x%08X ro[5](mlist)=0x%08X",
+                        cname_c, cp, cls_c[4], ro_c,
+                        ro_ptr_c[0], ro_ptr_c[1], ro_ptr_c[2],
+                        ro_ptr_c[4], ro_ptr_c[5]);
                     LogToJava(raw);
                 }
                 // Сканируем methodlist
