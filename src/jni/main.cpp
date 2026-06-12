@@ -7389,7 +7389,8 @@ extern "C" void* wrap_objc_getProperty(void* self, const char* op, ptrdiff_t off
 }
 extern "C" void Stub_exit(int code) { 
     uint32_t lr = (uint32_t)__builtin_return_address(0);
-    LogToJava("HLE_CALL: Игра вызвала exit(" + std::to_string(code) + ")! Caller: " + GetModuleInfoForAddress(lr)); 
+    char buf[64]; snprintf(buf, sizeof(buf), "0x%08X", lr);
+    LogToJava(std::string("HLE_CALL: Игра вызвала exit(") + std::to_string(code) + ")! Raw LR=" + buf + " | Caller(sym): " + GetModuleInfoForAddress(lr)); 
     __builtin_trap(); 
 }
 
