@@ -10664,7 +10664,12 @@ extern "C" void* wrap_fopen(const char* path, const char* mode) {
     // Создаём пустой id.bin чтобы LoadListIDsv получил EOF и не портил путь бандла.
     if (!real_f && (origPath == "id.bin" || sPath.find("/id.bin") != std::string::npos)) {
         std::string createPath = g_sandboxDir + "Documents/id.bin";
+        std::string dirPath = g_sandboxDir + "Documents";
+        LogToJava("C-API-DEBUG: [id.bin] mkdir -p " + dirPath);
+        mkdir(dirPath.c_str(), 0777); // создаём папку Documents, если её нет (без неё fopen wb может зависнуть на FUSE-сторадже)
+        LogToJava("C-API-DEBUG: [id.bin] fopen wb " + createPath);
         FILE* empty_f = fopen(createPath.c_str(), "wb");
+        LogToJava("C-API-DEBUG: [id.bin] fopen wb returned " + std::to_string((uintptr_t)empty_f));
         if (empty_f) { fclose(empty_f); }
         real_f = fopen(createPath.c_str(), "rb");
         if (real_f) {
