@@ -6455,6 +6455,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                     }
                     closedir(dir);
                 }
+                LogToJava("DEBUG: contentsOfDirectoryAtPath done, path=" + path);
                 return (uint64_t)(uintptr_t)arrInst;
             }
             if (strcmp(op, "fileExistsAtPath:isDirectory:") == 0) {
