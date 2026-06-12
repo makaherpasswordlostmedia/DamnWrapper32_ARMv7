@@ -10646,10 +10646,17 @@ extern "C" void* wrap_fopen(const char* path, const char* mode) {
         }
     }
     
-    FILE* real_f = fopen(sPath.c_str(), sMode.c_str());
+    // ФИКС ЗАВИСАНИЯ: на Android обычный fopen() по пути /storage/emulated/0/...id.bin
+    // может НАВЕЧНО ЗАВИСАТЬ (FUSE/scoped storage блокирует open() вместо ENOENT),
+    // если нет разрешения "Все файлы" или директория Documents не создана.
+    // Поэтому для id.bin вообще не вызываем системный fopen по внешнему пути —
+    // считаем файл отсутствующим (EOF), игре этого достаточно (см. фикс ниже).
+    bool isIdBin = (origPath == "id.bin" || sPath.find("/id.bin") != std::string::npos);
+
+    FILE* real_f = isIdBin ? nullptr : fopen(sPath.c_str(), sMode.c_str());
     
     // ФОЛБЕК НА БАНДЛ: Если файл не найден в Documents (например, кэш) и открыт на чтение, ищем в архивах игры!
-    if (!real_f && isRelative && sMode.find('w') == std::string::npos && sMode.find('a') == std::string::npos) {
+    if (!real_f && !isIdBin && isRelative && sMode.find('w') == std::string::npos && sMode.find('a') == std::string::npos) {
         std::string bundlePath = g_appBundlePath + "/" + origPath;
         real_f = fopen(bundlePath.c_str(), sMode.c_str());
         if (real_f) {
@@ -10661,20 +10668,15 @@ extern "C" void* wrap_fopen(const char* path, const char* mode) {
     // ФИКС: id.bin — список купленных ID, на первом запуске не существует.
     // fopen("id.bin","rb") падает → LoadListIDsv оставляет мусорный путь →
     // SetActiveBundle(null) → strlen(null)+1 = 0xFFFFFFFF → malloc(MAX) = NULL → BLX null → SIGSEGV.
-    // Создаём пустой id.bin чтобы LoadListIDsv получил EOF и не портил путь бандла.
-    if (!real_f && (origPath == "id.bin" || sPath.find("/id.bin") != std::string::npos)) {
-        std::string createPath = g_sandboxDir + "Documents/id.bin";
-        std::string dirPath = g_sandboxDir + "Documents";
-        LogToJava("C-API-DEBUG: [id.bin] mkdir -p " + dirPath);
-        mkdir(dirPath.c_str(), 0777); // создаём папку Documents, если её нет (без неё fopen wb может зависнуть на FUSE-сторадже)
-        LogToJava("C-API-DEBUG: [id.bin] fopen wb " + createPath);
-        FILE* empty_f = fopen(createPath.c_str(), "wb");
-        LogToJava("C-API-DEBUG: [id.bin] fopen wb returned " + std::to_string((uintptr_t)empty_f));
-        if (empty_f) { fclose(empty_f); }
-        real_f = fopen(createPath.c_str(), "rb");
+    // Раньше тут создавался пустой файл по пути /storage/emulated/0/... через fopen("wb"),
+    // но именно этот fopen() на внешнем хранилище НАВЕЧНО ЗАВИСАЛ (FUSE/scoped storage).
+    // Поэтому используем tmpfile() — пустой FILE* во внутреннем tmp-каталоге приложения,
+    // который сразу даёт EOF при чтении и не трогает /storage/emulated/0 вообще.
+    if (!real_f && isIdBin) {
+        real_f = tmpfile();
         if (real_f) {
-            sPath = createPath;
-            LogToJava("C-API-IO: [fopen] id.bin не существовал — создан пустой файл: " + createPath);
+            sPath = "<tmpfile:id.bin>";
+            LogToJava("C-API-IO: [fopen] id.bin не существовал — подставлен пустой tmpfile() (EOF)");
         }
     }
 
