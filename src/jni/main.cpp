@@ -4238,6 +4238,13 @@ float g_fpu_ret[4] = {0};
 int g_fpu_ret_flag = 0;
 
 uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8) {
+    {
+        static int s_msgCount = 0;
+        if (s_msgCount++ < 100000) {
+            char buf[64]; snprintf(buf, sizeof(buf), "0x%08X", (uint32_t)(uintptr_t)self);
+            LogToJava(std::string("[MSGSEND-RAW] self=") + buf + " sel=" + (op ? op : "(null)"));
+        }
+    }
     float saved_s[4] = {g_fpu_args[0], g_fpu_args[1], g_fpu_args[2], g_fpu_args[3]};
     static void* s_lazyGlView = nullptr;
     static void* s_lastMoviePlayer = nullptr;
