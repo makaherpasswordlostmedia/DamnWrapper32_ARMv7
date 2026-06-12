@@ -10720,6 +10720,15 @@ extern "C" size_t wrap_fread(void* ptr, size_t size, size_t nitems, void* fp) {
     size_t res = fread(ptr, size, nitems, real_f); 
     size_t bytesRead = res * size;
 
+    // ФИКС ЗАВИСАНИЯ: если файл пустой/EOF (fread вернул 0), буфер ptr остаётся
+    // неинициализированным мусором. Игра может затем сделать strlen()/strcpy()
+    // по этому мусору -> огромная "длина" -> malloc(огромный размер) -> 
+    // многосекундное зависание (зануление гигабайт памяти), выглядящее как фриз/чёрный экран.
+    // Зануляем буфер, чтобы строки внутри были корректно завершены '\0'.
+    if (bytesRead == 0 && size * nitems > 0) {
+        memset(ptr, 0, size * nitems);
+    }
+
     if (g_fileNames.count(fp) && bytesRead > 0) {
         if (!g_fileReadStats.count(fp)) {
             g_fileReadStats[fp].firstOffset = cur_offset;
