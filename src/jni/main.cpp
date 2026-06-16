@@ -13065,20 +13065,49 @@ static void ApplyGamePatches() {
     // его как PC-ОТНОСИТЕЛЬНОЕ СМЕЩЕНИЕ (не абсолютный адрес).
     // PC + 0x100B80C4 = 0x200D1BC8 — за пределами адресного пространства -> SIGSEGV.
     // Правильное значение: 0x000B80C4 (без ребейза — тогда PC + 0x000B80C4 = 0x100D1BC8, валидно).
+    //
+    // ВАЖНО: 0x19BDC — это смещение специфичное для Wolf3D-бинаря.
+    // Для других бинарей (ES2Cube и т.п.) этот адрес может быть за пределами
+    // любой замапленной секции → SIGSEGV при разыменовании.
+    // Поэтому ОБЯЗАТЕЛЬНО проверяем, что адрес находится внутри __TEXT,__text
+    // перед записью.
     {
-        uint32_t* patch_addr = (uint32_t*)(g_appSlide + 0x19BDC);
-        // После патча 1 двойной ребейз уже снят; этот слот мог содержать
-        // 0x200B80C4 -> стал 0x100B80C4 (ребейзнут один раз). Нам нужно 0x000B80C4.
-        // Либо если патч 1 его не задел (не попал в диапазон [0x20000000,0x20400000)),
-        // он всё ещё 0x100B80C4 — тоже нужно убрать ещё один ребейз.
-        uint32_t cur = *patch_addr;
-        const uint32_t expected_after_p1 = 0x000B80C4 + g_appSlide; // = 0x100B80C4
-        if (cur == expected_after_p1 || cur == expected_after_p1 + g_appSlide) {
-            *patch_addr = 0x000B80C4;
-            char msg[128];
-            snprintf(msg, sizeof(msg),
-                "POST-REBASE PATCH (PC-rel fix): __text+0x19BDC: 0x%08X -> 0x000B80C4 (G_ReloadDefaults)", cur);
-            LogToJava(std::string(msg));
+        const uint32_t PATCH2_OFFSET = 0x19BDC;
+        const uintptr_t patch_target = (uintptr_t)g_appSlide + PATCH2_OFFSET;
+
+        // Проверяем, что адрес входит в пределы одной из секций бинаря
+        bool addr_in_section = false;
+        for (const auto& sec : g_machoSections) {
+            if (patch_target >= (uintptr_t)sec.start && patch_target + 3 < (uintptr_t)sec.end) {
+                addr_in_section = true;
+                break;
+            }
+        }
+
+        if (!addr_in_section) {
+            LogToJava("POST-REBASE PATCH (PC-rel fix): пропускаем — адрес 0x" +
+                      std::to_string(patch_target) +
+                      " (g_appSlide+0x19BDC) вне замапленных секций (бинарь не Wolf3D)");
+        } else {
+            uint32_t* patch_addr = (uint32_t*)patch_target;
+            // После патча 1 двойной ребейз уже снят; этот слот мог содержать
+            // 0x200B80C4 -> стал 0x100B80C4 (ребейзнут один раз). Нам нужно 0x000B80C4.
+            // Либо если патч 1 его не задел (не попал в диапазон [0x20000000,0x20400000)),
+            // он всё ещё 0x100B80C4 — тоже нужно убрать ещё один ребейз.
+            uint32_t cur = *patch_addr;
+            const uint32_t expected_after_p1 = 0x000B80C4 + g_appSlide; // = 0x100B80C4
+            if (cur == expected_after_p1 || cur == expected_after_p1 + g_appSlide) {
+                *patch_addr = 0x000B80C4;
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                    "POST-REBASE PATCH (PC-rel fix): __text+0x19BDC: 0x%08X -> 0x000B80C4 (G_ReloadDefaults)", cur);
+                LogToJava(std::string(msg));
+            } else {
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                    "POST-REBASE PATCH (PC-rel fix): пропускаем — значение 0x%08X не совпало с ожидаемым 0x%08X", cur, expected_after_p1);
+                LogToJava(std::string(msg));
+            }
         }
     }
     // =======================================================================
