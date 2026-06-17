@@ -4238,6 +4238,16 @@ float g_fpu_ret[4] = {0};
 int g_fpu_ret_flag = 0;
 
 uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void* a3, void* a4, void* a5, void* a6, void* a7, void* a8) {
+    // [ФИК 1] Проверяем op ДО любого обращения к нему — op=0x8 вызывал strlen→SIGSEGV в std::string.
+    // Невалидный ненулевой op означает corrupted selref или мусор в регистре R1.
+    if (op && !isValidString(op)) {
+        char inv_buf[128];
+        char self_buf[32]; snprintf(self_buf, sizeof(self_buf), "0x%08X", (uint32_t)(uintptr_t)self);
+        snprintf(inv_buf, sizeof(inv_buf), "[MSGSEND-INVALID-SEL] self=%s op=0x%08X — невалидный selector, возвращаем 0",
+            self_buf, (uint32_t)(uintptr_t)op);
+        LogToJava(std::string(inv_buf));
+        return 0;
+    }
     {
         static int s_msgCount = 0;
         if (s_msgCount++ < 100000) {
@@ -13944,8 +13954,12 @@ void LoadMachO(const std::string& bundlePath) {
                                 int data_rebased_count = 0;
                                 
                                 bool is_const_or_data = (sectname == "__const" || sectname == "__data");
+                                // [ФИК 2] __objc_selrefs: каждый слот — указатель на строку в __objc_methname.
+                                // При min_vmaddr=0 unslid-адреса строк могут быть < 0x1000, поэтому
+                                // для selrefs отключаем порог 0x1000 и принимаем любой ненулевой unslid.
+                                bool is_selrefs = (sectname == "__objc_selrefs");
                                 FILE* f_diag = nullptr;
-                                if (is_const_or_data) {
+                                if (is_const_or_data || is_selrefs) {
                                     std::string diag_path = g_workDir + "rebase_diag_" + sectname + ".txt";
                                     f_diag = fopen(diag_path.c_str(), "w");
                                     if (f_diag) fprintf(f_diag, "DIAGNOSTICS FOR %s\n", sectname.c_str());
@@ -13970,7 +13984,10 @@ void LoadMachO(const std::string& bundlePath) {
                                         if (f_diag) fprintf(f_diag, "ADDR: 0x%08X | VAL: 0x%08X | TGT: already-slid-range       | RESULT: IGNORED (Already Rebased)\n", sect.addr + j*4, val);
                                         continue;
                                     }
-                                    if (val >= min_vmaddr && val < max_vmaddr && val > 0x1000) {
+                                    // Для __objc_selrefs: порог снижен до >0 (строки methname могут лежать по малым vmaddr)
+                                    // Для остальных секций: стандартный порог > 0x1000
+                                    uint32_t low_threshold = is_selrefs ? 0u : 0x1000u;
+                                    if (val >= min_vmaddr && val < max_vmaddr && val > low_threshold) {
                                         bool safe_to_rebase = true;
                                         std::string target_section = "Unknown";
                                         std::string reason = "OK";
@@ -14054,12 +14071,25 @@ void LoadMachO(const std::string& bundlePath) {
                                         } else {
                                             safe_to_rebase = false;
                                             reason = "Unknown Target";
+                                            // [ФИК 2b] Для __objc_selrefs: если цель неизвестна но попадает
+                                            // в общий vmaddr-диапазон бинаря — ребейзим безусловно.
+                                            // Строка в __objc_methname может не попасть в g_machoSections
+                                            // если секция не была занесена (например padding/gap).
+                                            if (is_selrefs) {
+                                                uint32_t slid_min = min_vmaddr + g_appSlide;
+                                                uint32_t slid_max = max_vmaddr + g_appSlide;
+                                                if (shifted_val >= slid_min && shifted_val < slid_max) {
+                                                    safe_to_rebase = true;
+                                                    reason = "Selref: ForcedRebase (in vmaddr range)";
+                                                }
+                                            }
                                         }
                                         // Глобальный guard на stride/size значения независимо от target-секции:
                                         // маленькое значение (<0x10000), кратное 0x80 — это stride/size буфера,
                                         // а не указатель (арифметическая прогрессия с шагом кратным 128).
                                         // Применяем ПОСЛЕ классификации target чтобы перекрыть все ветки.
-                                        if (safe_to_rebase && val < 0x10000 && (val & 0x7F) == 0) {
+                                        // Для __objc_selrefs исключение: строка methname может лежать по любому адресу.
+                                        if (!is_selrefs && safe_to_rebase && val < 0x10000 && (val & 0x7F) == 0) {
                                             safe_to_rebase = false;
                                             reason = "Global: SmallAligned (Buffer Stride)";
                                         }
@@ -14143,6 +14173,10 @@ void LoadMachO(const std::string& bundlePath) {
                         uint32_t count2 = sec2_size / 4;
                         bool is_cfstring_sec = (sec2.name.find("__cfstring") != std::string::npos);
                         bool is_data_sec     = (sec2.name.find("__DATA,__data") != std::string::npos);
+                        // [ФИК 3] __objc_selrefs: каждый слот — указатель на строку в __objc_methname.
+                        // При min_vmaddr=0 unslid-адреса строк могут быть < 0x1000, поэтому
+                        // для selrefs отключаем порог 0x1000 (используем только min_vmaddr).
+                        bool is_selrefs_sec  = (sec2.name.find("__objc_selrefs") != std::string::npos);
                         for (uint32_t j2 = 0; j2 < count2; j2++) {
                             // В __cfstring структура = {isa[0], flags[1], str_ptr[2], length[3]}.
                             // Поля flags(1) и length(3) — не указатели, пропускаем.
@@ -14152,8 +14186,21 @@ void LoadMachO(const std::string& bundlePath) {
                             uint32_t slid_max2 = max_vmaddr + g_appSlide;
                             // Уже ребейзнутый — пропустить
                             if (val2 >= slid_min2 && val2 < slid_max2) continue;
-                            // Не в оригинальном диапазоне — не указатель
-                            if (val2 < min_vmaddr || val2 >= max_vmaddr || val2 <= 0x1000) continue;
+                            // Не в оригинальном диапазоне — не указатель.
+                            // Для selrefs: порог снижен до min_vmaddr (строки methname могут лежать по малым vmaddr).
+                            // Для остальных: стандартный порог > 0x1000.
+                            {
+                                uint32_t low2 = is_selrefs_sec ? min_vmaddr : 0x1000u;
+                                if (val2 < min_vmaddr || val2 >= max_vmaddr || val2 <= low2) {
+                                    // Диагностика: логируем пропущенные ненулевые слоты selrefs
+                                    if (is_selrefs_sec && val2 != 0 && f_diag2) {
+                                        fprintf(f_diag2,
+                                            "SELREF-SKIP: ADDR=0x%08X VAL=0x%08X (out-of-range or zero)\n",
+                                            (uint32_t)((uintptr_t)&ptr2[j2] - g_appSlide), val2);
+                                    }
+                                    continue;
+                                }
+                            }
                             // Для __data: указатели выровнены по 4 байтам
                             if (is_data_sec && (val2 & 3) != 0) continue;
                             uintptr_t slot2 = (uintptr_t)&ptr2[j2];
@@ -14171,13 +14218,24 @@ void LoadMachO(const std::string& bundlePath) {
                             if (!in_known && is_data_sec) {
                                 in_known = (shifted2 >= slid_min2 + 0x1000 && shifted2 < slid_max2);
                             }
+                            // [ФИК 3b] Для __objc_selrefs: принимаем любую цель в общем vmaddr диапазоне
+                            // (строка methname может быть в gap между g_machoSections)
+                            if (!in_known && is_selrefs_sec) {
+                                in_known = (shifted2 >= slid_min2 && shifted2 < slid_max2);
+                                if (in_known && f_diag2) {
+                                    fprintf(f_diag2,
+                                        "SELREF-FORCE: ADDR=0x%08X VAL=0x%08X->0x%08X (gap target, force rebased)\n",
+                                        (uint32_t)((uintptr_t)&ptr2[j2] - g_appSlide), val2, shifted2);
+                                }
+                            }
                             // Дополнительный guard: маленькое значение (<0x10000), кратное 0x80 —
                             // это stride/size буфера (matrix palette, GL buffer и т.п.), не указатель.
                             // Применяем БЕЗУСЛОВНО (не только когда in_known==true),
                             // чтобы поймать случай когда shifted2 случайно попадает в __text
                             // только потому что в данном бинаре __text начинается низко.
-                            if (val2 < 0x10000 && (val2 & 0x7F) == 0) continue;
-                            if (in_known && is_data_sec && val2 < 0x10000 && (val2 & 0x7F) == 0) {
+                            // Для __objc_selrefs исключение: строка methname может лежать по любому адресу.
+                            if (!is_selrefs_sec && val2 < 0x10000 && (val2 & 0x7F) == 0) continue;
+                            if (!is_selrefs_sec && in_known && is_data_sec && val2 < 0x10000 && (val2 & 0x7F) == 0) {
                                 in_known = false;
                             }
                             if (!in_known) continue;
