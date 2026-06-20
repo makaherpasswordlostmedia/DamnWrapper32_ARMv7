@@ -10655,7 +10655,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_D(strdup), STB_D(strcasecmp), STB_D(strncasecmp), STB_D(strcspn), {"_strpbrk", (void*)(char*(*)(char*, const char*))strpbrk},
     STB_D(atoi), STB_D(atof), STB_D(atol), STB_D(strtol), STB_D(strtod), STB_D(strtoul), STB_W(strtoll), STB_D(sprintf), STB_D(snprintf), STB_D(vsprintf), STB_D(vsnprintf), STB_D(sscanf), STB_W(printf), STB_W(puts), STB_D(putchar), STB_W(vprintf), STB_W(vfprintf),
     STB_W(fopen), STB_W(fclose), STB_W(fread), STB_W(fwrite), STB_W(fseek), STB_W(ftell), STB_W(fgetpos), STB_W(fsetpos), STB_W(fputc), STB_W(fscanf), STB_W(fflush), STB_W(fputs), STB_W(fprintf), STB_W(fgetc), STB_W(fgets), STB_W(feof), STB_W(ferror), STB_W(fileno), {"___srget", (void*)wrap___srget},
-    {"_sqrt", (void*)(double(*)(double))sqrt}, STB_D(sqrtf), {"_pow", (void*)(double(*)(double, double))pow}, STB_D(powf), {"_exp", (void*)(double(*)(double))exp}, STB_D(expf), {"_log", (void*)(double(*)(double))log}, STB_D(logf), {"_log10", (void*)(double(*)(double))log10}, STB_D(log10f), {"_log2", (void*)(double(*)(double))log2}, STB_D(log2f), {"_exp2", (void*)(double(*)(double))exp2}, STB_D(exp2f),
+    {"_sqrt", (void*)(double(*)(double))sqrt}, STB_D(sqrtf), {"_pow", (void*)(double(*)(double, double))pow}, STB_D(powf), {"_exp", (void*)(double(*)(double))exp}, STB_D(expf), {"_log", (void*)(double(*)(double))log}, STB_D(logf), {"_log10", (void*)(double(*)(double))log10}, STB_D(log10f), {"_log2", (void*)(double(*)(double))log2}, STB_D(log2f),
     {"_ceil", (void*)(double(*)(double))ceil}, STB_D(ceilf), {"_floor", (void*)(double(*)(double))floor}, STB_D(floorf), {"_round", (void*)(double(*)(double))round}, STB_D(roundf), {"_fmod", (void*)(double(*)(double, double))fmod}, STB_D(fmodf), {"_fmin", (void*)(double(*)(double, double))fmin}, STB_D(fminf), {"_fmax", (void*)(double(*)(double, double))fmax}, STB_D(fmaxf),
     {"_sin", (void*)(double(*)(double))sin}, {"_cos", (void*)(double(*)(double))cos}, {"_tan", (void*)(double(*)(double))tan}, {"_asin", (void*)(double(*)(double))asin}, {"_acos", (void*)(double(*)(double))acos}, {"_atan", (void*)(double(*)(double))atan}, {"_atan2", (void*)(double(*)(double, double))atan2}, STB_D(atan2f), STB_D(atanf),
     {"_sinh", (void*)(double(*)(double))sinh}, {"_cosh", (void*)(double(*)(double))cosh}, {"_tanh", (void*)(double(*)(double))tanh}, {"_abs", (void*)(int(*)(int))abs}, {"_fabs", (void*)(double(*)(double))fabs}, STB_D(fabsf),
@@ -11741,7 +11741,7 @@ void LoadMachO(const std::string& bundlePath) {
                                     // Это похоже на недоребейзенный указатель: 0x007869F1 + slide(0x10000000)
                                     // = 0x107869F1 — валидный адрес в рабочем диапазоне. Проверяем оба варианта
                                     // (с Thumb-битом и без), чтобы понять, в какой секции он застрял.
-                                    if (val == 18362952 || val == 18321096 || val == 7339996 || val == 7891441 || val == 7891440) {
+                                    if (val == 18362952 || val == 18321096 || val == 7339996 || val == 7891441 || val == 7891440 || val == 3900836 || val == 3900837) { // 3900836=0x003B85A4, 3900837=0x003B85A5 (Thumb)
                                         char alert_buf[256];
                                         snprintf(alert_buf, sizeof(alert_buf), "REBASE-ALERT: Целевая переменная %u (0x%X) найдена по адресу 0x%X (секция %s)", val, val, sect.addr + j*4, sectname.c_str());
                                         LogToJava(alert_buf);
@@ -11851,7 +11851,11 @@ void LoadMachO(const std::string& bundlePath) {
                                                     bool sv_mapped = false;
                                                     for (const auto& sInfo : g_machoSections) { if (shifted_val >= sInfo.start && shifted_val < sInfo.end) { sv_mapped = true; break; } }
                                                     if (!sv_mapped) { safe_to_rebase = false; reason = "Data: Unmapped Ptr"; }
-                                                    else if (!isValidString((const char*)shifted_val)) { safe_to_rebase = false; reason = "Data: Unaligned & Bad ASCII"; }
+                                                    // FIX: __TEXT,__const содержит бинарные данные (structs, C-strings, jump tables) — isValidString
+                                                    // ненадёжен для этой секции: строки могут начинаться не с ASCII-символа.
+                                                    // Достаточно проверки sv_mapped. Убираем isValidString-фильтр.
+                                                    // Раньше это приводило к пропуску 7 указателей (__data->__const)
+                                                    // с причиной "Data: Unaligned & Bad ASCII", хотя они были валидными.
                                                 }
                                             }
                                         } else {
