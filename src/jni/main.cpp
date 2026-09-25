@@ -11503,10 +11503,26 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     else {
         if (strcmp(op, "alloc") == 0) {
             uint32_t* cls = (uint32_t*)self; uint32_t data_ptr = cls[4] & ~3; uint32_t instance_size = 32; 
-            if (data_ptr > 0x1000) { uint32_t parsed_size = ((uint32_t*)data_ptr)[2]; if (parsed_size > 0 && parsed_size < 100000) instance_size = parsed_size; }
+            bool sizeParsedOk = false;
+            if (data_ptr > 0x1000) {
+                uint32_t parsed_size = ((uint32_t*)data_ptr)[2];
+                // Потолок 100000 был рассчитан на обычные UIKit-объекты — он
+                // ломается на классах с большими C-массивами в иварах
+                // (например Machine: vecs[32768] дают ~800KB instanceSize).
+                // В таких случаях parsed_size корректный, но отбрасывался,
+                // и мы тихо уходили на fallback=32, после чего первый же
+                // memset/запись в -init переполняла 32-байтовую аллокацию
+                // и крашила процесс (SIGSEGV за пределами scudo-региона).
+                // Поднимаем потолок до 8MB — с запасом под тяжёлые классы,
+                // но всё ещё отсекаем откровенно мусорные/нерасслоённые значения.
+                if (parsed_size > 0 && parsed_size < 8 * 1024 * 1024) { instance_size = parsed_size; sizeParsedOk = true; }
+            }
             void* instance = calloc(1, instance_size); ((uint32_t*)instance)[0] = (uint32_t)self; 
             
             std::string cName = GetObjCClassName(self);
+            if (!sizeParsedOk) {
+                LogToJava("HLE-WARN: [ALLOC] instanceSize не распарсен для " + cName + ", fallback=32 — вероятен heap overflow");
+            }
             LogToJava("HLE_DEBUG: [ALLOC] Создан нативный объект класса: " + cName + " (size: " + std::to_string(instance_size) + ")");
             
             if (cName.find("Button") != std::string::npos) g_views[instance].type = "UIButton";
