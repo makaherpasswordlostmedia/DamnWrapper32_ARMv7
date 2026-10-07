@@ -11048,6 +11048,19 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
             if (strcmp(op, "length") == 0) return self_ptr[2];
             if (strcmp(op, "bytes") == 0) return self_ptr[1];
+            // CheckRom() читает код игры из ROM через getBytes:range: (a2=location, a3=length);
+            // без него код пустой, ROM «не Wario Land 4» и Play падает в скрытый UIAlertView.
+            if (strcmp(op, "getBytes:range:") == 0 || strcmp(op, "getBytes:length:") == 0 || strcmp(op, "getBytes:") == 0) {
+                uint8_t* dst = (uint8_t*)a1; const uint8_t* src = (const uint8_t*)self_ptr[1];
+                uint32_t size = self_ptr[2], loc = 0, len = size;
+                if (strcmp(op, "getBytes:range:") == 0) { loc = (uint32_t)(uintptr_t)a2; len = (uint32_t)(uintptr_t)a3; }
+                else if (strcmp(op, "getBytes:length:") == 0) len = (uint32_t)(uintptr_t)a2;
+                if (dst && src && loc <= size) {
+                    if (len > size - loc) len = size - loc;
+                    memcpy(dst, src + loc, len);
+                }
+                return 0;
+            }
         }
         if (clsName == "NSString") {
             if (strcmp(op, "initWithUTF8String:") == 0) {
