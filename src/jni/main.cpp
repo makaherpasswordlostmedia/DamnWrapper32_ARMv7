@@ -11501,6 +11501,12 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
     }
     // Ветка 3: Нативные классы (VC и App)
     else {
+        if (strcmp(op, "new") == 0 && !FindMethodIMP(isa, "new")) {
+            // +new == [[cls alloc] init]. Без этого [WL4Session new] / [MenuViewController new] возвращали nil.
+            void* obj = (void*)(uintptr_t)Impl_objc_msgSend(self, "alloc", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            if (!obj) return 0;
+            return Impl_objc_msgSend(obj, "init", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        }
         if (strcmp(op, "alloc") == 0) {
             uint32_t* cls = (uint32_t*)self; uint32_t data_ptr = cls[4] & ~3; uint32_t instance_size = 32; 
             bool sizeParsedOk = false;
@@ -12174,6 +12180,23 @@ extern "C" void* wrap_objc_getAssociatedObject(void* object, const void* key) {
 extern "C" void* wrap_objc_retain(void* obj) {
     return obj; // Управление памятью перехвачено HLE
 }
+// --- ARC runtime: объекты живут в HLE, поэтому retain/release/autorelease — тождественные функции.
+// Раньше эти символы падали в CreateDynamicStub (mov r0,#0), и каждый ARC-возврат обнулялся -> [nil ...] -> чёрный экран.
+extern "C" void  wrap_objc_release(void* obj) { (void)obj; }
+extern "C" void* wrap_objc_autorelease(void* obj) { return obj; }
+extern "C" void* wrap_objc_retainAutorelease(void* obj) { return obj; }
+extern "C" void* wrap_objc_retainAutoreleaseReturnValue(void* obj) { return obj; }
+extern "C" void* wrap_objc_retainAutoreleasedReturnValue(void* obj) { return obj; }
+extern "C" void* wrap_objc_autoreleaseReturnValue(void* obj) { return obj; }
+extern "C" void* wrap_objc_unsafeClaimAutoreleasedReturnValue(void* obj) { return obj; }
+extern "C" void  wrap_objc_storeStrong(void** loc, void* obj) { if (loc) *loc = obj; }
+extern "C" void* wrap_objc_storeWeak(void** loc, void* obj) { if (loc) *loc = obj; return obj; }
+extern "C" void* wrap_objc_initWeak(void** loc, void* obj) { if (loc) *loc = obj; return obj; }
+extern "C" void* wrap_objc_loadWeak(void** loc) { return loc ? *loc : nullptr; }
+extern "C" void* wrap_objc_loadWeakRetained(void** loc) { return loc ? *loc : nullptr; }
+extern "C" void  wrap_objc_destroyWeak(void** loc) { if (loc) *loc = nullptr; }
+extern "C" void* wrap_objc_autoreleasePoolPush() { return (void*)1; }
+extern "C" void  wrap_objc_autoreleasePoolPop(void* pool) { (void)pool; }
 extern "C" void* wrap_objc_lookUpClass(const char* name) { return name ? ResolveSymbol(std::string("OBJC_CLASS_$_") + name) : nullptr; }
 extern "C" void* wrap_class_getInstanceMethod(void* cls, const char* name) {
     if (!cls || !name) return nullptr;
@@ -17510,6 +17533,22 @@ std::map<std::string, void*> g_hleStubs = {
     {"_pthread_condattr_destroy", (void*)wrap_lcxx_pthread_condattr_destroy},
     {"_pthread_condattr_init", (void*)wrap_lcxx_pthread_condattr_init},
     {"_signal", (void*)wrap_lcxx_signal},
+    {"_objc_retain", (void*)wrap_objc_retain},
+    {"_objc_release", (void*)wrap_objc_release},
+    {"_objc_autorelease", (void*)wrap_objc_autorelease},
+    {"_objc_retainAutorelease", (void*)wrap_objc_retainAutorelease},
+    {"_objc_retainAutoreleaseReturnValue", (void*)wrap_objc_retainAutoreleaseReturnValue},
+    {"_objc_retainAutoreleasedReturnValue", (void*)wrap_objc_retainAutoreleasedReturnValue},
+    {"_objc_autoreleaseReturnValue", (void*)wrap_objc_autoreleaseReturnValue},
+    {"_objc_unsafeClaimAutoreleasedReturnValue", (void*)wrap_objc_unsafeClaimAutoreleasedReturnValue},
+    {"_objc_storeStrong", (void*)wrap_objc_storeStrong},
+    {"_objc_storeWeak", (void*)wrap_objc_storeWeak},
+    {"_objc_initWeak", (void*)wrap_objc_initWeak},
+    {"_objc_loadWeak", (void*)wrap_objc_loadWeak},
+    {"_objc_loadWeakRetained", (void*)wrap_objc_loadWeakRetained},
+    {"_objc_destroyWeak", (void*)wrap_objc_destroyWeak},
+    {"_objc_autoreleasePoolPush", (void*)wrap_objc_autoreleasePoolPush},
+    {"_objc_autoreleasePoolPop", (void*)wrap_objc_autoreleasePoolPop},
 };
 
 // Контейнеры для сортировки (map сам сортирует ключи по алфавиту)
