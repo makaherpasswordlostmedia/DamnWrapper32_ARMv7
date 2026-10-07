@@ -825,6 +825,7 @@ std::map<int, void*> g_pointerToUI;
 void* g_mainView = nullptr;
 bool g_touchTrace = false;
 void* g_presentedView = nullptr;
+void* g_hleRootVC = nullptr;   // корневой контроллер окна: ему нужен viewDidLayoutSubviews
 std::vector<void*> g_modalStack;   // модалки складываются стопкой, как в UIKit
 std::vector<void*> g_modalPresenters;          // кто показал каждую модалку
 std::map<void*, void*> g_presentedByVC;        // контроллер -> его текущая модалка
@@ -8119,6 +8120,18 @@ void* FindMethodIMP(uint32_t class_ptr, const char* selName) {
     return nullptr;
 }
 
+// UIKit зовёт viewDidLayoutSubviews у контроллера после layout его вью. Без этого вью,
+// которые контроллер раскладывает руками (меню WL4), остаются размером 0x0 и не видны.
+static void HLE_VCDidLayout(void* vc) {
+    if (!vc || (uintptr_t)vc < 0x1000) return;
+    uint32_t isa = ((uint32_t*)vc)[0];
+    if (void* imp = FindMethodIMP(isa, "viewDidLayoutSubviews")) {
+        LogToJava("HLE: Автоматический вызов [VC viewDidLayoutSubviews]");
+        typedef void (*F)(void*, const char*);
+        ((F)imp)(vc, "viewDidLayoutSubviews");
+    }
+}
+
 void* GetNSValuePtr(void* nsvalue) { return (void*)((uint32_t*)nsvalue)[1]; }
 
 // --- HELPER: Поиск ближайшего системного класса (HLE) в дереве наследования ---
@@ -9893,7 +9906,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "bytes") == 0 || strcmp(op, "length") == 0) return 0;
         }
         if (clsName == "NSData") {
-            if (strcmp(op, "dataWithContentsOfFile:") == 0 || strcmp(op, "dataWithContentsOfMappedFile:") == 0) {
+            if (strcmp(op, "dataWithContentsOfFile:") == 0 || strcmp(op, "dataWithContentsOfMappedFile:") == 0 ||
+                strcmp(op, "dataWithContentsOfFile:options:error:") == 0) {
                 std::string path = GetNSString(a1);
                 std::vector<unsigned char> raw;
                 if (!VfsReadFileAny(path, raw)) return 0;
@@ -9989,6 +10003,8 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                         LogToJava("HLE: Автоматический вызов [RootView layoutSubviews]");
                         Stub_objc_msgSend(g_mainView, "layoutSubviews", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                     }
+                    g_hleRootVC = a1;
+                    HLE_VCDidLayout(a1);
                     void* impVDA = FindMethodIMP(vcIsa, "viewDidAppear:");
                     if (impVDA) {
                         LogToJava("HLE: Автоматический вызов [RootVC viewDidAppear:]");
@@ -11765,7 +11781,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (strcmp(op, "setView:") == 0) {
             g_viewControllersViews[self] = a1; if (cName == "MainViewController") g_mainView = a1; return 0;
         }
-                if (strcmp(op, "presentModalViewController:animated:") == 0) {
+                if (strcmp(op, "presentModalViewController:animated:") == 0 || strcmp(op, "presentViewController:animated:completion:") == 0) {
             std::lock_guard<std::recursive_mutex> lock(g_uiTreeMutex);
             void* modalVC = a1;
             // UIKit не даёт контроллеру показать вторую модалку поверх своей же:
@@ -11783,6 +11799,16 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             g_modalPresenters.push_back(self);
 
             uint32_t modalIsa = ((uint32_t*)modalVC)[0];
+            // Порядок UIKit: viewWillAppear: -> layout -> viewDidAppear:. GameViewController
+            // запускает CADisplayLink именно в viewWillAppear:.
+            if (void* impVWA = FindMethodIMP(modalIsa, "viewWillAppear:")) {
+                LogToJava("HLE: Calling viewWillAppear: for Modal");
+                typedef void (*VWAFunc)(void*, const char*, uint32_t);
+                ((VWAFunc)impVWA)(modalVC, "viewWillAppear:", 1);
+            }
+            if (modalView && FindMethodIMP(((uint32_t*)modalView)[0], "layoutSubviews"))
+                Stub_objc_msgSend(modalView, "layoutSubviews", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            HLE_VCDidLayout(modalVC);
             void* impVDA = FindMethodIMP(modalIsa, "viewDidAppear:");
             if (impVDA) {
                 LogToJava("HLE: Calling viewDidAppear: for Modal");
@@ -11792,7 +11818,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return 0;
         }
 
-        if (strcmp(op, "dismissModalViewControllerAnimated:") == 0) {
+        if (strcmp(op, "dismissModalViewControllerAnimated:") == 0 || strcmp(op, "dismissViewControllerAnimated:completion:") == 0) {
             std::lock_guard<std::recursive_mutex> lock(g_uiTreeMutex);
             if (!g_modalStack.empty()) g_modalStack.pop_back();
             if (!g_modalPresenters.empty()) {
@@ -13349,6 +13375,7 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
             LogToJava("HLE: Повторный layoutSubviews после активации приложения.");
             Stub_objc_msgSend(g_mainView, "layoutSubviews", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         }
+        HLE_VCDidLayout(g_hleRootVC);
 
         // Отправляем нотификации (некоторые движки подписываются на них вместо делегата)
         uint32_t* actNotifInst = (uint32_t*)calloc(1, 32);
