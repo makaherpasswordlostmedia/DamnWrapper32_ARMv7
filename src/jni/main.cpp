@@ -215,6 +215,7 @@ pthread_t g_iosMainThread;
 struct MainQueueItem { void* target; const char* sel; void* arg; void* arg2; bool isInput; };
 std::vector<MainQueueItem> g_mainQueue;
 pthread_mutex_t g_mainQueueMutex = PTHREAD_MUTEX_INITIALIZER;
+void* g_wl4Session = nullptr;   // WL4Session.shared: подхватывается при первом нативном вызове
 
 std::string SimpleHTTP(const std::string& method) {
     // Симуляция отсутствия сети: блокируем реальный HTTP запрос, 
@@ -7904,6 +7905,80 @@ void UpdateTextCache(void* view, const std::string& text, float logicalH) {
 // ==========================================
 
 std::string GetObjCClassName(void* obj);   // ВРЕМЕННОЕ: для диагностики Asphalt 6
+// ---- Экранный пад WL4 (PadView) ----
+// Нативный PadView опирается на NSMutableSet/UITouch.locationInView:/drawRect, которых в HLE
+// нет: его layoutSubviews не зовётся, касания никуда не доходят и рисовать кнопки нечем.
+// Поэтому пад считаем и рисуем здесь, а маску кнопок отдаём в [WL4Session setTouchKeys:].
+struct PadBtn { uint16_t key; float cx, cy, r; const char* label; };
+static bool  g_padValid = false;
+static float g_padX = 0, g_padY = 0, g_padW = 0, g_padH = 0;
+static uint16_t g_padMask = 0;
+static std::map<int, std::pair<float,float>> g_padTouches;
+
+static void HLE_PadLayout(float w, float h, PadBtn* b) {
+    // Порядок и геометрия повторяют PadView.m (бит клавиши по GBA KEYINPUT).
+    const uint16_t keys[10] = {64, 128, 32, 16, 1, 2, 512, 256, 8, 4};
+    const char* labels[10] = {"^", "v", "<", ">", "A", "B", "L", "R", "START", "SEL"};
+    for (int i = 0; i < 10; i++) { b[i].key = keys[i]; b[i].label = labels[i]; }
+    float u = std::min(w, h) / 7.0f;
+    auto P = [&](int i, float x, float y, float r) { b[i].cx = x; b[i].cy = y; b[i].r = r; };
+    if (w > h) {
+        float cx = 1.9f * u, cy = h - 2.4f * u;
+        P(0, cx, cy - 1.2f * u, 0.7f * u); P(1, cx, cy + 1.2f * u, 0.7f * u);
+        P(2, cx - 1.2f * u, cy, 0.7f * u); P(3, cx + 1.2f * u, cy, 0.7f * u);
+        P(4, w - 1.2f * u, h - 2.7f * u, 0.8f * u); P(5, w - 2.9f * u, h - 1.5f * u, 0.8f * u);
+        P(6, 1.0f * u, 0.8f * u, 0.6f * u); P(7, w - 1.0f * u, 0.8f * u, 0.6f * u);
+        P(9, w / 2 - 1.1f * u, h - 0.7f * u, 0.5f * u); P(8, w / 2 + 1.1f * u, h - 0.7f * u, 0.5f * u);
+    } else {
+        float gameBottom = 160.0f * (w / 240.0f);
+        float region = h - gameBottom, cx = 2.0f * u, cy = gameBottom + region * 0.55f;
+        P(6, 1.0f * u, gameBottom + 0.9f * u, 0.6f * u); P(7, w - 1.0f * u, gameBottom + 0.9f * u, 0.6f * u);
+        P(0, cx, cy - 1.2f * u, 0.7f * u); P(1, cx, cy + 1.2f * u, 0.7f * u);
+        P(2, cx - 1.2f * u, cy, 0.7f * u); P(3, cx + 1.2f * u, cy, 0.7f * u);
+        P(4, w - 1.3f * u, cy - 0.7f * u, 0.8f * u); P(5, w - 3.0f * u, cy + 0.5f * u, 0.8f * u);
+        P(9, w / 2 - 1.1f * u, h - 0.8f * u, 0.5f * u); P(8, w / 2 + 1.1f * u, h - 0.8f * u, 0.5f * u);
+    }
+}
+
+static void HLE_DrawPad(float x, float y, float w, float h) {
+    g_padValid = true; g_padX = x; g_padY = y; g_padW = w; g_padH = h;
+    PadBtn b[10]; HLE_PadLayout(w, h, b);
+    for (int i = 0; i < 10; i++) {
+        bool down = (g_padMask & b[i].key) != 0;
+        float a = down ? 0.55f : 0.22f;
+        CPUDrawSolidRect(x + b[i].cx - b[i].r, y + b[i].cy - b[i].r, 2 * b[i].r, 2 * b[i].r, 1.0f, 1.0f, 1.0f, a, b[i].r);
+        if (g_fontLoaded) {
+            void* key = (void*)(uintptr_t)(0xDEB100 + i);
+            float fs = strlen(b[i].label) > 2 ? b[i].r * 0.6f : b[i].r * 0.9f;
+            UpdateTextCache(key, b[i].label, fs);
+            auto& cache = g_uiTextCache[key];
+            if (!cache.bitmap.empty())
+                CPUDrawText(x + b[i].cx - cache.width / 2.0f, y + b[i].cy - cache.height / 2.0f, (float)cache.width, (float)cache.height, 1.0f, 1.0f, 1.0f, cache);
+        }
+    }
+}
+
+// Касание -> маска кнопок -> [WL4Session setTouchKeys:] через очередь главного потока.
+static void HLE_PadTouch(int action, int pointerId, float x, float y) {
+    if (!g_padValid || !g_wl4Session) return;
+    if (action == 0 || action == 5 || action == 2) g_padTouches[pointerId] = {x, y};
+    else if (action == 1 || action == 6 || action == 3) g_padTouches.erase(pointerId);
+    PadBtn b[10]; HLE_PadLayout(g_padW, g_padH, b);
+    uint16_t m = 0;
+    for (auto const& t : g_padTouches) {
+        float px = t.second.first - g_padX, py = t.second.second - g_padY;
+        for (int i = 0; i < 10; i++) {
+            float dx = px - b[i].cx, dy = py - b[i].cy, rr = b[i].r * 1.25f;
+            if (dx * dx + dy * dy <= rr * rr) m |= b[i].key;
+        }
+    }
+    if (m == g_padMask) return;
+    g_padMask = m;
+    pthread_mutex_lock(&g_mainQueueMutex);
+    g_mainQueue.push_back({g_wl4Session, "setTouchKeys:", (void*)(uintptr_t)m, nullptr, false});
+    pthread_mutex_unlock(&g_mainQueueMutex);
+}
+
 void DrawViewRecursive(void* view, float parentX, float parentY, bool isRoot = false) {
     if (!view || !g_views.count(view)) return;
     auto& v = g_views[view];
@@ -8037,6 +8112,9 @@ void DrawViewRecursive(void* view, float parentX, float parentY, bool isRoot = f
     if (g_layerW > 0 && w > 100.0f && h > 100.0f && GetObjCClassName(view) == "GameView")
         HLE_BlitLayerFrame(x, y, w, h);
 
+    if (w > 100.0f && h > 100.0f && GetObjCClassName(view) == "PadView")
+        HLE_DrawPad(x, y, w, h);
+
     for (void* child : v.children) {
         DrawViewRecursive(child, x, y);
     }
@@ -8052,6 +8130,7 @@ static int CountSubtree(void* v, int depth) {   // ВРЕМЕННЫЙ
 
 void RenderHLEUI() {
     std::lock_guard<std::recursive_mutex> lock(g_uiTreeMutex);
+    g_padValid = false;
     void* activeView = g_presentedView ? g_presentedView : g_mainView;
     if (A6_DEBUG_LOG) {   // счётчики UITableView: меню Asphalt 6 строится на нём
         static int frame = 0;
@@ -11864,6 +11943,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         }
 
         void* imp = FindMethodIMP(isa, op);
+        if (cName == "WL4Session") g_wl4Session = self;
         if (imp) {
             LogToJava("OBJC-NATIVE-FORWARD: [" + cName + " " + std::string(op) + "]");
 #if defined(__arm__)
@@ -22774,6 +22854,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_damnwrapper32armv7_xaview_MainActivit
     bool isUp = (actionMasked == 1 || actionMasked == 6);
     bool isMove = (actionMasked == 2);
     bool isCancel = (actionMasked == 3);
+    HLE_PadTouch((int)actionMasked, (int)pointerId, x, y);
 
     // =====================================
     // ПРОСЧЕТ НАЖАТИЙ НА НАШ КАСТОМНЫЙ UI
