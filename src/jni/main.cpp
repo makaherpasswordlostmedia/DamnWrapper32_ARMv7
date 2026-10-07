@@ -21,6 +21,8 @@
 #include <signal.h>
 #include <ucontext.h>
 #include <map>
+#include <unordered_map>
+#include <algorithm>
 #include <set>
 #include <unordered_set>
 #include <sys/socket.h>
@@ -563,6 +565,7 @@ struct CGState {
 
 struct HLE_CGContext {
     int width; int height; int bpp; void* data;
+    int bytesPerRow = 0; uint32_t bitmapInfo = 0;
     std::vector<CGState> stateStack;
     CGState currentState;
     std::vector<CGPathElement> currentPath;
@@ -581,6 +584,69 @@ struct HLE_CGImage { int width; int height; int bpp; void* data; };
 struct HLE_CGColor { float components[4]; };
 
 bool g_cpuBufferDirty = false;
+
+// --- CALayer.contents -> CPU-буфер ---
+// Игры вроде Wario Land 4 (ioslegacy) рисуют кадр в CGBitmapContext и отдают его через
+// [CALayer setContents:CGImage]. Раньше метод падал в "Unimplemented HLE Class Method",
+// кадр не доходил до экрана, и оставался чёрный фон.
+static std::vector<uint32_t> g_layerFrame;   // RGBA (R в младшем байте), как в g_cpuColorBuffer
+static int g_layerW = 0, g_layerH = 0;
+static pthread_mutex_t g_layerMutex = PTHREAD_MUTEX_INITIALIZER;
+static std::unordered_map<void*, uint32_t> g_cgImageInfo;   // CGImage* -> bitmapInfo контекста
+static pthread_mutex_t g_cgImageInfoMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void HLE_LayerSetContents(void* cgImage) {
+    if (!cgImage || (uintptr_t)cgImage < 0x1000) return;
+    HLE_CGImage* img = (HLE_CGImage*)cgImage;
+    if (img->width <= 0 || img->height <= 0 || img->width > 4096 || img->height > 4096 || !img->data) return;
+    uint32_t info = 0;
+    bool known = false;
+    pthread_mutex_lock(&g_cgImageInfoMutex);
+    auto it = g_cgImageInfo.find(cgImage);
+    if (it != g_cgImageInfo.end()) { info = it->second; known = true; }
+    pthread_mutex_unlock(&g_cgImageInfoMutex);
+
+    // Позиции R,G,B в 4 байтах памяти. По умолчанию (изображения из stb) — RGBA.
+    int rOff = 0, gOff = 1, bOff = 2;
+    if (known) {
+        uint32_t alpha = info & 0x1F;                 // CGImageAlphaInfo
+        bool alphaFirst = (alpha == 2 || alpha == 4 || alpha == 6);
+        bool little32 = (info & 0x7000) == 0x2000;    // kCGBitmapByteOrder32Little
+        if (alphaFirst && little32)       { rOff = 2; gOff = 1; bOff = 0; }   // BGRA в памяти
+        else if (alphaFirst && !little32) { rOff = 1; gOff = 2; bOff = 3; }   // ARGB в памяти
+        else if (!alphaFirst && little32) { rOff = 3; gOff = 2; bOff = 1; }   // ABGR в памяти
+    }
+    pthread_mutex_lock(&g_layerMutex);
+    g_layerFrame.resize((size_t)img->width * img->height);
+    const uint8_t* src = (const uint8_t*)img->data;
+    for (size_t i = 0, n = g_layerFrame.size(); i < n; i++, src += 4)
+        g_layerFrame[i] = 0xFF000000u | ((uint32_t)src[bOff] << 16) | ((uint32_t)src[gOff] << 8) | src[rOff];
+    g_layerW = img->width; g_layerH = img->height;
+    pthread_mutex_unlock(&g_layerMutex);
+}
+
+// Рисует последний кадр слоя в прямоугольник (x,y,w,h) CPU-буфера: по центру, с сохранением
+// пропорций (letterbox), ближайший сосед — пиксели GBA остаются чёткими.
+static void HLE_BlitLayerFrame(float rx, float ry, float rw, float rh) {
+    if (g_layerW <= 0 || g_layerH <= 0 || rw < 1.0f || rh < 1.0f) return;
+    if (g_cpuColorBuffer.size() != (size_t)g_surfaceWidth * g_surfaceHeight) return;
+    pthread_mutex_lock(&g_layerMutex);
+    float sc = std::min(rw / (float)g_layerW, rh / (float)g_layerH);
+    int dw = (int)((float)g_layerW * sc), dh = (int)((float)g_layerH * sc);
+    int dx0 = (int)rx + ((int)rw - dw) / 2, dy0 = (int)ry + ((int)rh - dh) / 2;
+    for (int y = 0; y < dh; y++) {
+        int dy = dy0 + y; if (dy < 0 || dy >= g_surfaceHeight) continue;
+        int sy = y * g_layerH / dh;
+        const uint32_t* srow = &g_layerFrame[(size_t)sy * g_layerW];
+        uint32_t* drow = &g_cpuColorBuffer[(size_t)dy * g_surfaceWidth];
+        for (int x = 0; x < dw; x++) {
+            int dx = dx0 + x; if (dx < 0 || dx >= g_surfaceWidth) continue;
+            drow[dx] = srow[x * g_layerW / dw];
+        }
+    }
+    pthread_mutex_unlock(&g_layerMutex);
+    g_cpuBufferDirty = true;
+}
 
 void CPUDrawPixel(int x, int y, uint32_t color) {
     if (x >= 0 && x < g_surfaceWidth && y >= 0 && y < g_surfaceHeight) {
@@ -7965,6 +8031,11 @@ void DrawViewRecursive(void* view, float parentX, float parentY, bool isRoot = f
         CPUDrawLine((int)x, (int)(y + h - 1), (int)(x + w), (int)(y + h - 1), 0xFF888888);
     }
 
+    // Кадр игры приходит через CALayer.contents: рисуем его поверх фона GameView,
+    // но под дочерними вью (экранный пад и т.п.).
+    if (g_layerW > 0 && w > 100.0f && h > 100.0f && GetObjCClassName(view) == "GameView")
+        HLE_BlitLayerFrame(x, y, w, h);
+
     for (void* child : v.children) {
         DrawViewRecursive(child, x, y);
     }
@@ -9839,6 +9910,14 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             }
         }
         // -----------------------------
+
+        if (clsName == "CALayer") {
+            if (strcmp(op, "setContents:") == 0) { HLE_LayerSetContents(a1); return 0; }
+            if (strcmp(op, "contents") == 0) return 0;
+            if (strcmp(op, "setContentsGravity:") == 0 || strcmp(op, "setMagnificationFilter:") == 0 ||
+                strcmp(op, "setMinificationFilter:") == 0 || strcmp(op, "addSublayer:") == 0 ||
+                strcmp(op, "setFrame:") == 0) return 0;
+        }
 
         if (strcmp(op, "class") == 0) return (uint64_t)(uintptr_t)self;
         
@@ -13635,6 +13714,8 @@ extern "C" {
 extern "C" void* wrap_CGBitmapContextCreate(void* data, size_t width, size_t height, size_t bitsPerComponent, size_t bytesPerRow, void* space, uint32_t bitmapInfo) {
     HLE_CGContext* ctx = new HLE_CGContext();
     ctx->width = width; ctx->height = height; ctx->bpp = bitsPerComponent;
+    if (bytesPerRow == 0) bytesPerRow = width * 4;
+    ctx->bytesPerRow = (int)bytesPerRow; ctx->bitmapInfo = bitmapInfo;
     ctx->data = data ? data : calloc(1, bytesPerRow * height);
     LogToJava("HLE: CGBitmapContextCreate(" + std::to_string(width) + "x" + std::to_string(height) + ") -> " + std::to_string((uintptr_t)ctx));
     return ctx;
@@ -13646,7 +13727,19 @@ extern "C" void* wrap_CGBitmapContextGetData(void* ctx) {
 extern "C" void* wrap_CGBitmapContextCreateImage(void* c) {
     if (!c) return nullptr;
     HLE_CGContext* ctx = (HLE_CGContext*)c;
-    HLE_CGImage* img = new HLE_CGImage{ctx->width, ctx->height, ctx->bpp, ctx->data};
+    // Снимок пикселей, а не ссылка на буфер контекста: CGImageRelease освобождает data,
+    // и раньше после первого же кадра игра писала в уже освобождённую память.
+    int bpr = ctx->bytesPerRow > 0 ? ctx->bytesPerRow : ctx->width * 4;
+    uint8_t* copy = (uint8_t*)malloc((size_t)ctx->width * 4 * ctx->height);
+    if (!copy) return nullptr;
+    if (ctx->data) {
+        for (int y = 0; y < ctx->height; y++)
+            memcpy(copy + (size_t)y * ctx->width * 4, (uint8_t*)ctx->data + (size_t)y * bpr, (size_t)ctx->width * 4);
+    } else memset(copy, 0, (size_t)ctx->width * 4 * ctx->height);
+    HLE_CGImage* img = new HLE_CGImage{ctx->width, ctx->height, ctx->bpp, copy};
+    pthread_mutex_lock(&g_cgImageInfoMutex);
+    g_cgImageInfo[img] = ctx->bitmapInfo;
+    pthread_mutex_unlock(&g_cgImageInfoMutex);
     return img;
 }
 extern "C" size_t wrap_CGImageGetWidth(void* image) { return image ? ((HLE_CGImage*)image)->width : 0; }
@@ -13675,6 +13768,9 @@ extern "C" void wrap_CGContextRelease(void* c) {
 extern "C" void wrap_CGImageRelease(void* image) { 
     if (image) {
         HLE_CGImage* img = (HLE_CGImage*)image;
+        pthread_mutex_lock(&g_cgImageInfoMutex);
+        g_cgImageInfo.erase(img);
+        pthread_mutex_unlock(&g_cgImageInfoMutex);
         if (img->data) stbi_image_free(img->data);
         delete img;
     }
