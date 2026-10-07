@@ -8132,6 +8132,37 @@ static void HLE_VCDidLayout(void* vc) {
     }
 }
 
+// Форматтер для stringWithFormat: понимает флаги, ширину и точность (%.4s, %02d, %-8s),
+// а также %@ %d %i %u %x %X %c %s %p %%. Старый разбирал только "%" + одну букву, и
+// [NSString stringWithFormat:@"%.4s", code] отдавал литерал "%.4s": CheckRom() у WL4
+// никогда не совпадал с кодом игры.
+static std::string HLE_FormatObjC(const std::string& fmt, void** args, int nargs) {
+    std::string res; int ai = 0;
+    for (size_t i = 0; i < fmt.size(); i++) {
+        if (fmt[i] != '%' || i + 1 >= fmt.size()) { res += fmt[i]; continue; }
+        if (fmt[i+1] == '%') { res += '%'; i++; continue; }
+        size_t j = i + 1; std::string spec = "%";
+        while (j < fmt.size() && strchr("-+ #0", fmt[j])) spec += fmt[j++];
+        while (j < fmt.size() && isdigit((unsigned char)fmt[j])) spec += fmt[j++];
+        if (j < fmt.size() && fmt[j] == '.') { spec += fmt[j++]; while (j < fmt.size() && isdigit((unsigned char)fmt[j])) spec += fmt[j++]; }
+        while (j < fmt.size() && strchr("lhqzt", fmt[j])) j++;
+        if (j >= fmt.size()) { res += fmt.substr(i); break; }
+        char t = fmt[j];
+        void* arg = ai < nargs ? args[ai++] : nullptr;
+        char buf[512];
+        if (t == '@') { std::string v = GetNSString(arg); res += v; }
+        else if (t == 's') { std::string sp = spec + "s"; snprintf(buf, sizeof(buf), sp.c_str(), arg ? (const char*)arg : "(null)"); res += buf; }
+        else if (t == 'd' || t == 'i') { std::string sp = spec + "d"; snprintf(buf, sizeof(buf), sp.c_str(), (int)(intptr_t)arg); res += buf; }
+        else if (t == 'u') { std::string sp = spec + "u"; snprintf(buf, sizeof(buf), sp.c_str(), (unsigned)(uintptr_t)arg); res += buf; }
+        else if (t == 'x' || t == 'X' || t == 'o') { std::string sp = spec; sp += t; snprintf(buf, sizeof(buf), sp.c_str(), (unsigned)(uintptr_t)arg); res += buf; }
+        else if (t == 'c') { res += (char)(uintptr_t)arg; }
+        else if (t == 'p') { snprintf(buf, sizeof(buf), "0x%lx", (unsigned long)(uintptr_t)arg); res += buf; }
+        else { res += fmt.substr(i, j - i + 1); }
+        i = j;
+    }
+    return res;
+}
+
 void* GetNSValuePtr(void* nsvalue) { return (void*)((uint32_t*)nsvalue)[1]; }
 
 // --- HELPER: Поиск ближайшего системного класса (HLE) в дереве наследования ---
@@ -9739,18 +9770,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "NSString" && strcmp(op, "stringWithFormat:") == 0) {
             std::string fmt = GetNSString(a1);
             void* args[] = {a2, a3, a4, a5};
-            int argIdx = 0; std::string res = "";
-            for (size_t i = 0; i < fmt.length(); i++) {
-                if (fmt[i] == '%' && i + 1 < fmt.length()) {
-                    char type = fmt[i+1];
-                    void* arg = argIdx < 4 ? args[argIdx++] : nullptr;
-                    if (type == '@') res += GetNSString(arg);
-                    else if (type == 'd' || type == 'i') res += std::to_string((int)(uintptr_t)arg);
-                    else if (type == 's') res += arg ? (const char*)arg : "null";
-                    else { res += "%"; res += type; }
-                    i++;
-                } else res += fmt[i];
-            }
+            std::string res = HLE_FormatObjC(fmt, args, 4);
             return (uint64_t)(uintptr_t)CreateNSString(res);
         }
 
@@ -11194,18 +11214,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             if (strcmp(op, "stringWithFormat:") == 0) {
                 std::string fmt = GetNSString(a1);
                 void* args[] = {a2, a3, a4, a5};
-                int argIdx = 0; std::string res = "";
-                for (size_t i = 0; i < fmt.length(); i++) {
-                    if (fmt[i] == '%' && i + 1 < fmt.length()) {
-                        char type = fmt[i+1];
-                        void* arg = argIdx < 4 ? args[argIdx++] : nullptr;
-                        if (type == '@') res += GetNSString(arg);
-                        else if (type == 'd' || type == 'i') res += std::to_string((int)(uintptr_t)arg);
-                        else if (type == 's') res += arg ? (const char*)arg : "null";
-                        else { res += "%"; res += type; }
-                        i++;
-                    } else res += fmt[i];
-                }
+                std::string res = HLE_FormatObjC(fmt, args, 4);
                 return (uint64_t)(uintptr_t)CreateNSString(res);
             }
             if (strcmp(op, "stringByReplacingOccurrencesOfString:withString:") == 0) {
