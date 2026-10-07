@@ -799,6 +799,19 @@ void LoadUserDefaults();
 void SaveUserDefaults();
 
 struct NSFastEnumerationState { unsigned long state; void** itemsPtr; unsigned long* mutationsPtr; unsigned long extra[5]; };
+// Безопасный ответ на fast enumeration для получателей без собственной коллекции:
+// как для пустого массива — 0 элементов, но state/mutationsPtr валидны, чтобы код игры
+// (ARC-цикл for-in читает *mutationsPtr) не разыменовывал NULL.
+static unsigned long HLE_EmptyFastEnum(void* stateArg) {
+    if (stateArg) {
+        NSFastEnumerationState* st = (NSFastEnumerationState*)stateArg;
+        static unsigned long s_emptyMut = 0;
+        st->state = 0;
+        st->itemsPtr = nullptr;
+        st->mutationsPtr = &s_emptyMut;
+    }
+    return 0;
+}
 struct FakeUITouch { uint32_t isa; const char* className; float x; float y; void* view; uint32_t touchId; int phase; };
 struct FakeNSSet { uint32_t isa; const char* className; std::vector<void*> touches; };
 struct FakeUIEvent { uint32_t isa; const char* className; void* touchSet; };
@@ -9319,6 +9332,31 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             else if (clsName.find("UI") == 0) g_views[inst].type = clsName;
             return (uint64_t)(uintptr_t)inst;
         }
+        if (clsName == "GCController") {
+            // На Android физических MFi-контроллеров в HLE нет: +controllers — настоящий пустой NSArray.
+            // Раньше срабатывал общий fallback "return self", и игра перечисляла сам класс как массив.
+            if (strcmp(op, "controllers") == 0) {
+                uint32_t* arr = (uint32_t*)calloc(1, 32);
+                auto it = g_hleClasses.find("NSArray");
+                arr[0] = (uint32_t)(uintptr_t)(it != g_hleClasses.end() ? (void*)it->second : self);
+                g_arrays[arr].clear();
+                return (uint64_t)(uintptr_t)arr;
+            }
+            // Поиск беспроводных контроллеров: на Android HLE-слоя MFi нет, поэтому поиск
+            // завершается сразу без найденных устройств — ровно как на iOS, когда рядом
+            // никого нет. Handler обязан быть вызван (игры ждут его, чтобы снять "поиск...").
+            if (strcmp(op, "startWirelessControllerDiscoveryWithCompletionHandler:") == 0) {
+                if (a1) {
+                    uint32_t* block = (uint32_t*)a1;
+                    typedef void (*BlockInvoke)(void*);
+                    BlockInvoke invoke = (BlockInvoke)block[3];
+                    if (invoke) invoke(block);
+                }
+                return 0;
+            }
+            if (strcmp(op, "stopWirelessControllerDiscovery") == 0) return 0; // активного поиска нет — отменять нечего
+            if (strcmp(op, "countByEnumeratingWithState:objects:count:") == 0) return HLE_EmptyFastEnum(a1);
+        }
         if (strcmp(op, "buttonWithType:") == 0) {
             uint32_t* inst = (uint32_t*)calloc(1, 32); inst[0] = (uint32_t)self; 
             g_views[inst].type = "UIButton"; return (uint64_t)(uintptr_t)inst;
@@ -9804,6 +9842,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
 
         if (strcmp(op, "class") == 0) return (uint64_t)(uintptr_t)self;
         
+        if (strcmp(op, "countByEnumeratingWithState:objects:count:") == 0) return HLE_EmptyFastEnum(a1);
         char ptrStr[32]; snprintf(ptrStr, sizeof(ptrStr), "0x%lx", (unsigned long)(uintptr_t)self);
         LogToJava(std::string("OBJC-TODO: Unimplemented HLE Class Method +[(") + clsName + "*) " + ptrStr + " " + std::string(op) + "]");
         return (uint64_t)(uintptr_t)self; 
@@ -11495,6 +11534,7 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return 0;
         }
 
+        if (strcmp(op, "countByEnumeratingWithState:objects:count:") == 0) return HLE_EmptyFastEnum(a1);
         char ptrStr[32]; snprintf(ptrStr, sizeof(ptrStr), "0x%lx", (unsigned long)(uintptr_t)self);
         LogToJava(std::string("OBJC-TODO: Unimplemented HLE Instance Method -[(") + clsName + "*) " + ptrStr + " " + std::string(op) + "]");
         return (uint64_t)(uintptr_t)self;
