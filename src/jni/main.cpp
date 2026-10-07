@@ -13103,9 +13103,25 @@ extern "C" void* wrap_NSAllocateObject(void* aClass, uint32_t extraBytes, void* 
     return instance;
 }
 
+// cls здесь — сам объект класса, а не экземпляр: GetObjCClassName идёт по isa и для класса
+// возвращал имя корневого метакласса ("NSObject(instance)"). Из-за этого UIApplicationMain
+// не находил AppDelegate, игра минует меню и ядро WL4 никогда не стартует (чёрный экран).
+static std::string ClassObjectName(void* cls) {
+    if (!cls || (uintptr_t)cls < 0x1000) return "";
+    uint32_t w0 = 0;
+    if (!SafeRead32((uintptr_t)cls, &w0)) return "";
+    if (w0 == 0xDEADBEEF) return ((HLEClass*)cls)->className;
+    uint32_t bits = 0, namePtr = 0;
+    if (!SafeRead32((uintptr_t)cls + 16, &bits)) return "";
+    uint32_t ro = bits & ~3u;
+    if (ro > 0x1000 && SafeRead32(ro + 16, &namePtr) && namePtr > 0x1000 && isValidString((const char*)namePtr))
+        return std::string((const char*)namePtr);
+    return GetObjCClassName(cls);
+}
+
 extern "C" void* wrap_NSStringFromClass(void* cls) {
     if (!cls) return nullptr;
-    return CreateNSString(GetObjCClassName(cls));
+    return CreateNSString(ClassObjectName(cls));
 }
 
 extern "C" void* wrap_NSStringFromSelector(void* sel) {
@@ -13187,7 +13203,7 @@ extern "C" int Stub_UIApplicationMain(int argc, char *argv[], void* principalCla
     }
     
     uint32_t appDelClassAddr = 0;
-    if (!dName.empty() && dName != "Unknown") {
+    if (!dName.empty() && dName != "Unknown" && dName.find("(instance)") == std::string::npos) {
         appDelClassAddr = (uint32_t)ResolveSymbol("OBJC_CLASS_$_" + dName);
     }
     
