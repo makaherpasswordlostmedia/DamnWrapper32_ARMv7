@@ -16269,6 +16269,16 @@ extern "C" long wrap_ftell(void* fp) {
     if (!real_f) return -1;
     return ftell(real_f); 
 }
+extern "C" void wrap_rewind(void* fp) {
+    FILE* real_f = unwrap_file(fp);
+    if (!real_f) return;
+    fseek(real_f, 0, SEEK_SET);
+    clearerr(real_f);
+}
+extern "C" int wrap_setvbuf(void* fp, char* buf, int mode, size_t size) {
+    (void)buf; (void)mode; (void)size;
+    return unwrap_file(fp) ? 0 : -1;
+}
 extern "C" int wrap_fgetpos(void* fp, uint64_t* pos) {
     FILE* real_f = unwrap_file(fp);
     if (!real_f || !pos) return -1;
@@ -17588,7 +17598,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_D(strcpy), STB_D(strncpy), STB_D(strcmp), STB_D(strncmp), STB_D(strlen), STB_W(strcat), STB_W(strncat), {"_strchr", (void*)(char*(*)(char*, int))strchr}, {"_strrchr", (void*)(char*(*)(char*, int))strrchr}, {"_strstr", (void*)(char*(*)(char*, const char*))strstr},
     STB_D(strdup), STB_D(strcasecmp), STB_D(strncasecmp), STB_D(strcspn), {"_strpbrk", (void*)(char*(*)(char*, const char*))strpbrk},
     STB_D(atoi), STB_D(atof), STB_D(atol), STB_D(strtol), STB_D(strtod), STB_D(strtoul), STB_W(strtoll), STB_W(sprintf), STB_W(snprintf), STB_W(vsprintf), STB_W(vsnprintf), STB_D(sscanf), STB_W(printf), STB_W(puts), STB_D(putchar), STB_W(vprintf), STB_W(vfprintf),
-    STB_W(fopen), STB_W(fclose), STB_W(fread), STB_W(fwrite), STB_W(fseek), STB_W(ftell), STB_W(fgetpos), STB_W(fsetpos), STB_W(fputc), STB_W(fscanf), STB_W(fflush), STB_W(fputs), STB_W(fprintf), STB_W(fgetc), STB_W(fgets), STB_W(feof), STB_W(ferror), STB_W(fileno), {"___srget", (void*)wrap___srget},
+    STB_W(rewind), STB_W(setvbuf), STB_W(fopen), STB_W(fclose), STB_W(fread), STB_W(fwrite), STB_W(fseek), STB_W(ftell), STB_W(fgetpos), STB_W(fsetpos), STB_W(fputc), STB_W(fscanf), STB_W(fflush), STB_W(fputs), STB_W(fprintf), STB_W(fgetc), STB_W(fgets), STB_W(feof), STB_W(ferror), STB_W(fileno), {"___srget", (void*)wrap___srget},
     {"_sqrt", (void*)(double(*)(double))sqrt}, STB_D(sqrtf), {"_pow", (void*)(double(*)(double, double))pow}, STB_D(powf), {"_exp", (void*)(double(*)(double))exp}, STB_D(expf), {"_log", (void*)(double(*)(double))log}, STB_D(logf), {"_log10", (void*)(double(*)(double))log10}, STB_D(log10f), {"_log2", (void*)(double(*)(double))log2}, STB_D(log2f),
     {"_ceil", (void*)(double(*)(double))ceil}, STB_D(ceilf), {"_floor", (void*)(double(*)(double))floor}, STB_D(floorf), {"_round", (void*)(double(*)(double))round}, STB_D(roundf), {"_fmod", (void*)(double(*)(double, double))fmod}, STB_D(fmodf), {"_fmin", (void*)(double(*)(double, double))fmin}, STB_D(fminf), {"_fmax", (void*)(double(*)(double, double))fmax}, STB_D(fmaxf),
     {"_sin", (void*)(double(*)(double))sin}, {"_cos", (void*)(double(*)(double))cos}, {"_tan", (void*)(double(*)(double))tan}, {"_asin", (void*)(double(*)(double))asin}, {"_acos", (void*)(double(*)(double))acos}, {"_atan", (void*)(double(*)(double))atan}, {"_atan2", (void*)(double(*)(double, double))atan2}, STB_D(atan2f), STB_D(atanf),
