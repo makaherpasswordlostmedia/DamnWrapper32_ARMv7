@@ -8109,7 +8109,8 @@ void DrawViewRecursive(void* view, float parentX, float parentY, bool isRoot = f
 
     // Кадр игры приходит через CALayer.contents: рисуем его поверх фона GameView,
     // но под дочерними вью (экранный пад и т.п.).
-    if (g_layerW > 0 && w > 100.0f && h > 100.0f && GetObjCClassName(view) == "GameView")
+    if (g_layerW > 0 && w > 100.0f && h > 100.0f &&
+        (GetObjCClassName(view) == "GameView" || GetObjCClassName(view) == "KVMScreenView"))
         HLE_BlitLayerFrame(x, y, w, h);
 
     if (w > 100.0f && h > 100.0f && GetObjCClassName(view) == "PadView")
@@ -9403,6 +9404,11 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (g_uiColors.count(a1)) { g_views[self].textColor = g_uiColors[a1]; g_views[self].hasTextCol = true; }
         return 0;
     }
+    // [view layer] у нас возвращает сам view, поэтому self.layer.contents = CGImage приходит сюда,
+    // а не в ветку CALayer. Без этого кадр PSPKVM (KVMScreenView) терялся и экран был чёрным.
+    if (strcmp(op, "setContents:") == 0) { HLE_LayerSetContents(a1); return 0; }
+    if (strcmp(op, "setContentsGravity:") == 0 || strcmp(op, "setMagnificationFilter:") == 0 ||
+        strcmp(op, "setMinificationFilter:") == 0 || strcmp(op, "setOpaque:") == 0) return 0;
     if (strcmp(op, "layer") == 0) return (uint64_t)(uintptr_t)self;
     if (strcmp(op, "setCornerRadius:") == 0) {
         float r; uint32_t v = (uint32_t)a1; memcpy(&r, &v, 4); g_views[self].cornerRadius = r; return 0;
@@ -11959,6 +11965,26 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
             return ((MethodType)imp)(self, op, a1, a2, a3, a4, a5, a6, a7, a8);
         }
         
+        // UIKit: -[UIView init] вызывает -initWithFrame:CGRectZero, и это попадает в переопределение
+        // подкласса. Раньше init просто возвращал self, поэтому initWithFrame: игры (KVMScreenView:
+        // CADisplayLink, KVMPadView: кнопки) не выполнялся и экран оставался чёрным.
+        if (strcmp(op, "init") == 0) {
+            void* impFrame = FindMethodIMP(isa, "initWithFrame:");
+            std::string baseSys = GetBaseSystemClassName(isa);
+            if (impFrame && baseSys.compare(0, 2, "UI") == 0) {
+                LogToJava("HLE: [" + cName + " init] -> initWithFrame:CGRectZero (как в UIKit)");
+                static const float kZeroS[4] = {0, 0, 0, 0};
+#if defined(__arm__)
+                asm volatile (
+                    "vldr s0, [%0]\n" "vldr s1, [%0, #4]\n" "vldr s2, [%0, #8]\n" "vldr s3, [%0, #12]\n"
+                    : : "r"(kZeroS) : "s0", "s1", "s2", "s3"
+                );
+#endif
+                typedef uint64_t (*InitFrameType)(void*, const char*, void*, void*, void*, void*, void*, void*, void*, void*);
+                return ((InitFrameType)impFrame)(self, "initWithFrame:", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            }
+        }
+
         if (strncmp(op, "init", 4) == 0 || strcmp(op, "alloc") == 0) return (uint64_t)(uintptr_t)self; 
 
         if (strcmp(op, "touchesBegan:withEvent:") == 0 || strcmp(op, "touchesMoved:withEvent:") == 0 ||
@@ -13910,6 +13936,35 @@ extern "C" void wrap_CGContextRelease(void* c) {
         delete ctx;
     }
 }
+// --- CGDataProvider + CGImageCreate (PSPKVM: KVMScreenView tick: рисует кадр через них) ---
+struct HLE_CGDataProvider { void* info; const void* data; size_t size; };
+extern "C" void* wrap_CGDataProviderCreateWithData(void* info, const void* data, size_t size, void* releaseCb) {
+    HLE_CGDataProvider* p = new HLE_CGDataProvider{info, data, size};
+    return p;
+}
+extern "C" void wrap_CGDataProviderRelease(void* provider) {
+    // releaseCb не зовём: это гостевая функция, а данные принадлежат игре
+    if (provider) delete (HLE_CGDataProvider*)provider;
+}
+extern "C" void* wrap_CGImageCreate(size_t width, size_t height, size_t bitsPerComponent, size_t bitsPerPixel,
+                                    size_t bytesPerRow, void* colorSpace, uint32_t bitmapInfo, void* provider,
+                                    const void* decode, bool shouldInterpolate, int intent) {
+    HLE_CGDataProvider* p = (HLE_CGDataProvider*)provider;
+    if (!p || !p->data || width == 0 || height == 0 || width > 4096 || height > 4096 || bitsPerPixel != 32) return nullptr;
+    size_t bpr = bytesPerRow ? bytesPerRow : width * 4;
+    if (bpr < width * 4 || bpr * height > p->size + bpr) return nullptr;
+    // Снимок пикселей: игра перезаписывает свой буфер, а CGImageRelease освобождает data
+    uint8_t* copy = (uint8_t*)malloc(width * 4 * height);
+    if (!copy) return nullptr;
+    for (size_t y = 0; y < height; y++)
+        memcpy(copy + y * width * 4, (const uint8_t*)p->data + y * bpr, width * 4);
+    HLE_CGImage* img = new HLE_CGImage{(int)width, (int)height, (int)bitsPerComponent, copy};
+    pthread_mutex_lock(&g_cgImageInfoMutex);
+    g_cgImageInfo[img] = bitmapInfo;
+    pthread_mutex_unlock(&g_cgImageInfoMutex);
+    return img;
+}
+
 extern "C" void wrap_CGImageRelease(void* image) { 
     if (image) {
         HLE_CGImage* img = (HLE_CGImage*)image;
@@ -17632,7 +17687,7 @@ std::map<std::string, void*> g_hleStubs = {
  STB_W(CFStringCreateExternalRepresentation), STB_W(CFStringCreateFromExternalRepresentation), STB_W(CFStringCreateWithCStringNoCopy), STB_W(CFStringCreateWithCharacters), STB_W(CFStringGetCharacters), STB_W(CFStringGetMaximumSizeForEncoding), STB_W(CFStringGetTypeID), STB_W(CFURLCreateFromFileSystemRepresentation), STB_W(CFURLCreateStringByAddingPercentEscapes), STB_W(CFURLCreateStringByReplacingPercentEscapes), STB_W(CFURLCreateWithString), STB_W(CFArrayCreate), STB_W(CFArrayCreateMutable), STB_W(CFArrayGetCount), STB_W(CFArrayGetValueAtIndex), STB_W(CFArrayAppendValue), STB_W(CFArrayRemoveAllValues), STB_W(CFDictionaryCreateMutable), STB_W(CFDictionaryGetValue), STB_W(CFDictionarySetValue), STB_W(CFDictionaryRemoveValue), STB_W(CFBundleGetInfoDictionary), STB_W(CFBundleGetMainBundle), STB_W(CFBundleGetIdentifier), STB_W(CFBundleGetValueForInfoDictionaryKey), STB_W(CFBundleCopyResourcesDirectoryURL), STB_W(CFURLCopyFileSystemPath), STB_W(CFURLGetFileSystemRepresentation), STB_W(CFRunLoopGetCurrent), STB_W(CFRunLoopGetMain), STB_W(CFUUIDCreate), STB_W(CFUUIDCreateString), STB_W(CFTimeZoneCopySystem), STB_W(CFTimeZoneCopyDefault), STB_W(CFTimeZoneGetName), STB_W(CFTimeZoneGetSecondsFromGMT), STB_W(CFAbsoluteTimeGetGregorianDate), STB_W(CFAbsoluteTimeGetDayOfWeek), STB_W(CC_MD5), STB_W(CC_SHA1), STB_W(CC_SHA256), STB_W(CCCrypt), STB_W(CCCryptorCreate), STB_W(CCCryptorUpdate), STB_W(CCCryptorFinal), STB_W(CCCryptorRelease), STB_W(CCCryptorGetOutputLength), STB_W(AudioComponentFindNext), STB_W(AudioComponentInstanceNew), STB_W(UIGraphicsGetCurrentContext), STB_W(UIGraphicsPushContext), STB_W(UIGraphicsPopContext), STB_W(UIGraphicsBeginImageContext), STB_W(UIGraphicsEndImageContext), STB_W(UIGraphicsGetImageFromCurrentImageContext), STB_W(UIRectFill), STB_W(UIImagePNGRepresentation), STB_W(NSAllocateObject), STB_W(NSStringFromClass), STB_W(NSStringFromSelector), STB_W(CFBitVectorCreate), STB_W(CFBitVectorCreateMutableCopy), STB_W(CFBitVectorGetBitAtIndex), STB_W(CFBitVectorSetBitAtIndex),
     STB_V(kCFAllocatorDefault), STB_V(kCFAllocatorNull), STB_V(kCFBooleanFalse), STB_V(kCFBooleanTrue), STB_V(kCFErrorDescriptionKey), STB_V(kCFHTTPVersion1_1), STB_V(kCFPreferencesAnyHost), STB_V(kCFPreferencesCurrentUser), STB_V(kCFStreamPropertyHTTPResponseHeader), STB_V(kCFStreamPropertyHTTPShouldAutoredirect), STB_V(kSecAttrAccessGroup), STB_V(kSecAttrAccessible), STB_V(kSecAttrAccessibleWhenUnlocked), STB_V(kSecAttrDescription), STB_V(kSecAttrLabel), STB_V(kSecAttrAccount), STB_V(kSecAttrGeneric), STB_V(kSecAttrService), STB_V(kSecClass), STB_V(kSecClassGenericPassword), STB_V(kSecMatchLimit), STB_V(kSecMatchLimitOne), STB_V(kSecReturnAttributes), STB_V(kSecReturnData), STB_V(kSecValueData), STB_V(kCFRunLoopDefaultMode), STB_V(kCFRunLoopCommonModes), STB_V(kCFTypeArrayCallBacks), STB_V(kCFTypeDictionaryKeyCallBacks), STB_V(kCFTypeDictionaryValueCallBacks), STB_V(kCFBundleIdentifierKey), STB_V(kCFNumberNaN), STB_V(kCFNumberNegativeInfinity), STB_V(kCFNumberPositiveInfinity), {"_ADBannerContentSizeIdentifierLandscape", (void*)&hle_ADBannerContentSizeIdentifierLandscape_ptr}, {"_ADBannerContentSizeIdentifierPortrait", (void*)&hle_ADBannerContentSizeIdentifierPortrait_ptr},
     
-    STB_W(alcOpenDevice), STB_W(alcCreateContext), STB_W(alcMakeContextCurrent), STB_W(alGenSources), STB_W(alGenBuffers), STB_W(alSourcei), STB_W(alSourcef), STB_W(alBufferData), STB_W(alSourceQueueBuffers), STB_W(alSourcePlay), STB_W(alSourceStop), STB_W(alDeleteBuffers), STB_W(alDeleteSources), STB_W(alGetSourcei), STB_W(alListenerf), STB_W(alSource3f), STB_W(alcCloseDevice), STB_W(alcDestroyContext), STB_W(alcGetString), STB_W(alcProcessContext), STB_W(alcSuspendContext), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGImageGetBitsPerPixel), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
+    STB_W(alcOpenDevice), STB_W(alcCreateContext), STB_W(alcMakeContextCurrent), STB_W(alGenSources), STB_W(alGenBuffers), STB_W(alSourcei), STB_W(alSourcef), STB_W(alBufferData), STB_W(alSourceQueueBuffers), STB_W(alSourcePlay), STB_W(alSourceStop), STB_W(alDeleteBuffers), STB_W(alDeleteSources), STB_W(alGetSourcei), STB_W(alListenerf), STB_W(alSource3f), STB_W(alcCloseDevice), STB_W(alcDestroyContext), STB_W(alcGetString), STB_W(alcProcessContext), STB_W(alcSuspendContext), STB_W(AudioServicesPlaySystemSound), STB_W(AudioServicesCreateSystemSoundID), STB_W(AudioServicesDisposeSystemSoundID), STB_W(CGBitmapContextCreate), STB_W(CGBitmapContextCreateImage), STB_W(CGBitmapContextGetData), STB_W(CGColorSpaceCreateDeviceRGB), STB_W(CGColorSpaceRelease), STB_W(CGContextDrawImage), STB_W(CGImageGetHeight), STB_W(CGImageGetWidth), STB_W(CGImageGetAlphaInfo), STB_W(CGImageGetBitsPerComponent), STB_W(CGImageGetBitsPerPixel), STB_W(CGContextRelease), STB_W(CGImageRelease), STB_W(CGImageCreate), STB_W(CGDataProviderCreateWithData), STB_W(CGDataProviderRelease), STB_W(CGColorGetComponents), STB_W(CGColorGetColorSpace), STB_W(CGColorSpaceGetModel), STB_W(CGGradientCreateWithColors), STB_W(CGContextSaveGState), STB_W(CGContextRestoreGState), STB_W(CGContextScaleCTM), STB_W(CGContextTranslateCTM), STB_W(CGContextSetFillColor), STB_W(CGContextSetRGBFillColor), STB_W(CGContextSetFillColorWithColor), STB_W(CGContextSetStrokeColor), STB_W(CGContextSetRGBStrokeColor), STB_W(CGContextSetStrokeColorWithColor), STB_W(CGContextSetLineWidth), STB_W(CGContextBeginPath), STB_W(CGContextClosePath), STB_W(CGContextMoveToPoint), STB_W(CGContextAddLineToPoint), STB_W(CGContextAddRect), STB_W(CGContextAddArc), STB_W(CGContextAddArcToPoint), STB_W(CGContextStrokePath), STB_W(CGContextFillPath), STB_W(CGContextFillRect), STB_W(CGContextStrokeLineSegments), STB_W(CGContextSetStrokeColorSpace), STB_W(NSClassFromString), STB_W(NSSelectorFromString),
     {"_SCNetworkReachabilityScheduleWithRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }}, {"_SCNetworkReachabilitySetCallback", (void*)+[](void* target, void* callout, void* context) -> bool { return true; }}, {"_SCNetworkReachabilityUnscheduleFromRunLoop", (void*)+[](void* target, void* runLoop, void* runLoopMode) -> bool { return true; }},
     {"__Block_object_assign", (void*)wrap_Block_object_assign}, {"__Block_copy", (void*)wrap_Block_copy}, {"__Block_release", (void*)wrap_Block_release},
 
