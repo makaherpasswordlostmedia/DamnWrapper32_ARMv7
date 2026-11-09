@@ -8210,6 +8210,25 @@ static void HLE_VCDidLayout(void* vc) {
         typedef void (*F)(void*, const char*);
         ((F)imp)(vc, "viewDidLayoutSubviews");
     }
+    // UIKit после смены frame зовёт -layoutSubviews у вью. У PSPKVM KVMPadView расставляет в нём
+    // кнопки; без вызова все UILabel остаются 0x0 и пад не рисуется.
+    std::vector<void*> laidOut;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_uiTreeMutex);
+        for (auto& kv : g_views)
+            if (kv.second.frame.size() >= 4 && kv.second.frame[2] > 0.0f && kv.second.frame[3] > 0.0f)
+                laidOut.push_back(kv.first);
+    }
+    for (void* v : laidOut) {
+        if (!v || (uintptr_t)v < 0x1000) continue;
+        uint32_t visa = ((uint32_t*)v)[0];
+        if (visa < 0x1000) continue;
+        if (void* impL = FindMethodIMP(visa, "layoutSubviews")) {
+            LogToJava("HLE: Автоматический вызов [" + GetObjCClassName(v) + " layoutSubviews]");
+            typedef void (*LF)(void*, const char*);
+            ((LF)impL)(v, "layoutSubviews");
+        }
+    }
 }
 
 // Форматтер для stringWithFormat: понимает флаги, ширину и точность (%.4s, %02d, %-8s),
@@ -15869,6 +15888,44 @@ extern "C" void wrap_dispatch_sync(void* queue, void* block) {
     }
 }
 
+// --- dispatch_after: PSPKVM запускает VM через dispatch_after(3 c) -> javanotify_start() ---
+static uint32_t hle_dispatch_global_q_struct[16] = {0};
+extern "C" void* wrap_dispatch_get_global_queue(long identifier, unsigned long flags) {
+    return (void*)&hle_dispatch_global_q_struct;
+}
+// dispatch_time_t кодируем как «смещение в наносекундах от сейчас» (DISPATCH_TIME_NOW = 0)
+extern "C" uint64_t wrap_dispatch_time(uint64_t when, int64_t delta) {
+    return when + (uint64_t)delta;
+}
+struct DwDelayedBlock { uint64_t ns; void* block; };
+static void* DwDelayedBlockThread(void* p) {
+    DwDelayedBlock d = *(DwDelayedBlock*)p;
+    delete (DwDelayedBlock*)p;
+    struct timespec ts; ts.tv_sec = (time_t)(d.ns / 1000000000ull); ts.tv_nsec = (long)(d.ns % 1000000000ull);
+    nanosleep(&ts, nullptr);
+    LogToJava("C-API-HLE: dispatch_after сработал, выполняем блок");
+    uint32_t* b = (uint32_t*)d.block;
+    typedef void (*BlockInvoke)(void*);
+    BlockInvoke invoke = (BlockInvoke)b[3];
+    if (invoke) invoke(d.block);
+    return nullptr;
+}
+extern "C" void wrap_dispatch_after(uint64_t when, void* queue, void* block) {
+    if (!block) return;
+    // Копия блока: стековый блок к моменту срабатывания уже может быть недействителен
+    uint32_t* b = (uint32_t*)block;
+    void* blockCopy = block;
+    bool isGlobal = (b[2] & (1u << 28)) != 0;
+    uint32_t* desc = (uint32_t*)b[4];
+    if (!isGlobal && desc && desc[1] >= 20 && desc[1] <= 4096) {
+        blockCopy = malloc(desc[1]);
+        memcpy(blockCopy, block, desc[1]);
+    }
+    LogToJava("C-API-HLE: dispatch_after через " + std::to_string(when / 1000000ull) + " мс");
+    pthread_t th;
+    if (pthread_create(&th, nullptr, DwDelayedBlockThread, new DwDelayedBlock{when, blockCopy}) == 0) pthread_detach(th);
+}
+
 // Предикат обязан переключаться в «готово» только после блока, а опоздавшие потоки —
 // ждать: иначе второй поток идёт дальше по недоинициализированному объекту.
 // 0 — не начат, 1 — выполняется, 2 — готов.
@@ -17646,7 +17703,7 @@ std::map<std::string, void*> g_hleStubs = {
     STB_S(glLinkProgram), STB_S(glRenderbufferStorage), {"_glRenderbufferStorageOES", (void*)Stub_glRenderbufferStorage}, STB_S(glGetRenderbufferParameteriv), {"_glGetRenderbufferParameterivOES", (void*)Stub_glGetRenderbufferParameteriv}, STB_S(glCheckFramebufferStatus), {"_glCheckFramebufferStatusOES", (void*)Stub_glCheckFramebufferStatus}, STB_S(glShaderSource), STB_W(glUniformMatrix4fv), {"_glUseProgram", (void*)MegaDebug_glUseProgram}, STB_S(glVertexAttribPointer), STB_S(glViewport), STB_S(NSHomeDirectory), STB_S(NSTemporaryDirectory), STB_S(NSSearchPathForDirectoriesInDomains),
     STB_W(SCNetworkReachabilityCreateWithName), {"_SCNetworkReachabilityCreateWithAddress", (void*)+[](void* a, void* b) -> void* { return (void*)0xDEADBEEF; }}, {"_SCNetworkReachabilityGetFlags", (void*)+[](void* r, uint32_t* f) -> bool { if(f) *f = 2; return true; }},
     {"_AVAudioSessionCategoryPlayback", (void*)&hle_AVAudioSessionCategoryPlayback_ptr}, {"_AVAudioSessionCategoryAmbient", (void*)&hle_AVAudioSessionCategoryAmbient_ptr}, {"_NSUserDefaultsDidChangeNotification", (void*)&hle_NSUserDefaultsDidChangeNotification_ptr}, {"_kCFCoreFoundationVersionNumber", (void*)&wrap_kCFCoreFoundationVersionNumber}, {"_CGSizeZero", (void*)&wrap_CGSizeZero}, {"_CGPointZero", (void*)&wrap_CGPointZero}, {"__objc_empty_cache", (void*)&hle_objc_empty_cache}, STB_S(objc_enumerationMutation),
-    {"__dispatch_main_q", (void*)&hle_dispatch_main_q_struct}, STB_W(dispatch_get_main_queue), STB_W(dispatch_async), STB_W(dispatch_sync), STB_W(dispatch_once),
+    {"__dispatch_main_q", (void*)&hle_dispatch_main_q_struct}, STB_W(dispatch_get_main_queue), STB_W(dispatch_async), STB_W(dispatch_sync), STB_W(dispatch_once), STB_W(dispatch_after), STB_W(dispatch_time), STB_W(dispatch_get_global_queue),
     STB_W(mach_absolute_time), STB_W(mach_timebase_info), STB_S(CFAbsoluteTimeGetCurrent), {"___cxa_pure_virtual", (void*)Stub_cxa_pure_virtual},
     
     STB_W(malloc), STB_W(free), STB_W(calloc), STB_W(realloc), STB_D(memcpy), STB_D(memmove), STB_D(memset), STB_D(memcmp), {"_memchr", (void*)(void*(*)(void*, int, size_t))memchr},
