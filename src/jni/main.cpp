@@ -855,6 +855,59 @@ static int VfsStatAny(const std::string& p, struct stat* st) {
     return stat(p.c_str(), st);
 }
 
+// Реальный cwd, выставленный игрой через chdir(). PSPKVM делает chdir(Documents/pspkvm) и дальше
+// открывает "./lib/skin.bin", "./pspkvm.ini" и т.п. — относительные пути должны идти от него.
+std::string g_realCwd;
+static std::string RelBase() {
+    if (!g_realCwd.empty() && !g_sandboxDir.empty() && g_realCwd.compare(0, g_sandboxDir.size(), g_sandboxDir) == 0)
+        return g_realCwd + "/";
+    return g_sandboxDir + "Documents/";
+}
+
+// NSFileManager copyItemAtPath: / removeItemAtPath: (источник может быть внутри .ipa)
+static bool HLE_CopyTree(const std::string& from, const std::string& to) {
+    struct stat st;
+    if (VfsStatAny(from, &st) != 0) return false;
+    if (S_ISDIR(st.st_mode)) {
+        MakeDirsRecursive(to);
+        DIR* d = IpaIsVirtualPath(from.c_str()) ? IpaOpendir(from) : opendir(from.c_str());
+        if (!d) return false;
+        bool virt = IpaIsVirtualPath(from.c_str());
+        bool ok = true;
+        std::vector<std::string> names;
+        while (struct dirent* e = virt ? IpaReaddir(d) : readdir(d)) {
+            if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) names.push_back(e->d_name);
+        }
+        if (virt) IpaClosedir(d); else closedir(d);
+        for (auto& n : names) ok = HLE_CopyTree(from + "/" + n, to + "/" + n) && ok;
+        return ok;
+    }
+    std::vector<unsigned char> data;
+    if (!VfsReadFileAny(from, data)) return false;
+    size_t slash = to.rfind('/');
+    if (slash != std::string::npos && slash > 0) MakeDirsRecursive(to.substr(0, slash));
+    FILE* f = fopen(to.c_str(), "wb");
+    if (!f) return false;
+    size_t w = data.empty() ? 0 : fwrite(data.data(), 1, data.size(), f);
+    fclose(f);
+    return w == data.size();
+}
+static bool HLE_RemoveTree(const std::string& path) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) return true;
+    if (S_ISDIR(st.st_mode)) {
+        if (DIR* d = opendir(path.c_str())) {
+            std::vector<std::string> names;
+            while (struct dirent* e = readdir(d))
+                if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) names.push_back(e->d_name);
+            closedir(d);
+            for (auto& n : names) HLE_RemoveTree(path + "/" + n);
+        }
+        return rmdir(path.c_str()) == 0;
+    }
+    return unlink(path.c_str()) == 0;
+}
+
 std::string g_appBundlePath;
 std::string g_execPath;
 std::map<void*, std::string> g_bundlePaths;   // NSBundle -> корень бандла
@@ -9866,6 +9919,15 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
         if (clsName == "NSString" && strcmp(op, "stringWithContentsOfFile:encoding:error:") == 0) {
             std::string path = GetNSString(a1);
             std::vector<unsigned char> raw;
+            // Маркер .kvm_bundle_version остался от прошлого запуска, где копирование lib/ не удалось
+            // (copyItemAtPath: не был реализован): без lib/ сидинг надо повторить.
+            {
+                size_t slash = path.rfind('/');
+                if (slash != std::string::npos && path.compare(slash + 1, std::string::npos, ".kvm_bundle_version") == 0) {
+                    struct stat lst;
+                    if (stat((path.substr(0, slash) + "/lib").c_str(), &lst) != 0) return 0;
+                }
+            }
             if (VfsReadFileAny(path, raw)) {
                 return (uint64_t)(uintptr_t)CreateNSString(std::string((const char*)raw.data(), raw.size()));
             }
@@ -11528,6 +11590,24 @@ uint64_t Impl_objc_msgSend(void* self, const char* op, void* a1, void* a2, void*
                 struct stat info;
                 return (VfsStatAny(path, &info) == 0) ? 1 : 0;
             }
+            if (strcmp(op, "copyItemAtPath:toPath:error:") == 0) {
+                std::string from = GetNSString(a1), to = GetNSString(a2);
+                bool ok = HLE_CopyTree(from, to);
+                LogToJava("C-API-IO: [copyItemAtPath] " + from + " -> " + to + " : " + (ok ? "OK" : "FAIL"));
+                return ok ? 1 : 0;
+            }
+            if (strcmp(op, "removeItemAtPath:error:") == 0) {
+                std::string path = GetNSString(a1);
+                bool ok = HLE_RemoveTree(path);
+                LogToJava("C-API-IO: [removeItemAtPath] " + path + " : " + (ok ? "OK" : "FAIL"));
+                return ok ? 1 : 0;
+            }
+            if (strcmp(op, "moveItemAtPath:toPath:error:") == 0) {
+                std::string from = GetNSString(a1), to = GetNSString(a2);
+                bool ok = rename(from.c_str(), to.c_str()) == 0;
+                LogToJava("C-API-IO: [moveItemAtPath] " + from + " -> " + to + " : " + (ok ? "OK" : "FAIL"));
+                return ok ? 1 : 0;
+            }
             if (strcmp(op, "createDirectoryAtPath:withIntermediateDirectories:attributes:error:") == 0) {
                 std::string path = GetNSString(a1);
                 bool made = MakeDirsRecursive(path);
@@ -12581,7 +12661,7 @@ extern "C" int wrap_stat(const char* path, void* ios_stat_buf) {
         return 0;
     }
     bool isRelative = (sPath.length() > 0 && sPath[0] != '/');
-    if (isRelative) sPath = g_sandboxDir + "Documents/" + sPath;
+    if (isRelative) sPath = RelBase() + sPath;
 
     if (sPath.find(".dll") != std::string::npos || sPath.find("mscorlib") != std::string::npos || sPath.find("Mono") != std::string::npos || sPath.find("Data/Managed") != std::string::npos) {
         LogToJava("MONO-TRACE: [stat] Запрос инфы: " + sPath);
@@ -12620,7 +12700,7 @@ extern "C" int wrap_lstat(const char* path, void* ios_stat_buf) {
         return 0;
     }
     bool isRelative = (sPath.length() > 0 && sPath[0] != '/');
-    if (isRelative) sPath = g_sandboxDir + "Documents/" + sPath;
+    if (isRelative) sPath = RelBase() + sPath;
 
     struct stat android_st;
     int res = lstat(sPath.c_str(), &android_st);
@@ -15260,7 +15340,7 @@ extern "C" int wrap_rmdir(const char* pathname) {
 extern "C" int wrap_mkdir(const char* pathname, mode_t mode) {
     if (!pathname) return -1;
     std::string sPath = pathname;
-    if (!sPath.empty() && sPath[0] != '/') sPath = g_sandboxDir + "Documents/" + sPath;
+    if (!sPath.empty() && sPath[0] != '/') sPath = RelBase() + sPath;
     int res = ::mkdir(sPath.c_str(), mode ? mode : 0777);
     LogToBlackBox("C-API-IO: [mkdir] " + sPath + " -> " + std::to_string(res) +
                   (res < 0 ? " errno=" + std::to_string(errno) : ""));
@@ -15921,6 +16001,10 @@ extern "C" void wrap_dispatch_after(uint64_t when, void* queue, void* block) {
         blockCopy = malloc(desc[1]);
         memcpy(blockCopy, block, desc[1]);
     }
+    // Гостевой dispatch_time на ARM32 даёт 64-битное значение с мусором в младшем слове
+    // (3e9 нс оказывается в старшем): нормализуем, иначе nanosleep получает бессмысленный срок.
+    if (when > 600000000000ull) when >>= 32;
+    if (when > 600000000000ull) when = 3000000000ull;
     LogToJava("C-API-HLE: dispatch_after через " + std::to_string(when / 1000000ull) + " мс");
     pthread_t th;
     if (pthread_create(&th, nullptr, DwDelayedBlockThread, new DwDelayedBlock{when, blockCopy}) == 0) pthread_detach(th);
@@ -16130,6 +16214,7 @@ extern "C" int wrap_chdir(const char* path) {
     }
     if (chdir(want.c_str()) == 0) {
         g_virtualCwd = want;
+        g_realCwd = want;
         return 0;
     }
     return -1;
@@ -16152,7 +16237,7 @@ extern "C" int wrap_access(const char* path, int mode) {
     }
     bool isRelative = (sPath.length() > 0 && sPath[0] != '/');
     if (isRelative) {
-        std::string docPath = g_sandboxDir + "Documents/" + sPath;
+        std::string docPath = RelBase() + sPath;
         if (access(docPath.c_str(), mode) == 0) return 0;
         std::string bundlePath = g_appBundlePath + "/" + sPath;
         if (IpaIsVirtualPath(bundlePath.c_str())) {
@@ -16188,7 +16273,7 @@ extern "C" int wrap_open(const char* path, int ios_flags, ...) {
         return vfd;
     }
     if (!sPath.empty() && sPath[0] != '/') {
-        std::string docPath = g_sandboxDir + "Documents/" + sPath;
+        std::string docPath = RelBase() + sPath;
         if (!wantsWrite && access(docPath.c_str(), F_OK) != 0) {
             std::string bundlePath = g_appBundlePath + "/" + sPath;
             if (IpaIsVirtualPath(bundlePath.c_str()) && IpaExists(bundlePath)) {
@@ -16212,7 +16297,7 @@ extern "C" DIR* wrap_opendir(const char* name) {
         LogToBlackBox("C-API-IO: [opendir] Бандл: " + sName);
         return IpaOpendir(sName);
     }
-    if (!sName.empty() && sName[0] != '/') sName = g_sandboxDir + "Documents/" + sName;
+    if (!sName.empty() && sName[0] != '/') sName = RelBase() + sName;
     LogToBlackBox("C-API-IO: [opendir] Чтение директории: " + sName);
     return opendir(sName.c_str());
 }
@@ -16260,7 +16345,7 @@ extern "C" void* wrap_fopen(const char* path, const char* mode) {
     
     bool isRelative = (sPath.length() > 0 && sPath[0] != '/');
     if (isRelative) {
-        sPath = g_sandboxDir + "Documents/" + origPath;
+        sPath = RelBase() + origPath;
     }
 
     
